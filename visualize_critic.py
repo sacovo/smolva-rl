@@ -1,0 +1,290 @@
+import argparse
+import os
+import sys
+
+# Add src to sys.path to allow importing from lerobot_policy_smolvla_rl
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLMWithCriticModel
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Visualize SmolVLA Critic")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to the model checkpoint (.pt file)",
+    )
+    parser.add_argument(
+        "--dataset_repo_id",
+        type=str,
+        required=True,
+        help="Hugging Face repo id of the dataset",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        nargs="+",
+        required=True,
+        help="List of episode indices to visualize",
+    )
+    parser.add_argument(
+        "--model_id", type=str, default="HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    )
+    parser.add_argument(
+        "--num_vlm_layers",
+        type=int,
+        default=2,
+        help="Number of layers to keep in the VLM backbone",
+    )
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--output_dir", type=str, default="outputs/plots")
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=None,
+        help="Max episode length used for normalization during training. If not provided, it will be calculated from the full dataset metadata.",
+    )
+    return parser.parse_args()
+
+
+def process_batch(batch, model, camera_keys, device):
+    processor = model.processor
+    batch_size = batch["observation.state"].shape[0]
+
+    pixel_values_list = []
+    for key in camera_keys:
+        imgs = batch[key]  # Expected shape [B, C, H, W]
+        # The processor expects a list of images
+        imgs_list = [imgs[i].cpu() for i in range(batch_size)]
+
+        # Use the processor to get the correctly shaped pixel_values for the vision model
+        # images are already in [0, 1] range from LeRobotDataset, so we set do_rescale=False
+        inputs = processor(images=imgs_list, return_tensors="pt", do_rescale=False)
+        pixel_values_list.append(inputs["pixel_values"].to(device))
+
+    tasks = batch["task"]
+    # Tokenize the tasks
+    text_inputs = processor.tokenizer(
+        tasks, return_tensors="pt", padding=True, truncation=True
+    )
+    lang_tokens = text_inputs["input_ids"].to(device)
+    lang_masks = text_inputs["attention_mask"].to(device)
+
+    img_masks = [
+        torch.ones(batch_size, dtype=torch.bool, device=device) for _ in camera_keys
+    ]
+
+    state = batch["observation.state"].to(device)
+    # Ensure state matches max_state_dim
+    if state.shape[1] < model.max_state_dim:
+        pad_size = model.max_state_dim - state.shape[1]
+        state = F.pad(state, (0, pad_size))
+    elif state.shape[1] > model.max_state_dim:
+        state = state[:, : model.max_state_dim]
+
+    return pixel_values_list, img_masks, lang_tokens, lang_masks, state
+
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print(f"Loading checkpoint from {args.checkpoint}")
+    state_dict = torch.load(args.checkpoint, map_location=args.device)
+
+    # Auto-detect num_vlm_layers from state_dict
+    layer_indices = []
+    for key in state_dict.keys():
+        if key.startswith("vlm.model.text_model.layers."):
+            parts = key.split(".")
+            if len(parts) > 4:
+                try:
+                    layer_indices.append(int(parts[4]))
+                except ValueError:
+                    pass
+    if layer_indices:
+        inferred_layers = max(layer_indices) + 1
+        if inferred_layers != args.num_vlm_layers:
+            print(
+                f"Note: Inferred {inferred_layers} VLM layers from checkpoint (command line arg was {args.num_vlm_layers})."
+            )
+            args.num_vlm_layers = inferred_layers
+
+    print(f"Loading critic model from {args.model_id} (layers: {args.num_vlm_layers})")
+    model = SmolVLMWithCriticModel(
+        model_id=args.model_id, num_vlm_layers=args.num_vlm_layers
+    ).to(args.device)
+
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    print(f"Loading dataset: {args.dataset_repo_id}")
+    dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+
+    # Identify camera keys in the dataset
+    camera_keys = [k for k in dataset.features if k.startswith("observation.images.")]
+    print(f"Detected camera keys: {camera_keys}")
+
+    # Compute maximum episode length for normalization (we should probably use the same as training)
+    # However, for visualization, we need ground truth.
+    # In train_critic.py, max_length was computed from the whole dataset provided to the training script.
+    # Since we don't know the exact value used during training if we only load subset of episodes,
+    # we can try to guess or use the current dataset's max.
+    # Ideally the user would provide the same dataset_repo_id and no (or all) episodes to get the same max_length.
+    # But let's just use the metadata from the dataset.
+
+    # We might need to load the full meta to get the "global" max length if it matters.
+    # For now let's just use what's in the current dataset subset.
+    lengths = dataset.meta.episodes["length"]
+    max_length = max(lengths)
+    print(f"Max episode length in dataset: {max_length}")
+
+    support = torch.linspace(model.vmin, model.vmax, model.num_bins, device=args.device)
+
+    # Collect results for each episode
+    results_by_episode = {
+        ep_idx: {
+            "probs": [],
+            "expected_values": [],
+            "gt_values": [],
+            "frame_indices": [],
+        }
+        for ep_idx in args.episodes
+    }
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Predicting"):
+            images, img_masks, lang_tokens, lang_masks, state = process_batch(
+                batch, model, camera_keys, args.device
+            )
+
+            logits = model(images, img_masks, lang_tokens, lang_masks, state)
+            probs = F.softmax(logits, dim=-1)  # (B, num_bins)
+            expected_value = (probs * support).sum(dim=-1)  # (B,)
+
+            batch_eps = batch["episode_index"].cpu().numpy()
+            batch_frames = batch["frame_index"].cpu().numpy()
+
+            p_cpu = probs.cpu()
+            ev_cpu = expected_value.cpu()
+
+            for i, ep_idx in enumerate(batch_eps):
+                if ep_idx in results_by_episode:
+                    results_by_episode[ep_idx]["probs"].append(p_cpu[i])
+                    results_by_episode[ep_idx]["expected_values"].append(ev_cpu[i])
+                    results_by_episode[ep_idx]["frame_indices"].append(batch_frames[i])
+
+                    # Ground truth calculation
+                    # We need the length of this specific episode.
+                    # We can get it from dataset.meta.episodes
+                    ep_meta = dataset.meta.episodes.filter(
+                        lambda x: x["episode_index"] == ep_idx
+                    )
+                    total_frames = ep_meta["length"][0]
+                    gt = -((total_frames - batch_frames[i] - 1) / max_length)
+                    results_by_episode[ep_idx]["gt_values"].append(gt)
+
+    for ep_idx in args.episodes:
+        print(f"Plotting episode {ep_idx}...")
+        res = results_by_episode[ep_idx]
+        if not res["probs"]:
+            print(f"No data for episode {ep_idx}, skipping.")
+            continue
+
+        # Sort by frame index just in case
+        sorted_indices = np.argsort(res["frame_indices"])
+        all_probs = (
+            torch.stack([res["probs"][i] for i in sorted_indices]).float().numpy()
+        )
+        all_expected_values = np.array(
+            [res["expected_values"][i] for i in sorted_indices]
+        )
+        all_gt_values = np.array([res["gt_values"][i] for i in sorted_indices])
+
+        # Plotting
+        plt.figure(figsize=(15, 8))
+
+        # Heatmap
+        # We want the y-axis to be the support values.
+        # sns.heatmap expects rows to be y-axis and columns to be x-axis.
+        # Our all_probs is (T, num_bins). We want (num_bins, T).
+        # We also want to invert the y-axis so -1.0 is at the bottom.
+        # But for heatmaps, index 0 is at the top.
+        # So if we want -1.0 at the bottom and 0.0 at the top:
+        # Index 0 (top) -> 0.0, Index 50 (bottom) -> -1.0.
+        # The support is linspace(-1.0, 0.0, 51), so support[0] = -1.0, support[50] = 0.0.
+        # We flip the rows to have 0.0 at the top.
+
+        ax = sns.heatmap(
+            np.flipud(all_probs.T),
+            cmap="viridis",
+            cbar_kws={"label": "Probability"},
+        )
+
+        # Set ticks for Y axis
+        num_ticks = 11
+        ytick_indices = np.linspace(0, model.num_bins - 1, num_ticks)
+        ytick_labels = np.linspace(model.vmax, model.vmin, num_ticks)
+        ax.set_yticks(ytick_indices + 0.5)
+        ax.set_yticklabels([f"{v:.1f}" for v in ytick_labels])
+
+        # Set ticks for X axis
+        T = all_probs.shape[0]
+        xtick_step = max(1, T // 10)
+        ax.set_xticks(np.arange(0, T, xtick_step) + 0.5)
+        ax.set_xticklabels(np.arange(0, T, xtick_step))
+
+        # Plot Expected Value and Ground Truth
+        # We need to map the values to the heatmap y-coordinates.
+        # value v -> y index in [0, 50]
+        # y = (vmax - v) / (vmax - vmin) * (num_bins - 1)
+        def val_to_y(v):
+            return (model.vmax - v) / (model.vmax - model.vmin) * (
+                model.num_bins - 1
+            ) + 0.5
+
+        plt.plot(
+            np.arange(T) + 0.5,
+            val_to_y(all_expected_values),
+            color="white",
+            linewidth=2,
+            label="Expected Value",
+        )
+        plt.plot(
+            np.arange(T) + 0.5,
+            val_to_y(all_gt_values),
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            label="Ground Truth",
+        )
+
+        plt.title(f"Critic Output - Episode {ep_idx}")
+        plt.xlabel("Step")
+        plt.ylabel("Value (Normalized steps to completion)")
+        plt.legend()
+
+        output_path = os.path.join(args.output_dir, f"episode_{ep_idx}_critic.png")
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Saved plot to {output_path}")
+
+
+if __name__ == "__main__":
+    main()
