@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl.smolvla_critic import (
@@ -83,7 +84,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    accelerator = Accelerator(log_with='wandb', gradient_accumulation_steps=args.accumulation_steps)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(log_with='wandb', gradient_accumulation_steps=args.accumulation_steps, kwargs_handlers=[ddp_kwargs])
 
     # Initialize Weights & Biases
     accelerator.init_trackers(
@@ -161,7 +163,7 @@ def main():
 
     while step < args.steps:
         for batch in dataloader:
-            with accelerator.accumulate():
+            with accelerator.accumulate(model):
 
                 if step >= args.steps:
                     break
