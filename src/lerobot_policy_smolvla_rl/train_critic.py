@@ -7,7 +7,6 @@ from lerobot_policy_smolvla_rl.ds_utils import (
 )
 import argparse
 import os
-import wandb
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -84,16 +83,15 @@ def parse_args():
 
 def main():
     args = parse_args()
-    accelerator = Accelerator()
+    accelerator = Accelerator(log_with='wandb')
 
-    device = args.device
     # Initialize Weights & Biases
-    wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
+    accelerator.init_trackers(
+        project_name=args.wandb_project,
         config=vars(args),
-        name=args.job_name,
+        init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.job_name}}
     )
+    device = accelerator.device
 
     print(f"Loading dataset: {args.dataset_repo_id}")
     dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
@@ -121,7 +119,8 @@ def main():
         num_bins=51,
         freeze_vision_encoder=True,
         num_vlm_layers=args.num_vlm_layers,
-        input_features=None
+        input_features=None,
+        device=accelerator.device,
     )
     features = dataset_to_policy_features(dataset.meta.features)
 
@@ -161,6 +160,7 @@ def main():
         accelerator.load_state(args.resume_from)
         print(f"Resumed training state from {args.resume_from}")
 
+
     while step < args.steps:
         for batch in dataloader:
             if step >= args.steps:
@@ -176,7 +176,7 @@ def main():
 
             # Compute C51 target distribution
             target_dist = compute_c51_target_distribution(
-                returns, num_bins=model.config.num_bins, vmin=model.config.vmin, vmax=model.config.vmax
+                returns, num_bins=config.num_bins, vmin=config.vmin, vmax=config.vmax
             ).to(device)
 
             # Forward pass
@@ -196,7 +196,7 @@ def main():
                 optimizer.zero_grad()
 
             if step % args.log_freq == 0:
-                wandb.log({"loss": loss.item(), "step": step})
+                accelerator.log({"loss": loss.item(), "step": step})
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             if (step + 1) % args.save_freq == 0:
@@ -220,7 +220,7 @@ def main():
     torch.save(model.state_dict(), save_path)
 
     print(f"Training completed. Final model saved to {save_path}")
-    wandb.finish()
+    accelerator.end_training()
 
 
 if __name__ == "__main__":
