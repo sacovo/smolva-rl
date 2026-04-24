@@ -67,23 +67,23 @@ def parse_args():
         help="Path to state to resume from",
     )
     parser.add_argument(
-        "--accumulation_steps",
-        type=int,
-        default=8,
-        help="Number of steps to accumulate gradients for",
-    )
-    parser.add_argument(
         "--model_save_name",
         type=str,
         default="critic_final.pt",
         help="Filename for the final saved model (appended to save_dir)",
+    )
+    parser.add_argument(
+        "--accumulation_steps",
+        type=int,
+        default=1,
+        help="Accumulate over multiple steps"
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    accelerator = Accelerator(log_with='wandb')
+    accelerator = Accelerator(log_with='wandb', gradient_accumulation_steps=args.accumulation_steps)
 
     # Initialize Weights & Biases
     accelerator.init_trackers(
@@ -151,8 +151,6 @@ def main():
 
     progress_bar = tqdm(total=args.steps, desc="Training")
 
-    accumulation_steps = args.accumulation_steps
-    optimizer.zero_grad()
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
@@ -163,52 +161,52 @@ def main():
 
     while step < args.steps:
         for batch in dataloader:
-            if step >= args.steps:
-                break
+            with accelerator.accumulate():
 
-            returns = calculate_returns(
-                episode_lengths,
-                max_lengths,
-                batch["task_index"],
-                batch["episode_index"],
-                batch["frame_index"],
-            )
+                if step >= args.steps:
+                    break
 
-            # Compute C51 target distribution
-            target_dist = compute_c51_target_distribution(
-                returns, num_bins=config.num_bins, vmin=config.vmin, vmax=config.vmax
-            ).to(device)
+                returns = calculate_returns(
+                    episode_lengths,
+                    max_lengths,
+                    batch["task_index"],
+                    batch["episode_index"],
+                    batch["frame_index"],
+                )
 
-            # Forward pass
-            logits, predicted_dist = model(pre(batch))
-            # Critic loss (cross entropy over C51 distribution)
-            # loss = F.cross_entropy(logits, target_dist)
-            loss = F.binary_cross_entropy_with_logits(
-                logits, target_dist.unsqueeze(dim=1)
-            )
-            loss = loss / accumulation_steps
+                # Compute C51 target distribution
+                target_dist = compute_c51_target_distribution(
+                    returns, num_bins=config.num_bins, vmin=config.vmin, vmax=config.vmax
+                ).to(device)
 
-            # loss.backward()
-            accelerator.backward(loss)
+                # Forward pass
+                logits, predicted_dist = model(pre(batch))
+                # Critic loss (cross entropy over C51 distribution)
+                # loss = F.cross_entropy(logits, target_dist)
+                loss = F.binary_cross_entropy_with_logits(
+                    logits, target_dist.unsqueeze(dim=1)
+                )
 
-            if (step + 1) % accumulation_steps == 0:
+                # loss.backward()
+                accelerator.backward(loss)
+
                 optimizer.step()
                 optimizer.zero_grad()
 
-            if step % args.log_freq == 0:
-                accelerator.log({"loss": loss.item(), "step": step})
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                if step % args.log_freq == 0:
+                    accelerator.log({"loss": loss.item(), "step": step})
+                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-            if (step + 1) % args.save_freq == 0:
-                save_path = os.path.join(
-                    output_dir, f"state_{step + 1}.pt"
-                )
-                # torch.save(model.state_dict(), save_path)
-                accelerator.wait_for_everyone()
-                accelerator.save_state(save_path)
+                if (step + 1) % args.save_freq == 0:
+                    save_path = os.path.join(
+                        output_dir, f"state_{step + 1}.pt"
+                    )
+                    # torch.save(model.state_dict(), save_path)
+                    accelerator.wait_for_everyone()
+                    accelerator.save_state(save_path)
 
-            step += 1
-            progress_bar.update(1)
+                step += 1
+                progress_bar.update(1)
 
     progress_bar.close()
 
