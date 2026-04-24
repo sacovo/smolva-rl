@@ -1,3 +1,10 @@
+from lerobot.envs.utils import FeatureType
+from lerobot.policies.factory import dataset_to_policy_features
+from lerobot_policy_smolvla_rl.ds_utils import (
+    get_max_task_lengths,
+    get_episode_lengths,
+    calculate_returns,
+)
 import argparse
 import os
 import sys
@@ -6,7 +13,6 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -14,7 +20,7 @@ import seaborn as sns
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLMWithCriticModel
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig 
 
 
 def parse_args():
@@ -61,44 +67,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def process_batch(batch, model, camera_keys, device):
-    processor = model.processor
-    batch_size = batch["observation.state"].shape[0]
-
-    pixel_values_list = []
-    for key in camera_keys:
-        imgs = batch[key]  # Expected shape [B, C, H, W]
-        # The processor expects a list of images
-        imgs_list = [imgs[i].cpu() for i in range(batch_size)]
-
-        # Use the processor to get the correctly shaped pixel_values for the vision model
-        # images are already in [0, 1] range from LeRobotDataset, so we set do_rescale=False
-        inputs = processor(images=imgs_list, return_tensors="pt", do_rescale=False)
-        pixel_values_list.append(inputs["pixel_values"].to(device))
-
-    tasks = batch["task"]
-    # Tokenize the tasks
-    text_inputs = processor.tokenizer(
-        tasks, return_tensors="pt", padding=True, truncation=True
-    )
-    lang_tokens = text_inputs["input_ids"].to(device)
-    lang_masks = text_inputs["attention_mask"].to(device)
-
-    img_masks = [
-        torch.ones(batch_size, dtype=torch.bool, device=device) for _ in camera_keys
-    ]
-
-    state = batch["observation.state"].to(device)
-    # Ensure state matches max_state_dim
-    if state.shape[1] < model.max_state_dim:
-        pad_size = model.max_state_dim - state.shape[1]
-        state = F.pad(state, (0, pad_size))
-    elif state.shape[1] > model.max_state_dim:
-        state = state[:, : model.max_state_dim]
-
-    return pixel_values_list, img_masks, lang_tokens, lang_masks, state
-
-
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -125,57 +93,60 @@ def main():
             args.num_vlm_layers = inferred_layers
 
     print(f"Loading critic model from {args.model_id} (layers: {args.num_vlm_layers})")
-    model = SmolVLMWithCriticModel(
-        model_id=args.model_id, num_vlm_layers=args.num_vlm_layers
+    dataset = LeRobotDataset(args.dataset_repo_id)
+    config = SmolVLMCriticConfig(
+        num_bins=51,
+        num_vlm_layers=8,
+    )
+
+    features = dataset_to_policy_features(dataset.meta.features)
+
+    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+
+    config.input_features = input_features
+    model = SmolVLACrictic(
+        config
     ).to(args.device)
 
     model.load_state_dict(state_dict)
     model.eval()
 
+    # Load full ds first for getting the correct max length
+    max_lengths = get_max_task_lengths(dataset)
+    episode_lengths = get_episode_lengths(dataset)
+
     print(f"Loading dataset: {args.dataset_repo_id}")
-    dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+
+    # Reload if we only use the smaller ds
+    if args.episodes:
+        dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
     # Identify camera keys in the dataset
     camera_keys = [k for k in dataset.features if k.startswith("observation.images.")]
     print(f"Detected camera keys: {camera_keys}")
 
-    # Compute maximum episode length for normalization (we should probably use the same as training)
-    # However, for visualization, we need ground truth.
-    # In train_critic.py, max_length was computed from the whole dataset provided to the training script.
-    # Since we don't know the exact value used during training if we only load subset of episodes,
-    # we can try to guess or use the current dataset's max.
-    # Ideally the user would provide the same dataset_repo_id and no (or all) episodes to get the same max_length.
-    # But let's just use the metadata from the dataset.
-
-    # We might need to load the full meta to get the "global" max length if it matters.
-    # For now let's just use what's in the current dataset subset.
-    lengths = dataset.meta.episodes["length"]
-    max_length = max(lengths)
-    print(f"Max episode length in dataset: {max_length}")
-
-    support = torch.linspace(model.vmin, model.vmax, model.num_bins, device=args.device)
+    support = torch.linspace(model.config.vmin, model.config.vmax, model.config.num_bins, device=args.device)
 
     # Collect results for each episode
     results_by_episode = {
         ep_idx: {
-            "probs": [],
-            "expected_values": [],
-            "gt_values": [],
-            "frame_indices": [],
+            "probs": np.zeros((episode_lengths[ep_idx], model.config.num_bins)),
+            "expected_values": np.zeros(episode_lengths[ep_idx]),
+            "gt_values": np.zeros(episode_lengths[ep_idx]),
+            "frame_indices": np.zeros(episode_lengths[ep_idx]),
         }
         for ep_idx in args.episodes
     }
+
+    pre = model.get_pre_processor(dataset)
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting"):
-            images, img_masks, lang_tokens, lang_masks, state = process_batch(
-                batch, model, camera_keys, args.device
-            )
 
-            logits = model(images, img_masks, lang_tokens, lang_masks, state)
-            probs = F.softmax(logits, dim=-1)  # (B, num_bins)
+            logits, probs = model(pre(batch))
             expected_value = (probs * support).sum(dim=-1)  # (B,)
 
             batch_eps = batch["episode_index"].cpu().numpy()
@@ -184,33 +155,35 @@ def main():
             p_cpu = probs.cpu()
             ev_cpu = expected_value.cpu()
 
-            for i, ep_idx in enumerate(batch_eps):
-                if ep_idx in results_by_episode:
-                    results_by_episode[ep_idx]["probs"].append(p_cpu[i])
-                    results_by_episode[ep_idx]["expected_values"].append(ev_cpu[i])
-                    results_by_episode[ep_idx]["frame_indices"].append(batch_frames[i])
+            returns = calculate_returns(
+                episode_lengths,
+                max_lengths,
+                batch["task_index"],
+                batch["episode_index"],
+                batch["frame_index"],
+            )
 
-                    # Ground truth calculation
-                    # We need the length of this specific episode.
-                    # We can get it from dataset.meta.episodes
-                    ep_meta = dataset.meta.episodes.filter(
-                        lambda x: x["episode_index"] == ep_idx
-                    )
-                    total_frames = ep_meta["length"][0]
-                    gt = -((total_frames - batch_frames[i] - 1) / max_length)
-                    results_by_episode[ep_idx]["gt_values"].append(gt)
+            for i in range(len(batch_eps)):
+                frame_idx = batch["frame_index"][i].item()
+                ep_idx = batch["episode_index"][i].item()
+
+                results_by_episode[ep_idx]["probs"][frame_idx, :] = p_cpu[i]
+                results_by_episode[ep_idx]["expected_values"][frame_idx] = ev_cpu[i]
+                results_by_episode[ep_idx]["frame_indices"][frame_idx] = batch_frames[i]
+                results_by_episode[ep_idx]["gt_values"][frame_idx] = returns[i]
+
 
     for ep_idx in args.episodes:
         print(f"Plotting episode {ep_idx}...")
         res = results_by_episode[ep_idx]
-        if not res["probs"]:
+        if not len(res["probs"]) > 0:
             print(f"No data for episode {ep_idx}, skipping.")
             continue
 
         # Sort by frame index just in case
         sorted_indices = np.argsort(res["frame_indices"])
         all_probs = (
-            torch.stack([res["probs"][i] for i in sorted_indices]).float().numpy()
+            torch.stack([torch.tensor(res["probs"][i]) for i in sorted_indices]).float().numpy()
         )
         all_expected_values = np.array(
             [res["expected_values"][i] for i in sorted_indices]
@@ -239,8 +212,8 @@ def main():
 
         # Set ticks for Y axis
         num_ticks = 11
-        ytick_indices = np.linspace(0, model.num_bins - 1, num_ticks)
-        ytick_labels = np.linspace(model.vmax, model.vmin, num_ticks)
+        ytick_indices = np.linspace(0, model.config.num_bins - 1, num_ticks)
+        ytick_labels = np.linspace(model.config.vmax, model.config.vmin, num_ticks)
         ax.set_yticks(ytick_indices + 0.5)
         ax.set_yticklabels([f"{v:.1f}" for v in ytick_labels])
 
@@ -255,8 +228,8 @@ def main():
         # value v -> y index in [0, 50]
         # y = (vmax - v) / (vmax - vmin) * (num_bins - 1)
         def val_to_y(v):
-            return (model.vmax - v) / (model.vmax - model.vmin) * (
-                model.num_bins - 1
+            return (model.config.vmax - v) / (model.config.vmax - model.config.vmin) * (
+                model.config.num_bins - 1
             ) + 0.5
 
         plt.plot(

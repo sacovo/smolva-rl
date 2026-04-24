@@ -1,18 +1,24 @@
-import accelerate.commands.config.sagemaker
-from collections import defaultdict
-from accelerate import Accelerator
+from lerobot.configs.types import FeatureType
+from lerobot.datasets.feature_utils import dataset_to_policy_features
+from lerobot_policy_smolvla_rl.ds_utils import (
+    get_max_task_lengths,
+    get_episode_lengths,
+    calculate_returns,
+)
 import argparse
 import os
-import math
 import wandb
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from accelerate import Accelerator
+
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl.smolvla_critic import (
-    SmolVLMWithCriticModel,
+    SmolVLACrictic,
+    SmolVLMCriticConfig,
     compute_c51_target_distribution,
 )
 
@@ -56,6 +62,12 @@ def parse_args():
     parser.add_argument("--save_freq", type=int, default=1000)
     parser.add_argument("--save_dir", type=str, default="outputs/checkpoints_critic")
     parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to state to resume from",
+    )
+    parser.add_argument(
         "--accumulation_steps",
         type=int,
         default=8,
@@ -70,71 +82,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def process_batch(batch, model, camera_keys, device):
-    processor = model.processor
-    batch_size = batch["observation.state"].shape[0]
-
-    pixel_values_list = []
-    for key in camera_keys:
-        imgs = batch[key]  # Expected shape [B, C, H, W]
-        # The processor expects a list of images
-        imgs_list = [imgs[i].cpu() for i in range(batch_size)]
-
-        # Use the processor to get the correctly shaped pixel_values for the vision model
-        # images are already in [0, 1] range from LeRobotDataset, so we set do_rescale=False
-        inputs = processor(images=imgs_list, return_tensors="pt", do_rescale=False)
-        pixel_values_list.append(inputs["pixel_values"].to(device))
-
-    tasks = batch["task"]
-    # Tokenize the tasks
-    text_inputs = processor.tokenizer(
-        tasks, return_tensors="pt", padding=True, truncation=True
-    )
-    lang_tokens = text_inputs["input_ids"].to(device)
-    lang_masks = text_inputs["attention_mask"].to(device)
-
-    img_masks = [
-        torch.ones(batch_size, dtype=torch.bool, device=device) for _ in camera_keys
-    ]
-
-    state = batch["observation.state"].to(device)
-    # Ensure state matches max_state_dim
-    if state.shape[1] < model.max_state_dim:
-        pad_size = model.max_state_dim - state.shape[1]
-        state = F.pad(state, (0, pad_size))
-    elif state.shape[1] > model.max_state_dim:
-        state = state[:, : model.max_state_dim]
-
-    return pixel_values_list, img_masks, lang_tokens, lang_masks, state
-
-
-def get_max_task_lengths(dataset: LeRobotDataset):
-    """For each distinct task determine the maximum length and return the dictionary mapping task to max length
-
-    Args:
-        dataset (LeRobotDataset): The dataset to analyze
-    """
-    task_to_index = dataset.meta.tasks.to_dict()["task_index"]
-    print(f"Unique tasks in dataset: {task_to_index}")
-
-    task_max_lengths = defaultdict(int)
-    for task, length in zip(
-        dataset.meta.episodes["tasks"], dataset.meta.episodes["length"]
-    ):
-        task = task[0]
-        task_index = task_to_index[task]
-
-        task_max_lengths[task_index] = max(task_max_lengths[task_index], length)
-
-    return torch.tensor(
-        [v for k, v in sorted(task_max_lengths.items())], dtype=torch.float32
-    )
-
-
 def main():
     args = parse_args()
     accelerator = Accelerator()
 
+    device = args.device
     # Initialize Weights & Biases
     wandb.init(
         project=args.wandb_project,
@@ -147,7 +99,7 @@ def main():
     dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
     # Compute maximum episode length for normalization
-    episode_lengths = torch.tensor(dataset.meta.episodes["length"])
+    episode_lengths = get_episode_lengths(dataset)
 
     max_lengths = get_max_task_lengths(dataset)
 
@@ -165,9 +117,21 @@ def main():
     print(
         f"Initializing critic model from {args.model_id} (layers: {args.num_vlm_layers})"
     )
-    model = SmolVLMWithCriticModel(
-        model_id=args.model_id, num_vlm_layers=args.num_vlm_layers
-    ).to(accelerator.device)
+    config = SmolVLMCriticConfig(
+        num_bins=51,
+        freeze_vision_encoder=True,
+        num_vlm_layers=args.num_vlm_layers,
+        input_features=None
+    )
+    features = dataset_to_policy_features(dataset.meta.features)
+
+    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
+    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+
+    config.input_features = input_features
+    model = SmolVLACrictic(
+        config
+    ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -180,7 +144,11 @@ def main():
     model.train()
     step = 0
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    pre = model.get_pre_processor(dataset)
+
+    output_dir = os.path.join(args.save_dir, args.model_save_name)
+
+    os.makedirs(output_dir, exist_ok=True)
 
     progress_bar = tqdm(total=args.steps, desc="Training")
 
@@ -189,39 +157,38 @@ def main():
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
+    if args.resume_from:
+        accelerator.load_state(args.resume_from)
+        print(f"Resumed training state from {args.resume_from}")
+
     while step < args.steps:
         for batch in dataloader:
             if step >= args.steps:
                 break
 
-            # Preprocess the batch
-            images, img_masks, lang_tokens, lang_masks, state = process_batch(
-                batch, model, camera_keys, accelerator.device
+            returns = calculate_returns(
+                episode_lengths,
+                max_lengths,
+                batch["task_index"],
+                batch["episode_index"],
+                batch["frame_index"],
             )
-
-            episode_idx = batch["episode_index"]
-            frame_idx = batch["frame_index"]
-            task_idx = batch["task_index"]
-
-            T = episode_lengths[episode_idx]  # Shape: [batch_size]
-            rem_steps = torch.clamp(
-                T - frame_idx - 1, min=0
-            )  # Remaining steps until goal
-
-            max_lens = max_lengths[task_idx]  # Max lengths for the tasks in the batch
-            returns = -(rem_steps / max_lens)  # Normalize values between (-1,
 
             # Compute C51 target distribution
             target_dist = compute_c51_target_distribution(
-                returns, num_bins=model.num_bins, vmin=model.vmin, vmax=model.vmax
-            ).to(accelerator.device)
+                returns, num_bins=model.config.num_bins, vmin=model.config.vmin, vmax=model.config.vmax
+            ).to(device)
 
             # Forward pass
-            logits = model(images, img_masks, lang_tokens, lang_masks, state)
+            logits, predicted_dist = model(pre(batch))
             # Critic loss (cross entropy over C51 distribution)
-            loss = F.cross_entropy(logits, target_dist)
+            # loss = F.cross_entropy(logits, target_dist)
+            loss = F.binary_cross_entropy_with_logits(
+                logits, target_dist.unsqueeze(dim=1)
+            )
             loss = loss / accumulation_steps
 
+            # loss.backward()
             accelerator.backward(loss)
 
             if (step + 1) % accumulation_steps == 0:
@@ -234,9 +201,11 @@ def main():
 
             if (step + 1) % args.save_freq == 0:
                 save_path = os.path.join(
-                    args.save_dir, f"{args.model_save_name}_{step+1}.pt"
+                    output_dir, f"state_{step + 1}.pt"
                 )
-                torch.save(model.state_dict(), save_path)
+                # torch.save(model.state_dict(), save_path)
+                accelerator.wait_for_everyone()
+                accelerator.save_state(save_path)
 
             step += 1
             progress_bar.update(1)
@@ -244,8 +213,12 @@ def main():
     progress_bar.close()
 
     # Final save
-    save_path = os.path.join(args.save_dir, args.model_save_name + "_final.pt")
+    save_path = os.path.join(output_dir, "checkpoint_final.pt")
+
+    accelerator.wait_for_everyone()
+    model = accelerator.unwrap_model(model)
     torch.save(model.state_dict(), save_path)
+
     print(f"Training completed. Final model saved to {save_path}")
     wandb.finish()
 
