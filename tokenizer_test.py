@@ -25,6 +25,9 @@ print(f"Original Action: {action_data[:, :5, :]}")  # Print first 5 tokens for b
 # Encode
 tokens = processor(action_data)
 print(f"Encoded Tokens (first 5): {tokens[0][:5]}")
+print(f"Max token ID: {np.max(tokens)}")
+print(f"Min token ID: {np.min(tokens)}")
+print(f"Unique tokens count: {len(np.unique(tokens))}")
 
 # Decode
 decoded_actions = processor.decode(tokens)
