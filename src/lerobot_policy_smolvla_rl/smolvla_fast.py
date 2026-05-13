@@ -16,12 +16,14 @@ class SmolVLAFast(nn.Module):
         model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", 
         num_fast_tokens: int = 1024,
         least_used_tokens: list[int] = None,
+        action_stats: dict[str, np.ndarray] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         torch_dtype = torch.bfloat16
     ) -> None:
         super().__init__()
         self.device = device
         self.num_fast_tokens = num_fast_tokens
+        self.action_stats = action_stats
         
         # 1. Load VLM and its tokenizer
         self.vlm = AutoModelForImageTextToText.from_pretrained(
@@ -43,11 +45,9 @@ class SmolVLAFast(nn.Module):
         
         # 3. Define Token Replacement Mapping
         if least_used_tokens is None:
-            # Fallback: use the last N tokens (excluding some very last ones if they are special)
-            # For SmolVLM, let's take tokens from len(vocab) - 1024 - 100 to len(vocab) - 100
-            # to avoid overlapping with some potential special tokens at the very end.
-            # Ideally, this should be a pre-computed list.
-            self.action_token_ids = list(range(len(self.tokenizer) - num_fast_tokens - 100, len(self.tokenizer) - 100))
+            # Shift to avoid special tokens (49152, 49189, 49190, 49279)
+            # Range [48000, 49024] is safe.
+            self.action_token_ids = list(range(48000, 48000 + num_fast_tokens))
         else:
             assert len(least_used_tokens) >= num_fast_tokens
             self.action_token_ids = least_used_tokens[:num_fast_tokens]
@@ -71,85 +71,127 @@ class SmolVLAFast(nn.Module):
             if hasattr(lm_head, 'weight'):
                 nn.init.normal_(lm_head.weight[self.action_token_ids], std=0.02)
 
-    def encode_actions(self, actions: np.ndarray) -> torch.Tensor:
-        """Convert action chunks to VLM token IDs.
+    def _normalize_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Apply quantile normalization to [-1, 1] if stats are provided."""
+        if self.action_stats is None:
+            return actions
+        
+        q01 = self.action_stats["q01"]
+        q99 = self.action_stats["q99"]
+        # Linear mapping from [q01, q99] to [-1, 1]
+        normalized = 2.0 * (actions - q01) / (q99 - q01 + 1e-8) - 1.0
+        return normalized
+
+    def _denormalize_actions(self, normalized: np.ndarray) -> np.ndarray:
+        """Invert quantile normalization."""
+        if self.action_stats is None:
+            return normalized
+        
+        q01 = self.action_stats["q01"]
+        q99 = self.action_stats["q99"]
+        actions = (normalized + 1.0) / 2.0 * (q99 - q01 + 1e-8) + q01
+        return actions
+
+    def encode_actions(self, actions: np.ndarray, return_mask: bool = False) -> torch.Tensor:
+        """Convert action chunks to VLM token IDs with padding.
         
         Args:
             actions: numpy array of shape (batch, chunk_size, action_dim)
+            return_mask: whether to return a boolean mask of valid tokens
         Returns:
-            torch.Tensor of VLM token IDs (batch, chunk_size)
+            torch.Tensor of VLM token IDs (batch, num_tokens)
+            (Optional) torch.Tensor boolean mask
         """
-        # FAST processor returns token IDs in [0, 2047] (or similar)
-        fast_tokens = self.action_processor(actions) # returns list of lists or numpy
-        fast_tokens = torch.tensor(fast_tokens, device=self.device)
+        # 1. Normalize
+        actions = self._normalize_actions(actions)
         
-        # Clip to num_fast_tokens if necessary, or ensure mapping is large enough
+        # 2. FAST processor returns list of lists of token IDs
+        fast_tokens_list = self.action_processor(actions)
+        
+        # 3. Padding
+        max_len = max(len(t) for t in fast_tokens_list)
+        padded_tokens = []
+        masks = []
+        for t in fast_tokens_list:
+            padded = t + [0] * (max_len - len(t)) # 0 is usually the pad/ignore token in FAST
+            mask = [True] * len(t) + [False] * (max_len - len(t))
+            padded_tokens.append(padded)
+            masks.append(mask)
+            
+        fast_tokens = torch.tensor(padded_tokens, device=self.device)
+        
+        # 4. Clip and Map to VLM token IDs
         fast_tokens = torch.clamp(fast_tokens, 0, self.num_fast_tokens - 1)
-        
-        # Map to VLM token IDs
-        # This is a bit slow if done one by one, but for small batches it's okay.
-        # Efficient way:
         vlm_token_ids = torch.tensor(self.action_token_ids, device=self.device)[fast_tokens]
+        
+        if return_mask:
+            return vlm_token_ids, torch.tensor(masks, device=self.device)
         return vlm_token_ids
 
     def decode_actions(self, vlm_tokens: torch.Tensor) -> np.ndarray:
         """Convert VLM token IDs back to action chunks.
         
         Args:
-            vlm_tokens: torch.Tensor of shape (batch, chunk_size)
+            vlm_tokens: torch.Tensor of shape (batch, num_tokens)
         Returns:
             numpy array of action chunks
         """
         # Map VLM tokens back to action indices (0-1023)
         vlm_tokens_cpu = vlm_tokens.cpu().numpy()
-        # Handle tokens that are NOT in our action map by mapping them to 0 or a special ignore index
         action_tokens = np.vectorize(lambda x: self.vlm_to_action_map.get(x, 0))(vlm_tokens_cpu)
         
         # Decode using action processor
-        return self.action_processor.decode(action_tokens)
+        normalized_actions = self.action_processor.decode(action_tokens)
+        
+        # Denormalize
+        return self._denormalize_actions(normalized_actions)
 
     def prepare_inputs_for_training(self, batch, camera_keys):
-        """Prepare inputs and targets for training.
+        """Prepare inputs and targets for training following the FAST paper.
         
         Args:
             batch: dict containing 'observation.images.*', 'task', and 'action'
             camera_keys: list of camera keys to use
         """
         processor = self.vlm.processor
-        batch_size = batch["task"].shape[0] if isinstance(batch["task"], torch.Tensor) else len(batch["task"])
+        batch_size = len(batch["task"])
         
-        # 1. Process images
+        # 1. Process images and prompt
+        img_tokens = "<image>" * len(camera_keys)
+        prompts = [f"{img_tokens}Task: {t} Action:" for t in batch["task"]]
+        
+        # We need to structure images correctly for SmolVLM
         imgs_list = []
-        for key in camera_keys:
-            imgs = batch[key] # [B, C, H, W]
-            imgs_list.extend([imgs[i].cpu() for i in range(batch_size)])
+        for i in range(batch_size):
+            sample_imgs = []
+            for key in camera_keys:
+                sample_imgs.append(batch[key][i].cpu())
+            imgs_list.append(sample_imgs)
+            
+        inputs = processor(images=imgs_list, text=prompts, return_tensors="pt", padding=True).to(self.device)
         
-        # We assume one image per camera per step for now
-        # SmolVLM processor handles multiple images
-        inputs = processor(images=imgs_list, text=[""]*batch_size, return_tensors="pt", do_rescale=False)
-        pixel_values = inputs["pixel_values"].to(self.device)
+        # 2. Encode actions
+        actions = batch["action"].cpu().numpy()
+        action_token_ids, action_mask = self.encode_actions(actions, return_mask=True) # [B, N]
         
-        # 2. Tokenize tasks
-        tasks = batch["task"]
-        # Format as: "Task: {task} Action:"
-        prompts = [f"Task: {t} Action:" for t in tasks]
-        text_inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
+        # 3. Concatenate action tokens to input_ids
+        # input_ids: [B, S], action_token_ids: [B, N]
+        input_ids = torch.cat([inputs["input_ids"], action_token_ids], dim=1)
         
-        # 3. Encode actions
-        actions = batch["action"].cpu().numpy() # [B, T, D]
-        action_token_ids = self.encode_actions(actions) # [B, T]
+        # Create labels: -100 for non-action tokens, action_token_ids for valid actions
+        labels = torch.full_like(input_ids, -100)
+        # Apply labels only where action_mask is True
+        action_labels = torch.where(action_mask, action_token_ids, torch.tensor(-100, device=self.device))
+        labels[:, inputs["input_ids"].shape[1]:] = action_labels
         
-        # 4. Concatenate everything for causal modeling
-        # This part depends on how SmolVLM structures its input_ids (where image tokens go)
-        # Usually, processor(images=..., text=...) handles the <image> token placement.
+        # Update attention mask
+        attention_mask = torch.cat([inputs["attention_mask"], action_mask.long()], dim=1)
         
-        # For simplicity, let's just return the components and let the training loop handle it
-        # or implement the full concat here.
         return {
-            "pixel_values": pixel_values,
-            "input_ids": text_inputs["input_ids"],
-            "attention_mask": text_inputs["attention_mask"],
-            "labels": action_token_ids
+            "pixel_values": inputs["pixel_values"],
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
         }
 
     def generate_action(self, pixel_values, task, chunk_size=None):
@@ -157,7 +199,13 @@ class SmolVLAFast(nn.Module):
         if chunk_size is None:
             chunk_size = 50 # Default from FAST
             
-        prompt = f"Task: {task} Action:"
+        # Support multiple images if pixel_values is a list/nested list
+        num_images = 1
+        if isinstance(pixel_values, (list, tuple)):
+            num_images = len(pixel_values)
+            
+        img_tokens = "<image>" * num_images
+        prompt = f"{img_tokens}Task: {task} Action:"
         inputs = self.vlm.processor(images=pixel_values, text=prompt, return_tensors="pt").to(self.device)
         
         # Generate

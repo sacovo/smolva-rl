@@ -95,8 +95,8 @@ def main():
     print(f"Loading critic model from {args.model_id} (layers: {args.num_vlm_layers})")
     dataset = LeRobotDataset(args.dataset_repo_id)
     config = SmolVLMCriticConfig(
-        num_bins=51,
-        num_vlm_layers=8,
+        num_bins=201,
+        num_vlm_layers=args.num_vlm_layers,
     )
 
     features = dataset_to_policy_features(dataset.meta.features)
@@ -155,6 +155,7 @@ def main():
             p_cpu = probs.cpu()
             ev_cpu = expected_value.cpu()
 
+            # Calculate normalized steps remaining [-1, 0]
             returns = calculate_returns(
                 episode_lengths,
                 max_lengths,
@@ -170,7 +171,7 @@ def main():
                 results_by_episode[ep_idx]["probs"][frame_idx, :] = p_cpu[i]
                 results_by_episode[ep_idx]["expected_values"][frame_idx] = ev_cpu[i]
                 results_by_episode[ep_idx]["frame_indices"][frame_idx] = batch_frames[i]
-                results_by_episode[ep_idx]["gt_values"][frame_idx] = returns[i]
+                results_by_episode[ep_idx]["gt_values"][frame_idx] = returns[i].cpu().item()
 
 
     for ep_idx in args.episodes:
@@ -250,7 +251,7 @@ def main():
 
         plt.title(f"Critic Output - Episode {ep_idx}")
         plt.xlabel("Step")
-        plt.ylabel("Value (Normalized steps to completion)")
+        plt.ylabel("Time-to-Completion (steps)")
         plt.legend()
 
         output_path = os.path.join(args.output_dir, f"episode_{ep_idx}_critic.png")

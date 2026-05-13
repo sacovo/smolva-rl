@@ -18,10 +18,12 @@ def main():
     print("Model initialized.")
     
     # Test action roundtrip
-    batch_size = 1
+    batch_size = 2
     chunk_size = 4
     action_dim = 14
-    dummy_actions = np.random.rand(batch_size, chunk_size, action_dim).astype(np.float32)
+    # Use zeros for one and random for other
+    dummy_actions = np.zeros((batch_size, chunk_size, action_dim), dtype=np.float32)
+    dummy_actions[1] = np.random.rand(chunk_size, action_dim).astype(np.float32)
     
     print(f"Original actions (first step): {dummy_actions[0, 0, :5]}")
     

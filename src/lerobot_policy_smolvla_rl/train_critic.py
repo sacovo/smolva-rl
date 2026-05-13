@@ -19,7 +19,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl.smolvla_critic import (
     SmolVLACrictic,
     SmolVLMCriticConfig,
-    compute_c51_target_distribution,
 )
 
 
@@ -65,13 +64,13 @@ def parse_args():
         "--resume_from",
         type=str,
         default=None,
-        help="Path to state to resume from",
+        help="Path to state to resume from, or 'auto' to find the latest in save_dir",
     )
     parser.add_argument(
         "--model_save_name",
         type=str,
-        default="critic_final.pt",
-        help="Filename for the final saved model (appended to save_dir)",
+        default="critic",
+        help="Name of the experiment/model (used for output directory)",
     )
     parser.add_argument(
         "--accumulation_steps",
@@ -118,7 +117,7 @@ def main():
         f"Initializing critic model from {args.model_id} (layers: {args.num_vlm_layers})"
     )
     config = SmolVLMCriticConfig(
-        num_bins=51,
+        num_bins=201,
         freeze_vision_encoder=True,
         num_vlm_layers=args.num_vlm_layers,
         input_features=None,
@@ -148,17 +147,32 @@ def main():
     pre = model.get_pre_processor(dataset)
 
     output_dir = os.path.join(args.save_dir, args.model_save_name)
-
     os.makedirs(output_dir, exist_ok=True)
 
-    progress_bar = tqdm(total=args.steps, desc="Training")
-
+    if args.resume_from == "auto":
+        if os.path.exists(output_dir):
+            checkpoints = [d for d in os.listdir(output_dir) if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))]
+            if checkpoints:
+                # Sort by step number
+                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[1]))
+                args.resume_from = os.path.join(output_dir, latest_checkpoint)
+            else:
+                args.resume_from = None
+        else:
+            args.resume_from = None
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     if args.resume_from:
         accelerator.load_state(args.resume_from)
-        print(f"Resumed training state from {args.resume_from}")
+        # restore step from path if possible
+        try:
+            step = int(os.path.basename(args.resume_from).split("_")[1])
+            print(f"Resumed training state from {args.resume_from} at step {step}")
+        except (ValueError, IndexError):
+            print(f"Resumed training state from {args.resume_from}, but could not determine step. Starting from 0.")
+
+    progress_bar = tqdm(total=args.steps, initial=step, desc="Training")
 
 
     while step < args.steps:
@@ -176,18 +190,13 @@ def main():
                     batch["frame_index"],
                 )
 
-                # Compute C51 target distribution
-                target_dist = compute_c51_target_distribution(
-                    returns, num_bins=config.num_bins, vmin=config.vmin, vmax=config.vmax
-                ).to(device)
+                # Map normalized returns [-1.0, 0.0] to bin indices [0, 200]
+                # Formula: index = (val - vmin) / (vmax - vmin) * (num_bins - 1)
+                normalized_indices = ((returns - config.vmin) / (config.vmax - config.vmin)) * (config.num_bins - 1)
+                time_to_completion = torch.clamp(normalized_indices, 0, config.num_bins - 1).long().to(device)
 
-                # Forward pass
-                logits, predicted_dist = model(pre(batch))
-                # Critic loss (cross entropy over C51 distribution)
-                # loss = F.cross_entropy(logits, target_dist)
-                loss = F.binary_cross_entropy_with_logits(
-                    logits, target_dist.unsqueeze(dim=1)
-                )
+                # Forward pass and loss calculation
+                loss = model.compute_loss(pre(batch), time_to_completion)
 
                 # loss.backward()
                 accelerator.backward(loss)

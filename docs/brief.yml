@@ -1,0 +1,19 @@
+project:
+  name: "SmolVLA RL Training"
+  one_liner: "Reinforcement Learning for robotic rovers using Vision-Language-Action models and high-speed tokenization."
+  repo: "fhnw/rover/smolvla-rl"
+  contact:
+    name: "Sandro Covo"
+    email: "sandro.covo@fhnw.ch"
+    institute: "School of Informatics"
+  cluster:
+    partition: "Calculon GPU"
+    gpus: "NVIDIA H200/A100"
+    unlock: "Calculon storage and compute allowed training on the massive OpenX datasets without sampling or data reduction."
+  results:
+    - metric: "Dataset Scale"
+      value: "Full OpenX"
+    - metric: "Backbone"
+      value: "SmolVLM2-500M"
+  tags: ["Robotics", "RL", "VLM", "OpenX"]
+  status: draft

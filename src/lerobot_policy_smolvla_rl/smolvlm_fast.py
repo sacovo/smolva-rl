@@ -1,29 +1,21 @@
-from transformers import AutoModelForImageTextToText
-from typing import Any
-
+import torch
 from torch import nn
+from transformers import AutoModelForImageTextToText, AutoTokenizer
+from .smolvla_fast import SmolVLAFast
 
-
-class SmolVLMFast(nn.Module):
-    """SmolVLM Backbone with FAST Tokens replacing the 1024 least used tokens
-
-    Args:
-        nn (_type_): _description_
-    """
-
+class SmolVLMFast(SmolVLAFast):
+    """Alias for SmolVLAFast with potentially different defaults or layer pruning."""
+    
     def __init__(
-        self, model_id: str, num_vlm_layers: int = -1, num_fast_tokens: int = 1024
+        self, 
+        model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", 
+        num_fast_tokens: int = 1024,
+        num_vlm_layers: int = -1,
+        **kwargs
     ) -> None:
-        self.vlm = AutoModelForImageTextToText.from_pretrained(
-            model_id,
-            torch_dtype="bfloat16",
-            low_cpu_mem_usage=True,
-        )
-
+        super().__init__(model_id=model_id, num_fast_tokens=num_fast_tokens, **kwargs)
+        
         if num_vlm_layers > 0:
-            self.num_vlm_layers = num_vlm_layers
-        else:
-            self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
-
-    def get_vlm_model(self):
-        return self.vlm.model
+            # Prune layers if requested (experimental)
+            if hasattr(self.vlm.model.text_model, 'layers'):
+                self.vlm.model.text_model.layers = self.vlm.model.text_model.layers[:num_vlm_layers]
