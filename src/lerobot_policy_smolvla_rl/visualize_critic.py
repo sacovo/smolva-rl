@@ -64,6 +64,12 @@ def parse_args():
         default=None,
         help="Max episode length used for normalization during training. If not provided, it will be calculated from the full dataset metadata.",
     )
+    parser.add_argument(
+        "--drop_n_last_frames",
+        type=int,
+        default=0,
+        help="Drop/Shift the last N frames (should match training)",
+    )
     return parser.parse_args()
 
 
@@ -162,6 +168,7 @@ def main():
                 batch["task_index"],
                 batch["episode_index"],
                 batch["frame_index"],
+                post_goal_buffer=args.drop_n_last_frames,
             )
 
             for i in range(len(batch_eps)):

@@ -35,6 +35,7 @@ class SmolVLMCriticConfig(SmolVLAConfig):
     num_bins: int = 201
     vmin: float = -1.0
     vmax: float = 0.0
+    state_dropout: float = 0.0
 
 
 class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
@@ -72,14 +73,17 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
     def forward(self, batch: dict[str, torch.Tensor]):
         images, img_masks, state, lang_tokens, lang_masks = self._prepare_batch(batch)
 
+        if self.training and self.config.state_dropout > 0:
+            dropout_mask = (
+                torch.rand(state.shape[0], 1, device=state.device)
+                > self.config.state_dropout
+            ).to(state.dtype)
+            state = state * dropout_mask
+
         return self._forward(images, img_masks, lang_tokens, lang_masks, state)
 
 
     def _forward(self, images, img_masks, lang_tokens, lang_masks, state):
-        """
-        Evaluates the value distribution logits based purely on the environment
-        and language prefix, without action/timestep suffixes.
-        """
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
@@ -100,26 +104,25 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
         prefix_out = outputs_embeds[0]
         prefix_out = prefix_out.to(dtype=torch.float32)
 
-        # Slice the final token(s) to represent the aggregated state.
-        # (Adjust this slice if you need a specific chunk_size or pooling method)
         state_out = prefix_out[:, -1:]
 
-        # Pass through the new sequential head
         logits = self.c51_head(state_out).squeeze(1) # [B, num_bins]
 
-        # Compute the distribution across the bins
         distribution = torch.softmax(logits, dim=-1)
 
         return logits, distribution
 
-    def compute_loss(self, batch, time_to_completion):
+    def compute_loss(self, batch, time_to_completion, weights=None):
         """
         Compute cross-entropy loss for value function training.
         """
         logits, _ = self.forward(batch)
         
-        # Clamp targets to valid range [0, num_bins-1]
         targets = torch.clamp(time_to_completion, 0, self.config.num_bins - 1)
+        
+        if weights is not None:
+            loss = F.cross_entropy(logits, targets, reduction="none")
+            return (loss * weights).mean()
         
         return F.cross_entropy(logits, targets)
 

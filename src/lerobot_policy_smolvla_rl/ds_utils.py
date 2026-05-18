@@ -35,13 +35,14 @@ def get_episode_lengths(dataset: LeRobotDataset):
 
 
 def calculate_returns(
-    episode_lengths, max_lengths, task_idxs, episode_idxs, frame_idxs
+    episode_lengths, max_lengths, task_idxs, episode_idxs, frame_idxs, post_goal_buffer=0
 ):
     T = episode_lengths[episode_idxs]  # Shape: [batch_size]
-    rem_steps = torch.clamp(T - frame_idxs - 1, min=0)  # Remaining steps until goal
+    # Remaining steps until goal. Goal is shifted by post_goal_buffer.
+    rem_steps = torch.clamp(T - post_goal_buffer - frame_idxs - 1, min=0)
 
     max_lens = max_lengths[task_idxs]  # Max lengths for the tasks in the batch
-    returns = -(rem_steps / max_lens)  # Normalize values between (-1,
+    returns = -(rem_steps / max_lens)  # Normalize values between (-1, 0)
     return returns
 
 

@@ -8,12 +8,12 @@ from lerobot_policy_smolvla_rl.ds_utils import (
 import argparse
 import os
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+from diffusers.optimization import get_scheduler
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl.smolvla_critic import (
@@ -43,13 +43,19 @@ def parse_args():
     parser.add_argument(
         "--num_vlm_layers",
         type=int,
-        default=2,
+        default=8,
         help="Number of layers to keep in the VLM backbone",
     )
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--steps", type=int, default=1000, help="Total training steps")
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--steps", type=int, default=5000, help="Total training steps")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the VLM backbone")
+    parser.add_argument("--lr_head", type=float, default=1e-3, help="Learning rate for the critic head (c51_head)")
+    parser.add_argument("--min_lr", type=float, default=2.5e-6, help="Minimum learning rate for cosine decay")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.95)
+
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -77,6 +83,24 @@ def parse_args():
         type=int,
         default=1,
         help="Accumulate over multiple steps"
+    )
+    parser.add_argument(
+        "--state_dropout",
+        type=float,
+        default=0.0,
+        help="Probability of zeroing out the entire state during training"
+    )
+    parser.add_argument(
+        "--end_weight",
+        type=float,
+        default=1.0,
+        help="Loss weight multiplier for frames near the end of an episode"
+    )
+    parser.add_argument(
+        "--end_threshold",
+        type=float,
+        default=-0.2,
+        help="Return threshold above which end_weight is applied (e.g., -0.2 means last 20%%)"
     )
     return parser.parse_args()
 
@@ -122,6 +146,7 @@ def main():
         num_vlm_layers=args.num_vlm_layers,
         input_features=None,
         device=accelerator.device,
+        state_dropout=args.state_dropout,
     )
     features = dataset_to_policy_features(dataset.meta.features)
 
@@ -133,8 +158,32 @@ def main():
         config
     ).to(device)
 
+    # Group parameters for differential learning rates
+    head_params = []
+    backbone_params = []
+    for name, param in model.named_parameters():
+        if "c51_head" in name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    optimizer_grouped_parameters = [
+        {"params": backbone_params, "lr": args.lr},
+        {"params": head_params, "lr": args.lr_head},
+    ]
+
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        optimizer_grouped_parameters, 
+        weight_decay=args.weight_decay,
+        betas=(args.beta1, args.beta2)
+    )
+
+    # Use cosine scheduler with warmup
+    scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.steps,
     )
 
     # Identify camera keys in the dataset
@@ -161,7 +210,7 @@ def main():
         else:
             args.resume_from = None
 
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     if args.resume_from:
         accelerator.load_state(args.resume_from)
@@ -195,14 +244,20 @@ def main():
                 normalized_indices = ((returns - config.vmin) / (config.vmax - config.vmin)) * (config.num_bins - 1)
                 time_to_completion = torch.clamp(normalized_indices, 0, config.num_bins - 1).long().to(device)
 
-                # Forward pass and loss calculation
-                loss = model.compute_loss(pre(batch), time_to_completion)
+                # Apply end-of-episode weighting
+                weights = torch.ones_like(returns)
+                if args.end_weight != 1.0:
+                    weights = torch.where(returns > args.end_threshold, args.end_weight, 1.0)
+
+                loss = model.compute_loss(pre(batch), time_to_completion, weights=weights)
 
                 # loss.backward()
                 accelerator.backward(loss)
 
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
+
 
                 if step % args.log_freq == 0:
                     accelerator.log({"loss": loss.item(), "step": step})

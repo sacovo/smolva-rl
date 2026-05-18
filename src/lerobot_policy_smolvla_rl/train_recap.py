@@ -4,11 +4,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
-import wandb
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot_policy_smolvla_rl.smolvla_recap import SmolVLARECAP
+from lerobot_policy_smolvla_rl import SmolVLARECAP, SmolVLARECAPConfig
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
 from lerobot_policy_smolvla_rl.ds_utils import get_episode_lengths, get_max_task_lengths, calculate_returns
 
@@ -40,35 +38,41 @@ def main():
 
     # 2. Load Critic (for advantage conditioning)
     critic = None
-    if args.critic_checkpoint:
-        print(f"Loading critic from {args.critic_checkpoint}")
-        # Initialize config for critic
-        critic_config = SmolVLMCriticConfig(num_bins=201, num_vlm_layers=8)
-        # Note: In a real scenario, we'd need to match the dataset features
-        critic = SmolVLACrictic(critic_config).to(device)
-        critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
-        critic.eval()
-        
-        # Support for expected value calculation
-        support = torch.linspace(critic.config.vmin, critic.config.vmax, critic.config.num_bins, device=device)
-        pre_critic = critic.get_pre_processor(dataset)
-        
-        # Advantage threshold (in raw steps). Positive means doing better than average.
-        advantage_threshold = 0.0 
+    if not args.critic_checkpoint:
+        raise ValueError("Critic checkpoint is needed for RECAP training")
+
+    print(f"Loading critic from {args.critic_checkpoint}")
+    # Initialize config for critic
+    critic_config = SmolVLMCriticConfig(
+        num_bins=201, 
+        num_vlm_layers=8,
+        image_features=[k for k in dataset.features if k.startswith("observation.images.")],
+    )
+    # Note: In a real scenario, we'd need to match the dataset features
+    critic = SmolVLACrictic(critic_config).to(device)
+    critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
+    critic.eval()
+    
+    # Support for expected value calculation
+    support = torch.linspace(critic.config.vmin, critic.config.vmax, critic.config.num_bins, device=device)
+    pre_critic = critic.get_pre_processor(dataset)
+    
+    # Advantage threshold (in raw steps). Positive means doing better than average.
+    advantage_threshold = 0.0 
 
     # 3. Initialize RECAP Model
     action_dim = dataset.features["action"].shape[1]
-    model = SmolVLARECAP(
+    recap_config = SmolVLARECAPConfig(
         num_vlm_layers=args.num_vlm_layers,
-        action_dim=action_dim,
-        device=device
+        max_action_dim=action_dim,
+        image_features=[k for k in dataset.features if k.startswith("observation.images.")],
     )
+    model = SmolVLARECAP(recap_config).to(device)
+    pre_recap = model.get_pre_processor(dataset)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    
-    camera_keys = [k for k in dataset.features if k.startswith("observation.images.")]
     
     # 4. Training Loop
     step = 0
@@ -76,7 +80,8 @@ def main():
     
     while step < args.steps:
         for batch in dataloader:
-            if step >= args.steps: break
+            if step >= args.steps:
+                break
             
             # Label advantage
             advantage_bool = [True] * batch["action"].shape[0] # Default to positive for demo data
@@ -96,18 +101,19 @@ def main():
                     v_s = (probs * support).sum(dim=-1)
                     
                     # Advantage = V(s) - Actual_Return
-                    # Positive advantage means Actual_Return is more negative than expected (finishes faster)
-                    # Example: Expected V = -0.2 (10 steps) and Actual = -0.5 (25 steps)
-                    # Advantage = -0.2 - (-0.5) = +0.3 (Good!)
                     advantage = v_s - actual_return
                     advantage_bool = (advantage > advantage_threshold).tolist()
 
+            # Prepare batch for RECAP (tokenization, normalization)
+            recap_batch = pre_recap(batch)
+
             # Compute Loss
-            total_loss, ar_loss, flow_loss = model.compute_loss(batch, camera_keys, advantage=advantage_bool)
+            total_loss, ar_loss, flow_loss = model.compute_loss(recap_batch, advantage=advantage_bool)
             
             accelerator.backward(total_loss)
             optimizer.step()
             optimizer.zero_grad()
+
             
             if step % 10 == 0:
                 accelerator.log({
