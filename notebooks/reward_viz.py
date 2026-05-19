@@ -6,7 +6,11 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
-    from lerobot_policy_smolvla_rl.ds_utils import calculate_returns, get_episode_lengths, get_max_task_lengths
+    from lerobot_policy_smolvla_rl.ds_utils import (
+        calculate_returns,
+        get_episode_lengths,
+        get_max_task_lengths,
+    )
 
     from itertools import batched
 
@@ -46,11 +50,15 @@ def _(batched, calculate_returns, ds, episode_lengths, max_lengths, torch):
     returns = []
 
     for batch in batched(ds, 1024):
-        task_idxs = [int(frame['task_index']) for frame in batch]
+        task_idxs = [int(frame["task_index"]) for frame in batch]
         episode_idxs = [int(frame["episode_index"]) for frame in batch]
         frame_idxs = torch.tensor([int(frame["frame_index"]) for frame in batch])
 
-        returns.append(calculate_returns(episode_lengths, max_lengths, task_idxs, episode_idxs, frame_idxs))
+        returns.append(
+            calculate_returns(
+                episode_lengths, max_lengths, task_idxs, episode_idxs, frame_idxs
+            )
+        )
 
     returns = torch.cat(returns)
     return (returns,)

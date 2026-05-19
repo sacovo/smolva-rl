@@ -10,19 +10,39 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from lerobot_policy_smolvla_rl import SmolVLARECAP, SmolVLARECAPConfig
-from lerobot_policy_smolvla_rl.ds_utils import (
-    calculate_returns,
-    get_episode_lengths,
-    get_max_task_lengths,
-)
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.advantage_utils import (
+    FutureFrameWrapper,
+    extract_future_batch,
+    compute_temporal_advantage,
+    get_task_thresholds,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train SmolVLA RECAP (Phase 1)")
     parser.add_argument("--dataset_repo_id", type=str, required=True)
     parser.add_argument(
+        "--episodes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="List of episodes to load for testing",
+    )
+    parser.add_argument(
         "--critic_checkpoint", type=str, help="Path to trained critic checkpoint"
+    )
+    parser.add_argument(
+        "--action_chunk_size",
+        type=int,
+        default=1,
+        help="Number of frames to predict (chunk size) to compute advantage",
+    )
+    parser.add_argument(
+        "--thresholds_path",
+        type=str,
+        default=None,
+        help="Path to save/load epsilon_l thresholds",
     )
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -42,14 +62,7 @@ def main():
     device = accelerator.device
 
     # 1. Load Dataset
-    dataset = LeRobotDataset(args.dataset_repo_id)
-    dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
-    )
-
-    # Pre-calculate returns and thresholds if possible, or do it on the fly
-    episode_lengths = get_episode_lengths(dataset).to(device)
-    max_lengths = get_max_task_lengths(dataset).to(device)
+    dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
     # 2. Load Critic (for advantage conditioning)
     critic = None
@@ -59,8 +72,12 @@ def main():
     print(f"Loading critic from {args.critic_checkpoint}")
 
     features = dataset_to_policy_features(dataset.meta.features)
-    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+    output_features = {
+        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+    }
+    input_features = {
+        key: ft for key, ft in features.items() if key not in output_features
+    }
 
     # Initialize config for critic
     critic_config = SmolVLMCriticConfig(
@@ -68,19 +85,42 @@ def main():
         num_vlm_layers=args.critic_num_vlm_layers,
         input_features=input_features,
     )
-    # Note: In a real scenario, we'd need to match the dataset features
     critic = SmolVLACrictic(critic_config).to(device)
     critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
     critic.eval()
 
-    # Support for expected value calculation
     support = torch.linspace(
         critic.config.vmin, critic.config.vmax, critic.config.num_bins, device=device
     )
     pre_critic = critic.get_pre_processor(dataset)
 
-    # Advantage threshold (in raw steps). Positive means doing better than average.
-    advantage_threshold = 0.0
+    thresholds_save_path = args.thresholds_path
+    if not thresholds_save_path:
+        thresholds_save_path = os.path.join(
+            args.save_dir,
+            f"task_thresholds_{args.dataset_repo_id}.json",
+        )
+
+    # Calculate or load epsilon_l per task based on the raw dataset
+    task_thresholds = get_task_thresholds(
+        critic,
+        dataset,
+        support,
+        args.action_chunk_size,
+        thresholds_save_path,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        batch_size=8,
+        num_workers=args.num_workers,
+    )
+
+    # Wrap dataset to include future frames on the fly
+    wrapped_dataset = FutureFrameWrapper(dataset, args.action_chunk_size)
+    dataloader = DataLoader(
+        wrapped_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
 
     # 3. Initialize RECAP Model
     action_dim = features["action"].shape[0]
@@ -108,30 +148,27 @@ def main():
 
             # Label advantage
             with torch.no_grad():
-                # Calculate ground truth returns
-                actual_return = calculate_returns(
-                    episode_lengths,
-                    max_lengths,
-                    batch["task_index"],
-                    batch["episode_index"],
-                    batch["frame_index"],
-                ).to(device)
+                future_batch = extract_future_batch(batch)
+                has_future = batch["has_future"].to(device)
 
-                # Get expected return V(s) from critic
-                critic_batch = pre_critic(batch)
-                _, probs = critic(critic_batch)
+                # Compute temporal advantage on the fly
+                advantage, _, _ = compute_temporal_advantage(
+                    critic, pre_critic, batch, future_batch, support, has_future
+                )
 
-                # Expected return V(s) in [-1, 0]
-                v_s = (probs * support).sum(dim=-1)
+                # Compare advantage against task-specific epsilon_l
+                task_indices = batch["task_index"].cpu().numpy()
+                batch_thresholds = torch.tensor(
+                    [task_thresholds[int(t)] for t in task_indices],
+                    dtype=torch.float32,
+                    device=device,
+                )
 
-                # Advantage = V(s) - Actual_Return
-                advantage = v_s - actual_return
-                advantage_bool = (advantage > advantage_threshold).tolist()
+                advantage_bool = (advantage > batch_thresholds).tolist()
 
             # Prepare batch for RECAP (tokenization, normalization)
             recap_batch = pre_recap(batch)
 
-            # Compute Loss
             total_loss, ar_loss, flow_loss = model.compute_loss(
                 recap_batch, advantage=advantage_bool
             )

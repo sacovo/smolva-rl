@@ -4,6 +4,7 @@ from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_pro
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
 from .configuration_smolvla_recap import SmolVLARECAPConfig
 
+
 def make_smolvla_recap_pre_post_processors(
     config: SmolVLARECAPConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,

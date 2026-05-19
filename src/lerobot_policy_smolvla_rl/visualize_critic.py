@@ -16,11 +16,10 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig 
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
 
 
 def parse_args():
@@ -30,6 +29,18 @@ def parse_args():
         type=str,
         required=True,
         help="Path to the model checkpoint (.pt file)",
+    )
+    parser.add_argument(
+        "--action_chunk_size",
+        type=int,
+        default=1,
+        help="Number of frames to predict (chunk size) to compute temporal advantage",
+    )
+    parser.add_argument(
+        "--epsilon_l",
+        type=float,
+        default=30.0,
+        help="Percentile (0-100) for calculating the advantage threshold (epsilon_l) per task",
     )
     parser.add_argument(
         "--dataset_repo_id",
@@ -107,13 +118,15 @@ def main():
 
     features = dataset_to_policy_features(dataset.meta.features)
 
-    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+    output_features = {
+        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+    }
+    input_features = {
+        key: ft for key, ft in features.items() if key not in output_features
+    }
 
     config.input_features = input_features
-    model = SmolVLACrictic(
-        config
-    ).to(args.device)
+    model = SmolVLACrictic(config).to(args.device)
 
     model.load_state_dict(state_dict)
     model.eval()
@@ -132,7 +145,9 @@ def main():
     camera_keys = [k for k in dataset.features if k.startswith("observation.images.")]
     print(f"Detected camera keys: {camera_keys}")
 
-    support = torch.linspace(model.config.vmin, model.config.vmax, model.config.num_bins, device=args.device)
+    support = torch.linspace(
+        model.config.vmin, model.config.vmax, model.config.num_bins, device=args.device
+    )
 
     # Collect results for each episode
     results_by_episode = {
@@ -141,6 +156,7 @@ def main():
             "expected_values": np.zeros(episode_lengths[ep_idx]),
             "gt_values": np.zeros(episode_lengths[ep_idx]),
             "frame_indices": np.zeros(episode_lengths[ep_idx]),
+            "task_index": None,
         }
         for ep_idx in args.episodes
     }
@@ -151,7 +167,6 @@ def main():
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting"):
-
             logits, probs = model(pre(batch))
             expected_value = (probs * support).sum(dim=-1)  # (B,)
 
@@ -178,8 +193,49 @@ def main():
                 results_by_episode[ep_idx]["probs"][frame_idx, :] = p_cpu[i]
                 results_by_episode[ep_idx]["expected_values"][frame_idx] = ev_cpu[i]
                 results_by_episode[ep_idx]["frame_indices"][frame_idx] = batch_frames[i]
-                results_by_episode[ep_idx]["gt_values"][frame_idx] = returns[i].cpu().item()
+                results_by_episode[ep_idx]["gt_values"][frame_idx] = (
+                    returns[i].cpu().item()
+                )
+                results_by_episode[ep_idx]["task_index"] = batch["task_index"][i].item()
 
+    # Calculate temporal advantages for all episodes to compute task-specific thresholds
+    task_advantages = {}
+
+    for ep_idx in args.episodes:
+        res = results_by_episode[ep_idx]
+        if res["task_index"] is None:
+            continue
+
+        sorted_indices = np.argsort(res["frame_indices"])
+        all_expected_values = np.array(
+            [res["expected_values"][i] for i in sorted_indices]
+        )
+        T = len(all_expected_values)
+
+        advantages = np.zeros(T)
+        for t in range(T):
+            v_current = all_expected_values[t]
+            future_t = t + args.action_chunk_size
+            if future_t >= T:
+                v_future = 0.0
+            else:
+                v_future = all_expected_values[future_t]
+            advantages[t] = v_future - v_current
+
+        res["advantages"] = advantages
+
+        task_idx = res["task_index"]
+        if task_idx not in task_advantages:
+            task_advantages[task_idx] = []
+        task_advantages[task_idx].extend(advantages)
+
+    # Compute thresholds (epsilon_l) per task
+    task_thresholds = {}
+    for task_idx, advs in task_advantages.items():
+        task_thresholds[task_idx] = np.percentile(advs, args.epsilon_l)
+        print(
+            f"Task {task_idx} threshold (epsilon_l={args.epsilon_l}%): {task_thresholds[task_idx]:.4f}"
+        )
 
     for ep_idx in args.episodes:
         print(f"Plotting episode {ep_idx}...")
@@ -191,78 +247,99 @@ def main():
         # Sort by frame index just in case
         sorted_indices = np.argsort(res["frame_indices"])
         all_probs = (
-            torch.stack([torch.tensor(res["probs"][i]) for i in sorted_indices]).float().numpy()
+            torch.stack([torch.tensor(res["probs"][i]) for i in sorted_indices])
+            .float()
+            .numpy()
         )
         all_expected_values = np.array(
             [res["expected_values"][i] for i in sorted_indices]
         )
         all_gt_values = np.array([res["gt_values"][i] for i in sorted_indices])
 
-        # Plotting
-        plt.figure(figsize=(15, 8))
-
-        # Heatmap
-        # We want the y-axis to be the support values.
-        # sns.heatmap expects rows to be y-axis and columns to be x-axis.
-        # Our all_probs is (T, num_bins). We want (num_bins, T).
-        # We also want to invert the y-axis so -1.0 is at the bottom.
-        # But for heatmaps, index 0 is at the top.
-        # So if we want -1.0 at the bottom and 0.0 at the top:
-        # Index 0 (top) -> 0.0, Index 50 (bottom) -> -1.0.
-        # The support is linspace(-1.0, 0.0, 51), so support[0] = -1.0, support[50] = 0.0.
-        # We flip the rows to have 0.0 at the top.
-
-        ax = sns.heatmap(
-            np.flipud(all_probs.T),
-            cmap="viridis",
-            cbar_kws={"label": "Probability"},
-        )
-
-        # Set ticks for Y axis
-        num_ticks = 11
-        ytick_indices = np.linspace(0, model.config.num_bins - 1, num_ticks)
-        ytick_labels = np.linspace(model.config.vmax, model.config.vmin, num_ticks)
-        ax.set_yticks(ytick_indices + 0.5)
-        ax.set_yticklabels([f"{v:.1f}" for v in ytick_labels])
-
-        # Set ticks for X axis
         T = all_probs.shape[0]
-        xtick_step = max(1, T // 10)
-        ax.set_xticks(np.arange(0, T, xtick_step) + 0.5)
-        ax.set_xticklabels(np.arange(0, T, xtick_step))
+        all_advantages = res["advantages"]
+        task_idx = res["task_index"]
+        threshold = task_thresholds.get(task_idx, 0.0)
 
-        # Plot Expected Value and Ground Truth
-        # We need to map the values to the heatmap y-coordinates.
-        # value v -> y index in [0, 50]
-        # y = (vmax - v) / (vmax - vmin) * (num_bins - 1)
-        def val_to_y(v):
-            return (model.config.vmax - v) / (model.config.vmax - model.config.vmin) * (
-                model.config.num_bins - 1
-            ) + 0.5
+        all_advantage_bools = all_advantages > threshold
 
-        plt.plot(
+        # Plotting
+        fig = plt.figure(figsize=(15, 8))
+        gs = fig.add_gridspec(
+            3,
+            2,
+            width_ratios=[1, 0.03],
+            height_ratios=[2, 0.3, 6],
+            wspace=0.01,
+            hspace=0.05,
+        )
+        ax_adv = fig.add_subplot(gs[0, 0])
+        ax_bool = fig.add_subplot(gs[1, 0], sharex=ax_adv)
+        ax_hm = fig.add_subplot(gs[2, 0], sharex=ax_adv)
+        cax = fig.add_subplot(gs[2, 1])
+
+        plt.setp(ax_adv.get_xticklabels(), visible=False)
+        plt.setp(ax_bool.get_xticklabels(), visible=False)
+
+        # Plot Advantage bar
+        colors = ["green" if a > threshold else "red" for a in all_advantages]
+        ax_adv.bar(np.arange(T) + 0.5, all_advantages, color=colors, width=1.0)
+        ax_adv.set_ylabel("Advantage")
+        ax_adv.set_title(f"Critic Output - Episode {ep_idx}")
+        ax_adv.axhline(0, color="black", linewidth=1)
+        ax_adv.axhline(
+            threshold,
+            color="blue",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Thr ({threshold:.3f})",
+        )
+        ax_adv.set_xlim(0, T)
+        ax_adv.legend(loc="upper right")
+
+        # Plot Boolean bar
+        from matplotlib.colors import ListedColormap
+
+        cmap_bool = ListedColormap(["red", "green"])
+        # We need to map boolean True/False to 1/0 for the colormap (0=red, 1=green)
+        bool_array = all_advantage_bools.astype(int)[None, :]
+        ax_bool.imshow(bool_array, aspect="auto", cmap=cmap_bool, extent=[0, T, 0, 1])
+        ax_bool.set_yticks([])
+        ax_bool.set_ylabel("Adv>Thr", rotation=0, labelpad=25, va="center")
+
+        # Heatmap using standard matplotlib to ensure axes align
+        img = ax_hm.imshow(
+            all_probs.T,
+            aspect="auto",
+            origin="lower",
+            cmap="viridis",
+            extent=[0, T, model.config.vmin, model.config.vmax],
+        )
+        # Add colorbar for the heatmap
+        fig.colorbar(img, cax=cax, label="Probability")
+
+        ax_hm.plot(
             np.arange(T) + 0.5,
-            val_to_y(all_expected_values),
+            all_expected_values,
             color="white",
             linewidth=2,
             label="Expected Value",
         )
-        plt.plot(
+        ax_hm.plot(
             np.arange(T) + 0.5,
-            val_to_y(all_gt_values),
+            all_gt_values,
             color="red",
             linestyle="--",
             linewidth=2,
             label="Ground Truth",
         )
 
-        plt.title(f"Critic Output - Episode {ep_idx}")
-        plt.xlabel("Step")
-        plt.ylabel("Time-to-Completion (steps)")
-        plt.legend()
+        ax_hm.set_xlabel("Step")
+        ax_hm.set_ylabel("Time-to-Completion (steps)")
+        ax_hm.legend(loc="lower left")
 
         output_path = os.path.join(args.output_dir, f"episode_{ep_idx}_critic.png")
-        plt.savefig(output_path)
+        plt.savefig(output_path, bbox_inches="tight", pad_inches=0.05)
         plt.close()
         print(f"Saved plot to {output_path}")
 

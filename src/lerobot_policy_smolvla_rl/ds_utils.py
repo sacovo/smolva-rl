@@ -35,7 +35,12 @@ def get_episode_lengths(dataset: LeRobotDataset):
 
 
 def calculate_returns(
-    episode_lengths, max_lengths, task_idxs, episode_idxs, frame_idxs, post_goal_buffer=0
+    episode_lengths,
+    max_lengths,
+    task_idxs,
+    episode_idxs,
+    frame_idxs,
+    post_goal_buffer=0,
 ):
     T = episode_lengths[episode_idxs]  # Shape: [batch_size]
     # Remaining steps until goal. Goal is shifted by post_goal_buffer.
@@ -102,3 +107,15 @@ def calculate_ds_returns(dataset: LeRobotDataset, batch_size=1024):
         )
 
     return torch.cat(returns)
+
+
+def calculate_advantage(expected_return, actual_return, advantage_threshold=0.0):
+    """
+    Calculates the advantage and the boolean mask of positive advantages.
+    Returns:
+        advantage: A tensor representing the difference (expected - actual)
+        advantage_bool: A list of booleans indicating if the advantage is positive
+    """
+    advantage = expected_return - actual_return
+    advantage_bool = (advantage > advantage_threshold).tolist()
+    return advantage, advantage_bool

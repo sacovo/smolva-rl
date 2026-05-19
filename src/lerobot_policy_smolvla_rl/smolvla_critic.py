@@ -15,7 +15,6 @@ from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TO
 C_FAIL = 10000
 
 
-
 def pad_tensor(tensor, max_len, pad_value=0):
     b, d = tensor.shape[:2]
     padded_tensor = torch.full(
@@ -26,7 +25,6 @@ def pad_tensor(tensor, max_len, pad_value=0):
     )
     padded_tensor[:, :d] = tensor
     return padded_tensor
-
 
 
 @PreTrainedConfig.register_subclass("smolvla_critic")
@@ -50,17 +48,13 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
         hidden_size = self.vlm_with_expert.vlm.config.text_config.hidden_size
         # hidden_size = 960
 
-
         self.c51_head = nn.Sequential(
             nn.Linear(hidden_size, config.num_bins).to(
                 dtype=self.vlm_with_expert.vlm.dtype
             ),
         )
 
-
-    def _prepare_batch(
-        self, batch: dict[str, torch.Tensor] 
-    ):
+    def _prepare_batch(self, batch: dict[str, torch.Tensor]):
 
         images, img_masks = modeling_smolvla.SmolVLAPolicy.prepare_images(self, batch)
         state = modeling_smolvla.SmolVLAPolicy.prepare_state(self, batch)
@@ -68,7 +62,6 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         return images, img_masks, state, lang_tokens, lang_masks
-
 
     def forward(self, batch: dict[str, torch.Tensor]):
         images, img_masks, state, lang_tokens, lang_masks = self._prepare_batch(batch)
@@ -82,14 +75,15 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
 
         return self._forward(images, img_masks, lang_tokens, lang_masks, state)
 
-
     def _forward(self, images, img_masks, lang_tokens, lang_masks, state):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
 
-        prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+            prefix_pad_masks, prefix_att_masks
+        )
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         outputs_embeds, _ = self.vlm_with_expert.forward(
@@ -106,7 +100,7 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
 
         state_out = prefix_out[:, -1:]
 
-        logits = self.c51_head(state_out).squeeze(1) # [B, num_bins]
+        logits = self.c51_head(state_out).squeeze(1)  # [B, num_bins]
 
         distribution = torch.softmax(logits, dim=-1)
 
@@ -117,13 +111,13 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
         Compute cross-entropy loss for value function training.
         """
         logits, _ = self.forward(batch)
-        
+
         targets = torch.clamp(time_to_completion, 0, self.config.num_bins - 1)
-        
+
         if weights is not None:
             loss = F.cross_entropy(logits, targets, reduction="none")
             return (loss * weights).mean()
-        
+
         return F.cross_entropy(logits, targets)
 
     def get_pre_processor(self, dataset: LeRobotDataset):

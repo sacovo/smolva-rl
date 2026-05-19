@@ -48,10 +48,24 @@ def parse_args():
     )
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--steps", type=int, default=5000, help="Total training steps")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for the VLM backbone")
-    parser.add_argument("--lr_head", type=float, default=1e-3, help="Learning rate for the critic head (c51_head)")
-    parser.add_argument("--min_lr", type=float, default=2.5e-6, help="Minimum learning rate for cosine decay")
-    parser.add_argument("--warmup_steps", type=int, default=100, help="Number of warmup steps")
+    parser.add_argument(
+        "--lr", type=float, default=1e-4, help="Learning rate for the VLM backbone"
+    )
+    parser.add_argument(
+        "--lr_head",
+        type=float,
+        default=1e-3,
+        help="Learning rate for the critic head (c51_head)",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=2.5e-6,
+        help="Minimum learning rate for cosine decay",
+    )
+    parser.add_argument(
+        "--warmup_steps", type=int, default=100, help="Number of warmup steps"
+    )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
@@ -82,25 +96,25 @@ def parse_args():
         "--accumulation_steps",
         type=int,
         default=1,
-        help="Accumulate over multiple steps"
+        help="Accumulate over multiple steps",
     )
     parser.add_argument(
         "--state_dropout",
         type=float,
         default=0.0,
-        help="Probability of zeroing out the entire state during training"
+        help="Probability of zeroing out the entire state during training",
     )
     parser.add_argument(
         "--end_weight",
         type=float,
         default=1.0,
-        help="Loss weight multiplier for frames near the end of an episode"
+        help="Loss weight multiplier for frames near the end of an episode",
     )
     parser.add_argument(
         "--end_threshold",
         type=float,
         default=-0.2,
-        help="Return threshold above which end_weight is applied (e.g., -0.2 means last 20%%)"
+        help="Return threshold above which end_weight is applied (e.g., -0.2 means last 20%%)",
     )
     return parser.parse_args()
 
@@ -108,13 +122,17 @@ def parse_args():
 def main():
     args = parse_args()
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(log_with='wandb', gradient_accumulation_steps=args.accumulation_steps, kwargs_handlers=[ddp_kwargs])
+    accelerator = Accelerator(
+        log_with="wandb",
+        gradient_accumulation_steps=args.accumulation_steps,
+        kwargs_handlers=[ddp_kwargs],
+    )
 
     # Initialize Weights & Biases
     accelerator.init_trackers(
         project_name=args.wandb_project,
         config=vars(args),
-        init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.job_name}}
+        init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.job_name}},
     )
     device = accelerator.device
 
@@ -150,13 +168,15 @@ def main():
     )
     features = dataset_to_policy_features(dataset.meta.features)
 
-    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+    output_features = {
+        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+    }
+    input_features = {
+        key: ft for key, ft in features.items() if key not in output_features
+    }
 
     config.input_features = input_features
-    model = SmolVLACrictic(
-        config
-    ).to(device)
+    model = SmolVLACrictic(config).to(device)
 
     # Group parameters for differential learning rates
     head_params = []
@@ -173,9 +193,9 @@ def main():
     ]
 
     optimizer = torch.optim.AdamW(
-        optimizer_grouped_parameters, 
+        optimizer_grouped_parameters,
         weight_decay=args.weight_decay,
-        betas=(args.beta1, args.beta2)
+        betas=(args.beta1, args.beta2),
     )
 
     # Use cosine scheduler with warmup
@@ -200,7 +220,11 @@ def main():
 
     if args.resume_from == "auto":
         if os.path.exists(output_dir):
-            checkpoints = [d for d in os.listdir(output_dir) if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))]
+            checkpoints = [
+                d
+                for d in os.listdir(output_dir)
+                if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
+            ]
             if checkpoints:
                 # Sort by step number
                 latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[1]))
@@ -210,7 +234,9 @@ def main():
         else:
             args.resume_from = None
 
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model, optimizer, dataloader, scheduler
+    )
 
     if args.resume_from:
         accelerator.load_state(args.resume_from)
@@ -219,15 +245,15 @@ def main():
             step = int(os.path.basename(args.resume_from).split("_")[1])
             print(f"Resumed training state from {args.resume_from} at step {step}")
         except (ValueError, IndexError):
-            print(f"Resumed training state from {args.resume_from}, but could not determine step. Starting from 0.")
+            print(
+                f"Resumed training state from {args.resume_from}, but could not determine step. Starting from 0."
+            )
 
     progress_bar = tqdm(total=args.steps, initial=step, desc="Training")
-
 
     while step < args.steps:
         for batch in dataloader:
             with accelerator.accumulate(model):
-
                 if step >= args.steps:
                     break
 
@@ -241,15 +267,25 @@ def main():
 
                 # Map normalized returns [-1.0, 0.0] to bin indices [0, 200]
                 # Formula: index = (val - vmin) / (vmax - vmin) * (num_bins - 1)
-                normalized_indices = ((returns - config.vmin) / (config.vmax - config.vmin)) * (config.num_bins - 1)
-                time_to_completion = torch.clamp(normalized_indices, 0, config.num_bins - 1).long().to(device)
+                normalized_indices = (
+                    (returns - config.vmin) / (config.vmax - config.vmin)
+                ) * (config.num_bins - 1)
+                time_to_completion = (
+                    torch.clamp(normalized_indices, 0, config.num_bins - 1)
+                    .long()
+                    .to(device)
+                )
 
                 # Apply end-of-episode weighting
                 weights = torch.ones_like(returns)
                 if args.end_weight != 1.0:
-                    weights = torch.where(returns > args.end_threshold, args.end_weight, 1.0)
+                    weights = torch.where(
+                        returns > args.end_threshold, args.end_weight, 1.0
+                    )
 
-                loss = model.compute_loss(pre(batch), time_to_completion, weights=weights)
+                loss = model.compute_loss(
+                    pre(batch), time_to_completion, weights=weights
+                )
 
                 # loss.backward()
                 accelerator.backward(loss)
@@ -258,15 +294,12 @@ def main():
                 scheduler.step()
                 optimizer.zero_grad()
 
-
                 if step % args.log_freq == 0:
                     accelerator.log({"loss": loss.item(), "step": step})
                     progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
                 if (step + 1) % args.save_freq == 0:
-                    save_path = os.path.join(
-                        output_dir, f"state_{step + 1}.pt"
-                    )
+                    save_path = os.path.join(output_dir, f"state_{step + 1}.pt")
                     # torch.save(model.state_dict(), save_path)
                     accelerator.wait_for_everyone()
                     accelerator.save_state(save_path)

@@ -3,6 +3,7 @@ import numpy as np
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.configs.policies import PreTrainedConfig
 
+
 @PreTrainedConfig.register_subclass("smolvla_recap")
 @dataclass
 class SmolVLARECAPConfig(SmolVLAConfig):
