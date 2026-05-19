@@ -120,21 +120,32 @@ normalized_indices = ((returns - config.vmin) / (config.vmax - config.vmin)) * (
 time_to_completion = torch.clamp(normalized_indices, 0, config.num_bins - 1).long().to(device)
 ```
 
-**Policy Conditioning (`train_recap.py`)**
+**Policy Conditioning (`train_recap.py` & `advantage_utils.py`)**
 
-The critic calculates the expected return $V(s) = \sum (p_i \cdot z_i)$, where $z_i$ is the support value of bin $i$.
-
-**⚠️ MATHEMATICAL INCONSISTENCY IN ADVANTAGE**
-In standard RL formulations, Advantage is defined as $A = Q(s,a) - V(s)$ (i.e., `actual_return - expected_return`). The current implementation calculates the mathematical opposite:
+The policy uses a Temporal Difference (TD) approach to calculate the advantage of an action chunk. It compares the state value before and after the action chunk is executed: $A(s_t) = V(s_{t+\text{chunk\_size}}) - V(s_t)$. The expected return $V(s)$ is computed as the expected value of the critic's predicted C51 distribution: $V(s) = \sum (p_i \cdot z_i)$, where $z_i$ is the support value of bin $i$.
 
 ```python
-# Calculate expected return V(s) in [-1, 0]
-v_s = (probs * support).sum(dim=-1)
+def compute_temporal_advantage(critic, pre_critic, batch, future_batch, support, has_future):
+    # 1. Current V(s_t)
+    critic_batch = pre_critic(batch)
+    _, probs = critic(critic_batch)
+    v_s = (probs * support).sum(dim=-1)
 
-# Advantage logic (INCONSISTENT IMPLEMENTATION)
-# Mathematical definition should be: actual_return - v_s
-advantage = v_s - actual_return
-advantage_bool = (advantage > advantage_threshold).tolist() 
+    # 2. Future V(s_{t+chunk_size})
+    future_critic_batch = pre_critic(future_batch)
+    _, future_probs = critic(future_critic_batch)
+    v_s_future = (future_probs * support).sum(dim=-1)
+
+    # Where not has_future, v_s_future should be 0.0 (task completion)
+    v_s_future = torch.where(has_future, v_s_future, torch.zeros_like(v_s_future))
+
+    advantage = v_s_future - v_s
+    return advantage, v_s, v_s_future
 ```
 
-Because of this, if the actual return is *worse* (more negative) than $V(s)$, the calculation `v_s - actual_return` evaluates to a positive number. Consequently, a "bad" action that took longer than expected is erroneously assigned a `<advantage_positive>` token. *No fix has been applied to the code as per instructions, but developers utilizing this repository should be aware of this reversed polarity.*
+This advantage is then compared against a task-specific threshold $\epsilon_l$ (calculated from the dataset distribution of values) to determine if the action was "good" (`<advantage_positive>`) or "bad" (`<advantage_negative>`).
+
+```python
+# Compare advantage against task-specific epsilon_l
+advantage_bool = (advantage > batch_thresholds).tolist()
+```
