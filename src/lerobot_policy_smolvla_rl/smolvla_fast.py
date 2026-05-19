@@ -68,8 +68,8 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
         if self.action_stats is None:
             return actions
         
-        q01 = self.action_stats["q01"]
-        q99 = self.action_stats["q99"]
+        q01 = self.action_stats.get("q01", self.action_stats.get("min"))
+        q99 = self.action_stats.get("q99", self.action_stats.get("max"))
         # Linear mapping from [q01, q99] to [-1, 1]
         normalized = 2.0 * (actions - q01) / (q99 - q01 + 1e-8) - 1.0
         return normalized
@@ -79,8 +79,8 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
         if self.action_stats is None:
             return normalized
         
-        q01 = self.action_stats["q01"]
-        q99 = self.action_stats["q99"]
+        q01 = self.action_stats.get("q01", self.action_stats.get("min"))
+        q99 = self.action_stats.get("q99", self.action_stats.get("max"))
         actions = (normalized + 1.0) / 2.0 * (q99 - q01 + 1e-8) + q01
         return actions
 

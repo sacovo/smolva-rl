@@ -63,6 +63,10 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # Apply Knowledge Insulation (KI) Patch
         self._apply_ki_patch()
 
+        # Ensure projection layers are in the same dtype as the VLM
+        self.action_in_proj.to(self.vlm_with_expert.vlm.dtype)
+        self.action_out_proj.to(self.vlm_with_expert.vlm.dtype)
+
     def _apply_ki_patch(self):
         """Patch the forward_attn_layer to implement Knowledge Insulation."""
         original_forward_attn = self.vlm_with_expert.forward_attn_layer
@@ -142,7 +146,8 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         )
         
         vlm_hidden = outputs_embeds[0]
-        logits = self.vlm_with_expert.vlm.language_model.lm_head(vlm_hidden)
+        head = self.vlm_with_expert.vlm.get_output_embeddings()
+        logits = head(vlm_hidden.to(head.weight.dtype))
         
         labels = torch.full_like(full_pad_masks.long(), -100)
         prefix_len = prefix_embs.shape[1]
@@ -156,25 +161,31 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # 5. Action Expert (Flow Matching loss)
         # Detach VLM hidden states for KI
         vlm_prefix_hidden = vlm_hidden[:, :prefix_len, :]
+        expert_dtype = next(self.vlm_with_expert.lm_expert.parameters()).dtype
         
         bsize = full_embs.shape[0]
         device = full_embs.device
-        tau = torch.rand((bsize, 1, 1), device=device)
-        omega = torch.randn_like(batch[ACTION]).to(device)
-        noised_actions = tau * batch[ACTION].to(device) + (1 - tau) * omega
+        tau = torch.rand((bsize, 1, 1), device=device, dtype=expert_dtype)
+        omega = torch.randn_like(batch[ACTION]).to(device=device, dtype=expert_dtype)
+        noised_actions = tau * batch[ACTION].to(device=device, dtype=expert_dtype) + (1 - tau) * omega
         
-        expert_input = self.action_in_proj(noised_actions.to(self.vlm_with_expert.vlm.dtype))
+        expert_input = self.action_in_proj(noised_actions.to(next(self.action_in_proj.parameters()).dtype))
         
         expert_outputs = self.vlm_with_expert.lm_expert(
-            inputs_embeds=expert_input,
-            encoder_hidden_states=vlm_prefix_hidden.detach(), # KI
+            inputs_embeds=expert_input.to(expert_dtype),
+            encoder_hidden_states=vlm_prefix_hidden.detach().to(expert_dtype), # KI
             return_dict=True
         )
         expert_hidden = expert_outputs.last_hidden_state
         
-        predicted_flow = self.action_out_proj(expert_hidden)
-        target_flow = omega - batch[ACTION].to(device)
-        flow_loss = F.mse_loss(predicted_flow, target_flow)
+        predicted_flow = self.action_out_proj(expert_hidden.to(next(self.action_out_proj.parameters()).dtype))
+        target_flow = omega - batch[ACTION].to(device=device, dtype=expert_dtype)
+        
+        # Ensure shapes match for MSE loss (handle potential sequence/chunk dimension)
+        if predicted_flow.ndim == 3 and target_flow.ndim == 2:
+            target_flow = target_flow.unsqueeze(1)
+            
+        flow_loss = F.mse_loss(predicted_flow.to(torch.float32), target_flow.to(torch.float32))
         
         total_loss = ar_loss + flow_loss
         return total_loss, ar_loss, flow_loss
@@ -182,6 +193,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
     def generate_action(self, batch, chunk_size=None):
         """Generate action tokens including observation state."""
         return self.fast_wrapper.generate_action(batch, chunk_size=chunk_size)
+
+    def get_pre_processor(self, dataset):
+        return self.fast_wrapper.get_pre_processor(dataset)
 
 
 class SmolVLARECAPPolicy(PreTrainedPolicy):
