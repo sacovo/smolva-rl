@@ -95,6 +95,9 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
         self, actions: np.ndarray, return_mask: bool = False
     ) -> torch.Tensor:
         """Convert action chunks to VLM token IDs with padding."""
+        if actions.ndim == 2:
+            actions = np.expand_dims(actions, axis=1)
+
         # 1. Normalize
         actions = self._normalize_actions(actions)
 

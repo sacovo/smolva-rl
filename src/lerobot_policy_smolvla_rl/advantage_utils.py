@@ -31,10 +31,10 @@ class FutureFrameWrapper(Dataset):
         if has_future:
             future_item = self.dataset[idx + self.chunk_size]
         else:
-            future_item = item  # Dummy to keep shapes consistent
+            future_item = self.dataset[idx]
 
         # Prefix future item keys
-        for k, v in future_item.items():
+        for k, v in list(future_item.items()):
             if k != "has_future":
                 item[f"future_{k}"] = v
 
@@ -102,10 +102,10 @@ def get_task_thresholds(
     )
 
     pre_critic = critic_model.get_pre_processor(dataset)
-    all_vs = np.zeros(len(dataset), dtype=np.float32)
-    all_tasks = np.zeros(len(dataset), dtype=np.int32)
-    all_episodes = np.zeros(len(dataset), dtype=np.int32)
-    all_frames = np.zeros(len(dataset), dtype=np.int32)
+    all_vs_list = []
+    all_tasks_list = []
+    all_episodes_list = []
+    all_frames_list = []
 
     critic_model.eval()
     # Move critic to correct device just in case
@@ -127,11 +127,15 @@ def get_task_thresholds(
             _, probs = critic_model(critic_batch)
             v_s = (probs * support).sum(dim=-1).cpu().numpy()
 
-            indices = batch["index"].numpy()
-            all_vs[indices] = v_s
-            all_tasks[indices] = batch["task_index"].numpy()
-            all_episodes[indices] = batch["episode_index"].numpy()
-            all_frames[indices] = batch["frame_index"].numpy()
+            all_vs_list.append(v_s)
+            all_tasks_list.append(batch["task_index"].numpy())
+            all_episodes_list.append(batch["episode_index"].numpy())
+            all_frames_list.append(batch["frame_index"].numpy())
+
+    all_vs = np.concatenate(all_vs_list)
+    all_tasks = np.concatenate(all_tasks_list)
+    all_episodes = np.concatenate(all_episodes_list)
+    all_frames = np.concatenate(all_frames_list)
 
     ep_lengths = get_episode_lengths(dataset).numpy()
 

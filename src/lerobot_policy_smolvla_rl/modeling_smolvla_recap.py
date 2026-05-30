@@ -58,6 +58,8 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         self.fast_wrapper = SmolVLAFast(fast_config)
         # Point to the same VLM with Expert instance to avoid redundant weights
         self.fast_wrapper.vlm_with_expert = self.vlm_with_expert
+        # Re-initialize action embeddings on the shared VLM instance!
+        self.fast_wrapper._initialize_action_embeddings()
 
         # Add Advantage Tokens if requested
         if config.use_advantage_conditioning:
@@ -81,7 +83,8 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # Apply Knowledge Insulation (KI) Patch
         self._apply_ki_patch()
 
-        # Ensure projection layers are in the same dtype as the VLM
+        # Ensure projection layers and expert are in the same dtype as the VLM
+        self.vlm_with_expert.lm_expert.to(self.vlm_with_expert.vlm.dtype)
         self.action_in_proj.to(self.vlm_with_expert.vlm.dtype)
         self.action_out_proj.to(self.vlm_with_expert.vlm.dtype)
 
@@ -132,7 +135,20 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                     **kwargs,
                 )
 
-                return [vlm_out[0], expert_out[1]], None
+                if len(vlm_out) == 1:
+                    # Self-attention mode: both inputs concatenated in a single attention output
+                    vlm_len = vlm_hidden.shape[1]
+                    unified_att_output = torch.cat(
+                        [
+                            vlm_out[0][:, :vlm_len],
+                            expert_out[0][:, vlm_len:],
+                        ],
+                        dim=1,
+                    )
+                    return [unified_att_output], None
+                else:
+                    # Cross-attention mode: separate attention outputs
+                    return [vlm_out[0], expert_out[1]], None
 
             return original_forward_attn(
                 model_layers,
@@ -223,38 +239,50 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         )
 
         # 5. Action Expert (Flow Matching loss)
-        # Detach VLM hidden states for KI
-        vlm_prefix_hidden = vlm_hidden[:, :prefix_len, :]
-        expert_dtype = next(self.vlm_with_expert.lm_expert.parameters()).dtype
+        expert_dtype = self.vlm_with_expert.vlm.dtype
 
-        bsize = full_embs.shape[0]
-        device = full_embs.device
-        tau = torch.rand((bsize, 1, 1), device=device, dtype=expert_dtype)
-        omega = torch.randn_like(batch[ACTION]).to(device=device, dtype=expert_dtype)
+        bsize = prefix_embs.shape[0]
+        device = prefix_embs.device
+        
+        actions = batch[ACTION]
+        if actions.ndim == 2:
+            actions = actions.unsqueeze(1)
+            
+        tau = torch.rand((bsize, 1), device=device, dtype=expert_dtype)
+        omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
+        
+        tau_expanded = tau[:, :, None]
         noised_actions = (
-            tau * batch[ACTION].to(device=device, dtype=expert_dtype)
-            + (1 - tau) * omega
+            tau_expanded * actions.to(device=device, dtype=expert_dtype)
+            + (1 - tau_expanded) * omega
+        )
+        target_flow = omega - actions.to(device=device, dtype=expert_dtype)
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            noised_actions, tau.squeeze(1)
         )
 
-        expert_input = self.action_in_proj(
-            noised_actions.to(next(self.action_in_proj.parameters()).dtype)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+
+        att_2d_masks = modeling_smolvla.make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        # Run unified forward pass with Knowledge Insulation patch active
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
         )
 
-        expert_outputs = self.vlm_with_expert.lm_expert(
-            inputs_embeds=expert_input.to(expert_dtype),
-            encoder_hidden_states=vlm_prefix_hidden.detach().to(expert_dtype),  # KI
-            return_dict=True,
-        )
-        expert_hidden = expert_outputs.last_hidden_state
-
+        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
         predicted_flow = self.action_out_proj(
-            expert_hidden.to(next(self.action_out_proj.parameters()).dtype)
+            suffix_out.to(next(self.action_out_proj.parameters()).dtype)
         )
-        target_flow = omega - batch[ACTION].to(device=device, dtype=expert_dtype)
-
-        # Ensure shapes match for MSE loss (handle potential sequence/chunk dimension)
-        if predicted_flow.ndim == 3 and target_flow.ndim == 2:
-            target_flow = target_flow.unsqueeze(1)
 
         flow_loss = F.mse_loss(
             predicted_flow.to(torch.float32), target_flow.to(torch.float32)
