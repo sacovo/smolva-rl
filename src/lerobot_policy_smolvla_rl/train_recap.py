@@ -263,7 +263,7 @@ def main():
                 # Prepare batch for RECAP (tokenization, normalization)
                 recap_batch = pre_recap(batch)
 
-                total_loss, ar_loss, flow_loss = model.compute_loss(
+                total_loss, ar_loss, flow_loss = model(
                     recap_batch, advantage=advantage_bool
                 )
 

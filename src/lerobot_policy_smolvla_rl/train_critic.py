@@ -8,6 +8,7 @@ from lerobot_policy_smolvla_rl.ds_utils import (
 import argparse
 import os
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -283,9 +284,14 @@ def main():
                         returns > args.end_threshold, args.end_weight, 1.0
                     )
 
-                loss = model.compute_loss(
-                    pre(batch), time_to_completion, weights=weights
-                )
+                logits, _ = model(pre(batch))
+                targets = torch.clamp(time_to_completion, 0, config.num_bins - 1)
+
+                if args.end_weight != 1.0:
+                    loss = F.cross_entropy(logits, targets, reduction="none")
+                    loss = (loss * weights).mean()
+                else:
+                    loss = F.cross_entropy(logits, targets)
 
                 # loss.backward()
                 accelerator.backward(loss)

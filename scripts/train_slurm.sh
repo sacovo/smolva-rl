@@ -17,6 +17,7 @@ mkdir -p logs
 
 # Ensure uv is in PATH (adjust if necessary for your cluster)
 export PATH="$HOME/.local/bin:$PATH"
+export PYTHONUNBUFFERED=1
 
 if [ -z "$1" ]; then
     echo "Usage: sbatch scripts/train_slurm.sh <train_script_path> [args...]"

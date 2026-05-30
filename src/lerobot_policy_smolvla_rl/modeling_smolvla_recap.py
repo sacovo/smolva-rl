@@ -163,6 +163,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
 
         self.vlm_with_expert.forward_attn_layer = ki_forward_attn_layer
 
+    def forward(self, batch, camera_keys=None, advantage=None):
+        return self.compute_loss(batch, camera_keys=camera_keys, advantage=advantage)
+
     def compute_loss(self, batch, camera_keys=None, advantage=None):
         """
         Compute combined loss: AR loss on FAST tokens + Flow Matching loss on continuous actions.
