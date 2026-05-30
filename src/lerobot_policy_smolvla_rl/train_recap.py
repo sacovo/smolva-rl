@@ -1,5 +1,6 @@
 import argparse
 import os
+import json
 import numpy as np
 
 import torch
@@ -124,7 +125,8 @@ def main():
 
     # 1. Load Dataset
     print(f"Loading dataset: {args.dataset_repo_id}")
-    dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+    with accelerator.local_main_process_first():
+        dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
     # 2. Check for precomputed advantages (.npy)
     precomputed_advantages = None
@@ -172,8 +174,16 @@ def main():
             num_vlm_layers=args.critic_num_vlm_layers,
             input_features=input_features,
         )
-        critic = SmolVLACrictic(critic_config).to(device)
-        critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
+        with accelerator.local_main_process_first():
+            critic = SmolVLACrictic(critic_config).to(device)
+            critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
+        
+        # Explicitly cast floating point weights to ensure strict matching across ranks
+        if accelerator.mixed_precision == "bf16":
+            critic = critic.to(dtype=torch.bfloat16)
+        elif accelerator.mixed_precision == "fp16":
+            critic = critic.to(dtype=torch.float16)
+        
         critic.eval()
 
         support = torch.linspace(
@@ -233,7 +243,15 @@ def main():
         chunk_size=1,
         n_action_steps=1,
     )
-    model = SmolVLARECAP(recap_config).to(device)
+    with accelerator.local_main_process_first():
+        model = SmolVLARECAP(recap_config).to(device)
+
+    # Explicitly cast floating point weights to ensure strict matching across ranks
+    if accelerator.mixed_precision == "bf16":
+        model = model.to(dtype=torch.bfloat16)
+    elif accelerator.mixed_precision == "fp16":
+        model = model.to(dtype=torch.float16)
+
     pre_recap = model.get_pre_processor(dataset)
 
     optimizer = torch.optim.AdamW(
@@ -268,6 +286,72 @@ def main():
                 args.resume_from = None
         else:
             args.resume_from = None
+
+    # Verify input_features and model parameters consistency across all ranks
+    if accelerator.use_distributed:
+        print(f"[Rank {accelerator.process_index}] Verifying model parameters and input features consistency...")
+        local_cams = sorted(list(input_features.keys()))
+        local_params = []
+        for name, param in model.named_parameters():
+            local_params.append((name, list(param.shape), str(param.dtype), param.requires_grad))
+        
+        gathered_cams = [None] * accelerator.num_processes
+        gathered_params = [None] * accelerator.num_processes
+        
+        try:
+            torch.distributed.all_gather_object(gathered_cams, local_cams)
+            torch.distributed.all_gather_object(gathered_params, local_params)
+            
+            if accelerator.is_main_process:
+                mismatch_found = False
+                ref_cams = gathered_cams[0]
+                ref_params = gathered_params[0]
+                ref_dict = {item[0]: item for item in ref_params}
+                
+                # Check cameras consistency
+                for rank_idx in range(1, accelerator.num_processes):
+                    rank_cams = gathered_cams[rank_idx]
+                    if ref_cams != rank_cams:
+                        print(f"CRITICAL ERROR: Camera key list mismatch! Rank 0 has {ref_cams}, but Rank {rank_idx} has {rank_cams}")
+                        mismatch_found = True
+                        
+                # Check parameters consistency
+                for rank_idx in range(1, accelerator.num_processes):
+                    rank_params = gathered_params[rank_idx]
+                    rank_dict = {item[0]: item for item in rank_params}
+                    
+                    if len(ref_params) != len(rank_params):
+                        print(f"CRITICAL ERROR: Parameter count mismatch! Rank 0 has {len(ref_params)} params, but Rank {rank_idx} has {len(rank_params)} params.")
+                        mismatch_found = True
+                        
+                    for name, shape, dtype, req_grad in ref_params:
+                        if name not in rank_dict:
+                            print(f"CRITICAL ERROR: Parameter '{name}' in Rank 0 is missing in Rank {rank_idx}!")
+                            mismatch_found = True
+                        else:
+                            r_name, r_shape, r_dtype, r_req_grad = rank_dict[name]
+                            if shape != r_shape:
+                                print(f"CRITICAL ERROR: Parameter '{name}' shape mismatch! Rank 0: {shape}, Rank {rank_idx}: {r_shape}")
+                                mismatch_found = True
+                            if dtype != r_dtype:
+                                print(f"CRITICAL ERROR: Parameter '{name}' dtype mismatch! Rank 0: {dtype}, Rank {rank_idx}: {r_dtype}")
+                                mismatch_found = True
+                            if req_grad != r_req_grad:
+                                print(f"CRITICAL ERROR: Parameter '{name}' requires_grad mismatch! Rank 0: {req_grad}, Rank {rank_idx}: {r_req_grad}")
+                                mismatch_found = True
+                                
+                    for name in rank_dict:
+                        if name not in ref_dict:
+                            print(f"CRITICAL ERROR: Parameter '{name}' in Rank {rank_idx} is missing in Rank 0!")
+                            mismatch_found = True
+                            
+                if mismatch_found:
+                    print("CRITICAL: PARAMETER OR FEATURE STRUCTURAL MISMATCH DETECTED ACROSS RANKS! Raising error to avoid DDP hang.")
+                    raise RuntimeError("Parameter/feature structural mismatch detected across ranks before DDP preparation.")
+                else:
+                    print("SUCCESS: All model parameters and input features are perfectly consistent across all ranks!")
+        except Exception as check_err:
+            print(f"WARNING: Rank consistency check encountered an issue: {check_err}")
 
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
