@@ -117,6 +117,13 @@ def parse_args():
         default=-0.2,
         help="Return threshold above which end_weight is applied (e.g., -0.2 means last 20%%)",
     )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of camera keys to use (e.g. observation.images.exterior_image_1_left observation.images.wrist_image_left). If None, all cameras in the dataset are used.",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +182,13 @@ def main():
     input_features = {
         key: ft for key, ft in features.items() if key not in output_features
     }
+
+    if args.cameras:
+        all_cameras = [k for k in input_features if k.startswith("observation.images.")]
+        for cam in all_cameras:
+            if cam not in args.cameras:
+                print(f"Filtering out camera: {cam}")
+                del input_features[cam]
 
     config.input_features = input_features
     model = SmolVLACrictic(config).to(device)

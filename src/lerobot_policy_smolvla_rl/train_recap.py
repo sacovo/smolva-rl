@@ -1,5 +1,6 @@
 import argparse
 import os
+import numpy as np
 
 import torch
 from accelerate import Accelerator
@@ -32,7 +33,7 @@ def parse_args():
         help="List of episodes to load for testing",
     )
     parser.add_argument(
-        "--critic_checkpoint", type=str, help="Path to trained critic checkpoint"
+        "--critic_checkpoint", type=str, default=None, help="Path to trained critic checkpoint"
     )
     parser.add_argument(
         "--action_chunk_size",
@@ -45,6 +46,12 @@ def parse_args():
         type=str,
         default=None,
         help="Path to save/load epsilon_l thresholds",
+    )
+    parser.add_argument(
+        "--precomputed_advantages",
+        type=str,
+        default=None,
+        help="Path to precomputed advantages (.npy) array file to run in offline mode",
     )
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -88,6 +95,13 @@ def parse_args():
         default=None,
         help="Path to state to resume from, or 'auto' to find the latest in save_dir",
     )
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of camera keys to use (e.g. observation.images.exterior_image_1_left observation.images.wrist_image_left). If None, all cameras in the dataset are used.",
+    )
     return parser.parse_args()
 
 
@@ -112,13 +126,19 @@ def main():
     print(f"Loading dataset: {args.dataset_repo_id}")
     dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
-    # 2. Load Critic (for advantage conditioning)
+    # 2. Check for precomputed advantages (.npy)
+    precomputed_advantages = None
+    safe_repo_name = args.dataset_repo_id.replace("/", "_")
+    advantages_path = args.precomputed_advantages
+    if not advantages_path:
+        advantages_path = os.path.join(args.save_dir, f"task_advantages_{safe_repo_name}.npy")
+    
+    if os.path.exists(advantages_path):
+        print(f"Loading pre-computed advantages from {advantages_path}")
+        precomputed_advantages = np.load(advantages_path)
+    
+    # 3. Initialize/Load Critic (only if pre-computed advantages do not exist)
     critic = None
-    if not args.critic_checkpoint:
-        raise ValueError("Critic checkpoint is needed for RECAP training")
-
-    print(f"Loading critic from {args.critic_checkpoint}")
-
     features = dataset_to_policy_features(dataset.meta.features)
     output_features = {
         key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
@@ -127,43 +147,75 @@ def main():
         key: ft for key, ft in features.items() if key not in output_features
     }
 
-    # Initialize config for critic
-    critic_config = SmolVLMCriticConfig(
-        num_bins=201,
-        num_vlm_layers=args.critic_num_vlm_layers,
-        input_features=input_features,
-    )
-    critic = SmolVLACrictic(critic_config).to(device)
-    critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
-    critic.eval()
-
-    support = torch.linspace(
-        critic.config.vmin, critic.config.vmax, critic.config.num_bins, device=device
-    )
-    pre_critic = critic.get_pre_processor(dataset)
+    if args.cameras:
+        all_cameras = [k for k in input_features if k.startswith("observation.images.")]
+        for cam in all_cameras:
+            if cam not in args.cameras:
+                print(f"Filtering out camera: {cam}")
+                del input_features[cam]
 
     thresholds_save_path = args.thresholds_path
     if not thresholds_save_path:
-        safe_repo_name = args.dataset_repo_id.replace("/", "_")
         thresholds_save_path = os.path.join(
             args.save_dir,
             f"task_thresholds_{safe_repo_name}.json",
         )
 
-    # Calculate or load epsilon_l per task based on the raw dataset
-    task_thresholds = get_task_thresholds(
-        critic,
-        dataset,
-        support,
-        args.action_chunk_size,
-        thresholds_save_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        batch_size=8,
-        num_workers=args.num_workers,
-    )
+    if precomputed_advantages is None:
+        if not args.critic_checkpoint:
+            raise ValueError("Critic checkpoint is needed for RECAP training unless pre-computed advantages are provided")
 
-    # Wrap dataset to include future frames on the fly
-    wrapped_dataset = FutureFrameWrapper(dataset, args.action_chunk_size)
+        print(f"Loading critic from {args.critic_checkpoint}")
+        # Initialize config for critic
+        critic_config = SmolVLMCriticConfig(
+            num_bins=201,
+            num_vlm_layers=args.critic_num_vlm_layers,
+            input_features=input_features,
+        )
+        critic = SmolVLACrictic(critic_config).to(device)
+        critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
+        critic.eval()
+
+        support = torch.linspace(
+            critic.config.vmin, critic.config.vmax, critic.config.num_bins, device=device
+        )
+        pre_critic = critic.get_pre_processor(dataset)
+
+        # Calculate epsilon_l per task based on the raw dataset (only on main process to avoid multi-GPU I/O bottlenecks)
+        if accelerator.is_main_process:
+            task_thresholds = get_task_thresholds(
+                critic,
+                dataset,
+                support,
+                args.action_chunk_size,
+                thresholds_save_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                batch_size=8,
+                num_workers=0,  # use 0 workers to prevent multiprocessing shm/forking pickler crashes on HPC nodes
+            )
+        
+        accelerator.wait_for_everyone()
+
+        if not accelerator.is_main_process:
+            import json
+            with open(thresholds_save_path, "r") as f:
+                str_keys = json.load(f)
+                task_thresholds = {int(k): v for k, v in str_keys.items()}
+    else:
+        # Load thresholds directly from JSON
+        print(f"Loading pre-computed advantage thresholds from {thresholds_save_path}")
+        with open(thresholds_save_path, "r") as f:
+            str_keys = json.load(f)
+            task_thresholds = {int(k): v for k, v in str_keys.items()}
+
+    # 4. Wrap/Load Dataloader
+    if precomputed_advantages is None:
+        # Wrap dataset to include future frames on the fly for on-the-fly calculation
+        wrapped_dataset = FutureFrameWrapper(dataset, args.action_chunk_size)
+    else:
+        # High-Speed Offline Mode: use the raw dataset directly (no future wrappers needed!)
+        wrapped_dataset = dataset
+
     dataloader = DataLoader(
         wrapped_dataset,
         batch_size=args.batch_size,
@@ -243,13 +295,17 @@ def main():
             with accelerator.accumulate(model):
                 # Label advantage
                 with torch.no_grad():
-                    future_batch = extract_future_batch(batch)
-                    has_future = batch["has_future"].to(device)
-
-                    # Compute temporal advantage on the fly
-                    advantage, _, _ = compute_temporal_advantage(
-                        critic, pre_critic, batch, future_batch, support, has_future
-                    )
+                    if precomputed_advantages is not None:
+                        # High-Speed Offline Mode: direct array lookup using absolute index
+                        batch_indices = batch["index"].cpu().numpy()
+                        advantage = torch.tensor(precomputed_advantages[batch_indices], device=device)
+                    else:
+                        # On-the-fly Mode: compute using Critic forward passes
+                        future_batch = extract_future_batch(batch)
+                        has_future = batch["has_future"].to(device)
+                        advantage, _, _ = compute_temporal_advantage(
+                            critic, pre_critic, batch, future_batch, support, has_future
+                        )
 
                     # Compare advantage against task-specific epsilon_l
                     task_indices = batch["task_index"].cpu().numpy()
