@@ -70,6 +70,7 @@ def parse_args():
         default="recap_model",
         help="Name of the experiment/model (used for output directory)",
     )
+    parser.add_argument("--job_name", type=str, default="train_recap")
     parser.add_argument("--wandb_project", type=str, default="smolvla-recap")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -103,7 +104,7 @@ def main():
     accelerator.init_trackers(
         project_name=args.wandb_project,
         config=vars(args),
-        init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.model_save_name}},
+        init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.job_name}},
     )
     device = accelerator.device
 
