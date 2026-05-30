@@ -203,11 +203,7 @@ def main():
         print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
         model = SmolVLACrictic(config).to(device)
 
-    # Explicitly cast floating point weights to ensure strict matching across ranks
-    if accelerator.mixed_precision == "bf16":
-        model = model.to(dtype=torch.bfloat16)
-    elif accelerator.mixed_precision == "fp16":
-        model = model.to(dtype=torch.float16)
+
 
     # Group parameters for differential learning rates
     head_params = []

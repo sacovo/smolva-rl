@@ -187,12 +187,6 @@ def main():
             critic = SmolVLACrictic(critic_config).to(device)
             critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
         
-        # Explicitly cast floating point weights to ensure strict matching across ranks
-        if accelerator.mixed_precision == "bf16":
-            critic = critic.to(dtype=torch.bfloat16)
-        elif accelerator.mixed_precision == "fp16":
-            critic = critic.to(dtype=torch.float16)
-        
         critic.eval()
 
         support = torch.linspace(
@@ -259,11 +253,7 @@ def main():
         print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
         model = SmolVLARECAP(recap_config).to(device)
 
-    # Explicitly cast floating point weights to ensure strict matching across ranks
-    if accelerator.mixed_precision == "bf16":
-        model = model.to(dtype=torch.bfloat16)
-    elif accelerator.mixed_precision == "fp16":
-        model = model.to(dtype=torch.float16)
+
 
     pre_recap = model.get_pre_processor(dataset)
 
