@@ -78,7 +78,7 @@ def parse_args():
     parser.add_argument(
         "--accumulation_steps",
         type=int,
-        default=1,
+        default=4,
         help="Accumulate over multiple steps",
     )
     parser.add_argument(

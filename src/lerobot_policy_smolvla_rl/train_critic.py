@@ -46,7 +46,7 @@ def parse_args():
         default=8,
         help="Number of layers to keep in the VLM backbone",
     )
-    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--steps", type=int, default=5000, help="Total training steps")
     parser.add_argument(
         "--lr", type=float, default=1e-4, help="Learning rate for the VLM backbone"
@@ -95,7 +95,7 @@ def parse_args():
     parser.add_argument(
         "--accumulation_steps",
         type=int,
-        default=1,
+        default=16,
         help="Accumulate over multiple steps",
     )
     parser.add_argument(
