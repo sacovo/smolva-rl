@@ -125,7 +125,11 @@ def main():
 
     # 1. Load Dataset
     print(f"Loading dataset: {args.dataset_repo_id}")
-    with accelerator.local_main_process_first():
+    try:
+        with accelerator.local_main_process_first():
+            dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+    except Exception as e:
+        print(f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}")
         dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
     # 2. Check for precomputed advantages (.npy)
@@ -174,7 +178,12 @@ def main():
             num_vlm_layers=args.critic_num_vlm_layers,
             input_features=input_features,
         )
-        with accelerator.local_main_process_first():
+        try:
+            with accelerator.local_main_process_first():
+                critic = SmolVLACrictic(critic_config).to(device)
+                critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
+        except Exception as e:
+            print(f"Warning: local_main_process_first failed during critic load, falling back to direct load: {e}")
             critic = SmolVLACrictic(critic_config).to(device)
             critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
         
@@ -243,7 +252,11 @@ def main():
         chunk_size=1,
         n_action_steps=1,
     )
-    with accelerator.local_main_process_first():
+    try:
+        with accelerator.local_main_process_first():
+            model = SmolVLARECAP(recap_config).to(device)
+    except Exception as e:
+        print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
         model = SmolVLARECAP(recap_config).to(device)
 
     # Explicitly cast floating point weights to ensure strict matching across ranks

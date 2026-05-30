@@ -145,7 +145,11 @@ def main():
     device = accelerator.device
 
     print(f"Loading dataset: {args.dataset_repo_id}")
-    with accelerator.local_main_process_first():
+    try:
+        with accelerator.local_main_process_first():
+            dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+    except Exception as e:
+        print(f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}")
         dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
 
     # Compute maximum episode length for normalization
@@ -192,7 +196,11 @@ def main():
                 del input_features[cam]
 
     config.input_features = input_features
-    with accelerator.local_main_process_first():
+    try:
+        with accelerator.local_main_process_first():
+            model = SmolVLACrictic(config).to(device)
+    except Exception as e:
+        print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
         model = SmolVLACrictic(config).to(device)
 
     # Explicitly cast floating point weights to ensure strict matching across ranks
