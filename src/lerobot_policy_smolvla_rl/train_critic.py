@@ -261,8 +261,8 @@ def main():
                 if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
             ]
             if checkpoints:
-                # Sort by step number
-                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[1]))
+                # Sort by step number (stripping any file extension like .pt)
+                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[1].split(".")[0]))
                 args.resume_from = os.path.join(output_dir, latest_checkpoint)
             else:
                 args.resume_from = None
@@ -343,7 +343,7 @@ def main():
         accelerator.load_state(args.resume_from)
         # restore step from path if possible
         try:
-            step = int(os.path.basename(args.resume_from).split("_")[1])
+            step = int(os.path.basename(args.resume_from).split("_")[1].split(".")[0])
             print(f"Resumed training state from {args.resume_from} at step {step}")
         except (ValueError, IndexError):
             print(
