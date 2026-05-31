@@ -108,6 +108,14 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Configure PyTorch multiprocessing sharing strategy to prevent
+    # "RuntimeError: received 0 items of ancdata" from open file descriptor/shared memory limits
+    try:
+        import torch.multiprocessing as mp
+        mp.set_sharing_strategy("file_system")
+    except Exception as e:
+        print(f"Warning: could not set sharing strategy: {e}")
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         log_with="wandb",
