@@ -218,7 +218,6 @@ def main():
         accelerator.wait_for_everyone()
 
         if not accelerator.is_main_process:
-            import json
             with open(thresholds_save_path, "r") as f:
                 str_keys = json.load(f)
                 task_thresholds = {int(k): v for k, v in str_keys.items()}
