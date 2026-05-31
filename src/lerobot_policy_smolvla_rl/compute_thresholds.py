@@ -1,6 +1,7 @@
 import argparse
 import os
 import json
+import time
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -28,6 +29,12 @@ def parse_args():
         nargs="+",
         default=None,
         help="List of camera keys to use (e.g. observation.images.exterior_image_1_left observation.images.wrist_image_left). If None, all cameras in the dataset are used.",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="Optional delay in seconds between evaluation batches to allow GPU cooling and prevent power spikes.",
     )
     return parser.parse_args()
 
@@ -96,6 +103,9 @@ def main():
             all_tasks_list.append(batch["task_index"].numpy())
             all_episodes_list.append(batch["episode_index"].numpy())
             all_frames_list.append(batch["frame_index"].numpy())
+
+            if args.delay > 0:
+                time.sleep(args.delay)
 
     all_vs = np.concatenate(all_vs_list)
     all_tasks = np.concatenate(all_tasks_list)
