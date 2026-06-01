@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --mem=64G
 #SBATCH --output=logs/%x_%j.out
@@ -66,11 +66,16 @@ if [[ ! "$TRAIN_ARGS" =~ "--resume_from" ]]; then
 fi
 
 # Run with accelerate launch
-# We use --multi_gpu and detect the number of processes.
+# We use --multi_gpu only if more than 1 GPU is active.
 # SmolVLM typically benefits from bf16 on modern GPUs (A100/H100/4090).
 # If your GPUs are older, you might want to switch to fp16.
+LAUNCH_ARGS=""
+if [ "$NUM_GPUS" -gt 1 ]; then
+    LAUNCH_ARGS="--multi_gpu"
+fi
+
 uv run accelerate launch \
-    --multi_gpu \
+    $LAUNCH_ARGS \
     --num_machines 1 \
     --num_processes $NUM_GPUS \
     --mixed_precision bf16 \
