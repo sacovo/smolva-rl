@@ -220,7 +220,7 @@ def main():
     # Load pretrained critic weights if provided
     if args.pretrained_critic_path:
         print(f"Loading pretrained critic weights from {args.pretrained_critic_path}")
-        state_dict = torch.load(args.pretrained_critic_path, map_location=device)
+        state_dict = torch.load(args.pretrained_critic_path, map_location="cpu")
 
         # Clean state dict (strip DDP/wrapper prefixes)
         clean_state_dict = {}

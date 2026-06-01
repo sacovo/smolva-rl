@@ -195,7 +195,7 @@ def main():
         try:
             with accelerator.local_main_process_first():
                 critic = SmolVLACrictic(critic_config).to(device)
-                critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
+                critic.load_state_dict(torch.load(args.critic_checkpoint, map_location="cpu"))
         except Exception as e:
             print(f"Warning: local_main_process_first failed during critic load, falling back to direct load: {e}")
             critic = SmolVLACrictic(critic_config).to(device)
@@ -277,11 +277,11 @@ def main():
             else:
                 pt_path = os.path.join(args.pretrained_policy_path, "checkpoint_final.pt")
                 if os.path.exists(pt_path):
-                    state_dict = torch.load(pt_path, map_location=device)
+                    state_dict = torch.load(pt_path, map_location="cpu")
                 else:
                     raise FileNotFoundError(f"Could not find model.safetensors or checkpoint_final.pt in {args.pretrained_policy_path}")
         else:
-            state_dict = torch.load(args.pretrained_policy_path, map_location=device)
+            state_dict = torch.load(args.pretrained_policy_path, map_location="cpu")
 
         # Clean state dict to remove "model." prefix if it comes from an exported LeRobot Policy
         clean_state_dict = {}
