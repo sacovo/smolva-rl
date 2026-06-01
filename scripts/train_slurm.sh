@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
 #SBATCH --time=24:00:00
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
@@ -40,11 +40,18 @@ TRAIN_SCRIPT=$1
 shift
 TRAIN_ARGS=$@
 
-# Detect number of GPUs assigned by Slurm
+# Detect number of GPUs assigned by Slurm (robustly extract integer count)
 if [ -n "$SLURM_GPUS_ON_NODE" ]; then
-    NUM_GPUS=$SLURM_GPUS_ON_NODE
+    # Extract only the trailing number (e.g., gpu:1 -> 1, gpu:rtx2080:4 -> 4)
+    NUM_GPUS=$(echo "$SLURM_GPUS_ON_NODE" | grep -o '[0-9]\+$')
 else
     NUM_GPUS=$(nvidia-smi -L | wc -l)
+fi
+
+# Bypass nvshare for multi-GPU DistributedDataParallel (DDP) runs to prevent DDP/NCCL conflicts
+if [ "$NUM_GPUS" -gt 1 ]; then
+    echo "Multi-GPU run detected ($NUM_GPUS GPUs). Unsetting LD_PRELOAD to bypass nvshare and enable native DDP."
+    unset LD_PRELOAD
 fi
 
 echo "Job started on $(hostname) at $(date)"
