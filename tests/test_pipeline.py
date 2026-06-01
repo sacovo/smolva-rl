@@ -172,3 +172,68 @@ def test_critic_modeling():
     # Note: prepare_images might fail without proper preprocessing, so we just check initialization for now
     # as full forward pass requires a lot of setup (processor etc)
     assert len(model.vlm_with_expert.vlm.model.text_model.layers) == 1
+
+
+def test_critic_streaming_training():
+    checkpoint_dir = "outputs/test_critic_streaming_pytest"
+    cmd = [
+        sys.executable,
+        "src/lerobot_policy_smolvla_rl/train_critic.py",
+        "--dataset_repo_id",
+        DATASET_REPO_ID,
+        "--streaming",
+        "--limit_episodes",
+        "2",
+        "--steps",
+        "1",
+        "--batch_size",
+        "1",
+        "--num_vlm_layers",
+        "1",
+        "--save_dir",
+        checkpoint_dir,
+        "--model_save_name",
+        "streaming_smoke_test",
+        "--wandb_project",
+        "pytest-smoke-test",
+        "--num_workers",
+        "0",
+    ]
+    env = os.environ.copy()
+    env["WANDB_MODE"] = "offline"
+    subprocess.run(cmd, check=True, env=env)
+    assert os.path.exists(os.path.join(checkpoint_dir, "streaming_smoke_test"))
+
+
+def test_recap_streaming_training(critic_checkpoint_path):
+    save_dir = "outputs/test_recap_streaming_pytest"
+    cmd = [
+        sys.executable,
+        "src/lerobot_policy_smolvla_rl/train_recap.py",
+        "--dataset_repo_id",
+        DATASET_REPO_ID,
+        "--streaming",
+        "--limit_episodes",
+        "2",
+        "--critic_checkpoint",
+        critic_checkpoint_path,
+        "--steps",
+        "1",
+        "--batch_size",
+        "1",
+        "--num_vlm_layers",
+        "1",
+        "--critic_num_vlm_layers",
+        "1",
+        "--save_dir",
+        save_dir,
+        "--wandb_project",
+        "pytest-smoke-test",
+        "--num_workers",
+        "0",
+    ]
+    env = os.environ.copy()
+    env["WANDB_MODE"] = "offline"
+    subprocess.run(cmd, check=True, env=env)
+    assert os.path.exists(save_dir)
+
