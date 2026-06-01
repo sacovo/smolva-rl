@@ -318,7 +318,7 @@ def main():
     )
 
     # Identify camera keys in the dataset
-    camera_keys = [k for k in dataset.features if k.startswith("observation.images.")]
+    camera_keys = [k for k in dataset.meta.features if k.startswith("observation.images.")]
     print(f"Detected camera keys: {camera_keys}")
 
     model.train()
