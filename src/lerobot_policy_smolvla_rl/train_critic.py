@@ -148,6 +148,18 @@ def parse_args():
     return parser.parse_args()
 
 
+def streaming_collate_fn(batch):
+    from PIL import Image
+    from torch.utils.data._utils.collate import default_collate
+    import numpy as np
+    for item in batch:
+        for k, v in item.items():
+            if isinstance(v, Image.Image):
+                # Convert PIL Image to [C, H, W] float32 tensor scaled to [0, 1]
+                item[k] = torch.from_numpy(np.array(v).transpose(2, 0, 1)).float() / 255.0
+    return default_collate(batch)
+
+
 def main():
     args = parse_args()
 
@@ -207,12 +219,18 @@ def main():
     episode_lengths = episode_lengths.to(accelerator.device)
     max_lengths = max_lengths.to(accelerator.device)
 
+    num_workers = args.num_workers
+    if args.streaming and num_workers > 0:
+        print(f"WARNING: StreamingLeRobotDataset with num_workers > 0 is known to cause Segmentation Faults. Automatically setting num_workers=0 for safety.")
+        num_workers = 0
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        shuffle=True if not args.streaming else False,
+        num_workers=num_workers,
+        pin_memory=True if not args.streaming else False,
+        collate_fn=streaming_collate_fn if args.streaming else None,
     )
 
     print(
