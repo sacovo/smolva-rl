@@ -20,12 +20,14 @@ dependencies = [
   "transformers>=5.3.0",
   "weasyprint>=68.1",
 ]
+
+[project.optional-dependencies]
+libero = [
+    "lerobot[libero]>=0.5.1",
+]
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = [
-    "lerobot[libero]>=0.5.1",
-    "pytest>=9.0.3",
-]
+dev = ["pytest>=9.0.3"]
