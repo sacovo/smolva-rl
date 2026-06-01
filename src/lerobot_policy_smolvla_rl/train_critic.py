@@ -88,6 +88,12 @@ def parse_args():
         help="Path to state to resume from, or 'auto' to find the latest in save_dir",
     )
     parser.add_argument(
+        "--pretrained_critic_path",
+        type=str,
+        default=None,
+        help="Path to pretrained critic checkpoint (.pt file) to finetune from",
+    )
+    parser.add_argument(
         "--model_save_name",
         type=str,
         default="critic",
@@ -210,6 +216,25 @@ def main():
     except Exception as e:
         print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
         model = SmolVLACrictic(config).to(device)
+
+    # Load pretrained critic weights if provided
+    if args.pretrained_critic_path:
+        print(f"Loading pretrained critic weights from {args.pretrained_critic_path}")
+        state_dict = torch.load(args.pretrained_critic_path, map_location=device)
+
+        # Clean state dict (strip DDP/wrapper prefixes)
+        clean_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("module."):
+                clean_state_dict[k[7:]] = v
+            elif k.startswith("_orig_mod."):
+                clean_state_dict[k[10:]] = v
+            else:
+                clean_state_dict[k] = v
+
+        # Load weights into SmolVLACrictic model
+        missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
+        print(f"Loaded pretrained critic weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
 
 
 

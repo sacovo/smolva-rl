@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.13.0",
     "click>=8.3.2",
-    "lerobot[smolvla]>=0.5.1",
+    "lerobot[libero,smolvla]>=0.5.1",
     "marimo[lsp]>=0.23.2",
     "matplotlib>=3.10.8",
     "protobuf>=6.33.6",

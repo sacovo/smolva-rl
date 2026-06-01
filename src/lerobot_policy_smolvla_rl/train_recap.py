@@ -97,6 +97,12 @@ def parse_args():
         help="Path to state to resume from, or 'auto' to find the latest in save_dir",
     )
     parser.add_argument(
+        "--pretrained_policy_path",
+        type=str,
+        default=None,
+        help="Path to pretrained model checkpoint (.pt) or exported directory containing model.safetensors to finetune from",
+    )
+    parser.add_argument(
         "--cameras",
         type=str,
         nargs="+",
@@ -259,6 +265,37 @@ def main():
     except Exception as e:
         print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
         model = SmolVLARECAP(recap_config).to(device)
+
+    # Load pretrained policy weights if provided
+    if args.pretrained_policy_path:
+        print(f"Loading pretrained policy weights from {args.pretrained_policy_path}")
+        if os.path.isdir(args.pretrained_policy_path):
+            from safetensors.torch import load_file
+            safetensors_path = os.path.join(args.pretrained_policy_path, "model.safetensors")
+            if os.path.exists(safetensors_path):
+                state_dict = load_file(safetensors_path)
+            else:
+                pt_path = os.path.join(args.pretrained_policy_path, "checkpoint_final.pt")
+                if os.path.exists(pt_path):
+                    state_dict = torch.load(pt_path, map_location=device)
+                else:
+                    raise FileNotFoundError(f"Could not find model.safetensors or checkpoint_final.pt in {args.pretrained_policy_path}")
+        else:
+            state_dict = torch.load(args.pretrained_policy_path, map_location=device)
+
+        # Clean state dict to remove "model." prefix if it comes from an exported LeRobot Policy
+        clean_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("model."):
+                clean_state_dict[k[6:]] = v
+            else:
+                clean_state_dict[k] = v
+
+        # Load weights into SmolVLARECAP model
+        missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
+        print(f"Loaded pretrained weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+        if len(unexpected_keys) > 0:
+            print(f"Unexpected keys: {unexpected_keys[:10]}")
 
 
 
