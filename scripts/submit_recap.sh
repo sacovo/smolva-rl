@@ -13,9 +13,23 @@ fi
 shift 2
 EXTRA_ARGS=$@
 
+# Extract clean dataset name (e.g. lerobot/pusht -> pusht)
+DATASET_NAME=$(basename "$DATASET")
+
+# Detect mode based on whether we are loading pretrained policy weights
+MODE="pretrain"
+if [[ "$EXTRA_ARGS" =~ "--pretrained_policy_path" ]]; then
+    MODE="finetune"
+fi
+
+# Define a highly descriptive WandB run name
+JOB_NAME="recap_${DATASET_NAME}_${MODE}_$(date +%m%d_%H%M%S)"
+
+echo "Submitting Slurm job with WandB run name: $JOB_NAME"
+
 sbatch scripts/train_slurm.sh \
     src/lerobot_policy_smolvla_rl/train_recap.py \
     --dataset_repo_id "$DATASET" \
     --critic_checkpoint "$CRITIC_CHECKPOINT" \
-    --job_name "train_recap_$(date +%Y%m%d_%H%M%S)" \
+    --job_name "$JOB_NAME" \
     $EXTRA_ARGS
