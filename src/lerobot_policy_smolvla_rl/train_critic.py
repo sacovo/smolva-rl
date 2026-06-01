@@ -17,6 +17,10 @@ from accelerate.utils import DistributedDataParallelKwargs
 from diffusers.optimization import get_scheduler
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+try:
+    from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+except ImportError:
+    StreamingLeRobotDataset = None
 from lerobot_policy_smolvla_rl.smolvla_critic import (
     SmolVLACrictic,
     SmolVLMCriticConfig,
@@ -88,6 +92,17 @@ def parse_args():
         help="Path to state to resume from, or 'auto' to find the latest in save_dir",
     )
     parser.add_argument(
+        "--limit_episodes",
+        type=int,
+        default=None,
+        help="Limit the dataset to load only the first N episodes (useful to save memory or speed up testing)",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Stream the dataset directly from Hugging Face Hub without downloading it locally (requires LeRobot >= 3.0)",
+    )
+    parser.add_argument(
         "--pretrained_critic_path",
         type=str,
         default=None,
@@ -157,14 +172,32 @@ def main():
         init_kwargs={"wandb": {"entity": args.wandb_entity, "name": args.job_name}},
     )
     device = accelerator.device
+    # Determine episodes to load
+    episodes_to_load = args.episodes
+    if episodes_to_load is None and args.limit_episodes is not None:
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+            meta = LeRobotDatasetMetadata(args.dataset_repo_id)
+            total = meta.total_episodes
+            episodes_to_load = list(range(min(args.limit_episodes, total)))
+            print(f"Limiting dataset load to first {len(episodes_to_load)} episodes (out of {total} total episodes)")
+        except Exception as e:
+            print(f"Warning: could not load dataset metadata to limit episodes: {e}")
+
+    dataset_class = LeRobotDataset
+    if args.streaming:
+        if StreamingLeRobotDataset is None:
+            raise ImportError("StreamingLeRobotDataset could not be imported. Please make sure you are using LeRobot >= 3.0.")
+        dataset_class = StreamingLeRobotDataset
+        print("Using StreamingLeRobotDataset to stream directly from HF Hub...")
 
     print(f"Loading dataset: {args.dataset_repo_id}")
     try:
         with accelerator.local_main_process_first():
-            dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+            dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load)
     except Exception as e:
         print(f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}")
-        dataset = LeRobotDataset(args.dataset_repo_id, episodes=args.episodes)
+        dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load)
 
     # Compute maximum episode length for normalization
     episode_lengths = get_episode_lengths(dataset)
