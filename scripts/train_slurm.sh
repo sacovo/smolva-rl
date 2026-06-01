@@ -24,11 +24,11 @@ export LC_ALL=C.UTF-8
 export PYTHONIOENCODING=utf-8
 
 # Resolve NCCL Peer-to-Peer, shared memory, and InfiniBand communication failures on cluster nodes
-export NCCL_P2P_DISABLE=1
-export NCCL_SHM_DISABLE=1
-export NCCL_IB_DISABLE=1
-export NCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
+# export NCCL_P2P_DISABLE=1
+# export NCCL_SHM_DISABLE=1
+# export NCCL_IB_DISABLE=1
+# export NCCL_SOCKET_IFNAME=lo
+# export GLOO_SOCKET_IFNAME=lo
 export NCCL_DEBUG=INFO
 
 if [ -z "$1" ]; then
