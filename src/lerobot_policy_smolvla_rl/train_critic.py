@@ -244,7 +244,29 @@ def main():
         device=accelerator.device,
         state_dropout=args.state_dropout,
     )
+    camera_map = {}
     features = dataset_to_policy_features(dataset.meta.features)
+    if args.cameras:
+        dataset_cameras = sorted([k for k in features if k.startswith("observation.images.")])
+        if any(cam not in features for cam in args.cameras):
+            if len(dataset_cameras) == len(args.cameras):
+                for src, dst in zip(dataset_cameras, args.cameras):
+                    print(f"Mapping dataset camera '{src}' -> policy expected '{dst}'")
+                    camera_map[src] = dst
+            else:
+                raise ValueError(
+                    f"Cannot remap cameras: dataset has {len(dataset_cameras)} cameras ({dataset_cameras}), "
+                    f"but requested {len(args.cameras)} cameras ({args.cameras})"
+                )
+
+    if camera_map:
+        mapped_features = {}
+        for k, v in features.items():
+            if k in camera_map:
+                mapped_features[camera_map[k]] = v
+            else:
+                mapped_features[k] = v
+        features = mapped_features
 
     output_features = {
         key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
@@ -430,6 +452,8 @@ def main():
 
     while step < args.steps:
         for batch in dataloader:
+            if camera_map:
+                batch = {camera_map.get(k, k): v for k, v in batch.items()}
             with accelerator.accumulate(model):
                 if step >= args.steps:
                     break
