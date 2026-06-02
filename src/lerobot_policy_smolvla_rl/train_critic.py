@@ -145,6 +145,12 @@ def parse_args():
         default=None,
         help="List of camera keys to use (e.g. observation.images.exterior_image_1_left observation.images.wrist_image_left). If None, all cameras in the dataset are used.",
     )
+    parser.add_argument(
+        "--tolerance_s",
+        type=float,
+        default=0.0001,
+        help="Tolerance in seconds for timestamp matching when loading video frames",
+    )
     return parser.parse_args()
 
 
@@ -206,10 +212,10 @@ def main():
     print(f"Loading dataset: {args.dataset_repo_id}")
     try:
         with accelerator.local_main_process_first():
-            dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load)
+            dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
     except Exception as e:
         print(f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}")
-        dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load)
+        dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
 
     # Compute maximum episode length for normalization
     episode_lengths = get_episode_lengths(dataset)
