@@ -1,4 +1,4 @@
-import argparse
+import logging
 import os
 
 import torch
@@ -9,19 +9,22 @@ from diffusers.optimization import get_scheduler
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-from lerobot_policy_smolvla_rl.ds_utils import (
-    calculate_returns,
-    get_episode_lengths,
-    get_max_task_lengths,
-)
 
 try:
     from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 except ImportError:
     StreamingLeRobotDataset = None
+
+from lerobot_policy_smolvla_rl.dataloader_utils import (
+    add_dataloader_args,
+    build_dataloader,
+)
+from lerobot_policy_smolvla_rl.ds_utils import (
+    calculate_returns,
+    get_episode_lengths,
+    get_max_task_lengths,
+)
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
 from lerobot_policy_smolvla_rl.smolvla_critic import (
     SmolVLACrictic,
@@ -31,6 +34,8 @@ from lerobot_policy_smolvla_rl.checkpoint_utils import (
     resolve_checkpoints,
     load_checkpoint,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -87,7 +92,7 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="smolvla-critic")
     parser.add_argument("--job_name", type=str, default="train_critic")
     parser.add_argument("--wandb_entity", type=str, default=None)
-    parser.add_argument("--num_workers", type=int, default=4)
+    add_dataloader_args(parser)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
     parser.add_argument("--save_dir", type=str, default="outputs/checkpoints_critic")
@@ -167,23 +172,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def streaming_collate_fn(batch):
-    import numpy as np
-    from PIL import Image
-    from torch.utils.data._utils.collate import default_collate
-
-    for item in batch:
-        for k, v in item.items():
-            if isinstance(v, Image.Image):
-                # Convert PIL Image to [C, H, W] float32 tensor scaled to [0, 1]
-                item[k] = (
-                    torch.from_numpy(np.array(v).transpose(2, 0, 1)).float() / 255.0
-                )
-    return default_collate(batch)
-
-
 def main():
     args = parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     # Configure PyTorch multiprocessing sharing strategy to prevent
     # "RuntimeError: received 0 items of ancdata" from open file descriptor/shared memory limits
@@ -258,24 +253,15 @@ def main():
 
     # Compute maximum episode length for normalization
     episode_lengths = get_episode_lengths(dataset)
-
     max_lengths = get_max_task_lengths(dataset)
-
     episode_lengths = episode_lengths.to(accelerator.device)
     max_lengths = max_lengths.to(accelerator.device)
 
-    num_workers = args.num_workers
-    if args.streaming and num_workers > 0:
-        print(
-            "WARNING: StreamingLeRobotDataset with num_workers > 0 is known to cause Segmentation Faults. Automatically setting num_workers=0 for safety."
-        )
-        num_workers = 0
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
+    dataloader = build_dataloader(
+        args,
         shuffle=True,
-        num_workers=args.num_workers,
+        device=device,
+        is_streaming=args.streaming,
         pin_memory=True,
     )
 
