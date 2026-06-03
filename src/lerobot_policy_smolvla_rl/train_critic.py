@@ -159,10 +159,10 @@ def parse_args():
         help="Tolerance in seconds for timestamp matching when loading video frames",
     )
     parser.add_argument(
-        "--codec",
+        "--video_backend",
         type=str,
         default="torchcodec",
-        help="Codec for loading videos (either torchcodec or pyav)",
+        help="Backend for loading videos (either torchcodec or pyav)",
     )
     return parser.parse_args()
 
