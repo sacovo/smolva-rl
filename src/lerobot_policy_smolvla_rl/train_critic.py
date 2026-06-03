@@ -1,22 +1,28 @@
-from lerobot.configs.types import FeatureType
-from lerobot.datasets.feature_utils import dataset_to_policy_features
-from lerobot_policy_smolvla_rl.ds_utils import (
-    get_max_task_lengths,
-    get_episode_lengths,
-    calculate_returns,
-)
 import argparse
 import os
+
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from diffusers.optimization import get_scheduler
-
+from lerobot.configs.types import FeatureType
+from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from lerobot_policy_smolvla_rl.ds_utils import (
+    calculate_returns,
+    get_episode_lengths,
+    get_max_task_lengths,
+)
+
+try:
+    from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+except ImportError:
+    StreamingLeRobotDataset = None
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
 from lerobot_policy_smolvla_rl.smolvla_critic import (
     SmolVLACrictic,
     SmolVLMCriticConfig,
@@ -152,18 +158,40 @@ def parse_args():
         default=0.0001,
         help="Tolerance in seconds for timestamp matching when loading video frames",
     )
+    parser.add_argument(
+        "--codec",
+        type=str,
+        default="torchcodec",
+        help="Codec for loading videos (either torchcodec or pyav)",
+    )
     return parser.parse_args()
 
 
+def streaming_collate_fn(batch):
+    import numpy as np
+    from PIL import Image
+    from torch.utils.data._utils.collate import default_collate
 
-# pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-nested-blocks
+    for item in batch:
+        for k, v in item.items():
+            if isinstance(v, Image.Image):
+                # Convert PIL Image to [C, H, W] float32 tensor scaled to [0, 1]
+                item[k] = (
+                    torch.from_numpy(np.array(v).transpose(2, 0, 1)).float() / 255.0
+                )
+    return default_collate(batch)
+
+
 def main():
     args = parse_args()
 
     # Configure PyTorch multiprocessing sharing strategy to prevent
     # "RuntimeError: received 0 items of ancdata" from open file descriptor/shared memory limits
     try:
+        import torch.multiprocessing as mp
+
         import torch.multiprocessing as mp  # pylint: disable=import-outside-toplevel
+
         mp.set_sharing_strategy("file_system")
     except Exception as e:
         print(f"Warning: could not set sharing strategy: {e}")
@@ -185,21 +213,48 @@ def main():
     episodes_to_load = args.episodes
     if episodes_to_load is None and args.limit_episodes is not None:
         try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata  # pylint: disable=import-outside-toplevel
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
             meta = LeRobotDatasetMetadata(args.dataset_repo_id)
             total = meta.total_episodes
             episodes_to_load = list(range(min(args.limit_episodes, total)))
-            print(f"Limiting dataset load to first {len(episodes_to_load)} episodes (out of {total} total episodes)")
+            print(
+                f"Limiting dataset load to first {len(episodes_to_load)} episodes (out of {total} total episodes)"
+            )
         except Exception as e:
             print(f"Warning: could not load dataset metadata to limit episodes: {e}")
 
+    dataset_class = LeRobotDataset
+    if args.streaming:
+        if StreamingLeRobotDataset is None:
+            raise ImportError(
+                "StreamingLeRobotDataset could not be imported. Please make sure you are using LeRobot >= 3.0."
+            )
+        dataset_class = StreamingLeRobotDataset
+        print("Using StreamingLeRobotDataset to stream directly from HF Hub...")
+
     print(f"Loading dataset: {args.dataset_repo_id}")
+    dataset_kwargs = {
+        "episodes": episodes_to_load,
+        "tolerance_s": args.tolerance_s,
+    }
+    if not args.streaming:
+        dataset_kwargs["video_backend"] = args.video_backend
+
     try:
         with accelerator.local_main_process_first():
-            dataset = LeRobotDataset(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
+            dataset = dataset_class(
+                args.dataset_repo_id,
+                **dataset_kwargs,
+            )
     except Exception as e:
-        print(f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}")
-        dataset = LeRobotDataset(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
+        print(
+            f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}"
+        )
+        dataset = dataset_class(
+            args.dataset_repo_id,
+            **dataset_kwargs,
+        )
 
     # Compute maximum episode length for normalization
     episode_lengths = get_episode_lengths(dataset)
@@ -208,6 +263,13 @@ def main():
 
     episode_lengths = episode_lengths.to(accelerator.device)
     max_lengths = max_lengths.to(accelerator.device)
+
+    num_workers = args.num_workers
+    if args.streaming and num_workers > 0:
+        print(
+            "WARNING: StreamingLeRobotDataset with num_workers > 0 is known to cause Segmentation Faults. Automatically setting num_workers=0 for safety."
+        )
+        num_workers = 0
 
     dataloader = DataLoader(
         dataset,
@@ -231,7 +293,9 @@ def main():
     camera_map = {}
     features = dataset_to_policy_features(dataset.meta.features)
     if args.cameras:
-        dataset_cameras = sorted([k for k in features if k.startswith("observation.images.")])
+        dataset_cameras = sorted(
+            [k for k in features if k.startswith("observation.images.")]
+        )
         if any(cam not in features for cam in args.cameras):
             if len(dataset_cameras) == len(args.cameras):
                 for src, dst in zip(dataset_cameras, args.cameras):
@@ -271,7 +335,9 @@ def main():
         with accelerator.local_main_process_first():
             model = SmolVLACrictic(config).to(device)
     except Exception as e:
-        print(f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}")
+        print(
+            f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}"
+        )
         model = SmolVLACrictic(config).to(device)
 
     # Load pretrained critic weights if provided
@@ -290,10 +356,12 @@ def main():
                 clean_state_dict[k] = v
 
         # Load weights into SmolVLACrictic model
-        missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
-        print(f"Loaded pretrained critic weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
-
-
+        missing_keys, unexpected_keys = model.load_state_dict(
+            clean_state_dict, strict=False
+        )
+        print(
+            f"Loaded pretrained critic weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}"
+        )
 
     # Group parameters for differential learning rates
     head_params = []
@@ -324,7 +392,9 @@ def main():
     )
 
     # Identify camera keys in the dataset
-    camera_keys = [k for k in dataset.meta.features if k.startswith("observation.images.")]
+    camera_keys = [
+        k for k in dataset.meta.features if k.startswith("observation.images.")
+    ]
     print(f"Detected camera keys: {camera_keys}")
 
     model.train()
@@ -335,75 +405,111 @@ def main():
     output_dir = os.path.join(args.save_dir, args.model_save_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    checkpoint_to_try, fallback_checkpoint = resolve_checkpoints(args.resume_from, output_dir)
+    if args.resume_from == "auto":
+        if os.path.exists(output_dir):
+            checkpoints = [
+                d
+                for d in os.listdir(output_dir)
+                if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
+            ]
+            if checkpoints:
+                # Sort by step number (stripping any file extension like .pt)
+                latest_checkpoint = max(
+                    checkpoints, key=lambda x: int(x.split("_")[1].split(".")[0])
+                )
+                args.resume_from = os.path.join(output_dir, latest_checkpoint)
+            else:
+                args.resume_from = None
+        else:
+            args.resume_from = None
 
     # Verify input_features and model parameters consistency across all ranks
     if accelerator.use_distributed:
-        print(f"[Rank {accelerator.process_index}] Verifying model parameters and input features consistency...")
+        print(
+            f"[Rank {accelerator.process_index}] Verifying model parameters and input features consistency..."
+        )
         local_cams = sorted(list(input_features.keys()))
         local_params = []
         for name, param in model.named_parameters():
-            local_params.append((name, list(param.shape), str(param.dtype), param.requires_grad))
-        
+            local_params.append(
+                (name, list(param.shape), str(param.dtype), param.requires_grad)
+            )
+
         gathered_cams = [None] * accelerator.num_processes
         gathered_params = [None] * accelerator.num_processes
-        
+
         try:
             torch.distributed.all_gather_object(gathered_cams, local_cams)
             torch.distributed.all_gather_object(gathered_params, local_params)
-            
+
             if accelerator.is_main_process:
                 mismatch_found = False
                 ref_cams = gathered_cams[0]
                 ref_params = gathered_params[0]
                 ref_dict = {item[0]: item for item in ref_params}
-                
+
                 # Check cameras consistency
                 for rank_idx in range(1, accelerator.num_processes):
                     rank_cams = gathered_cams[rank_idx]
                     if ref_cams != rank_cams:
-                        print(f"CRITICAL ERROR: Camera key list mismatch! Rank 0 has {ref_cams}, but Rank {rank_idx} has {rank_cams}")
+                        print(
+                            f"CRITICAL ERROR: Camera key list mismatch! Rank 0 has {ref_cams}, but Rank {rank_idx} has {rank_cams}"
+                        )
                         mismatch_found = True
-                        
+
                 # Check parameters consistency
                 for rank_idx in range(1, accelerator.num_processes):
                     rank_params = gathered_params[rank_idx]
                     rank_dict = {item[0]: item for item in rank_params}
-                    
+
                     if len(ref_params) != len(rank_params):
                         print(
-                            f"CRITICAL ERROR: Parameter count mismatch! "
-                            f"Rank 0 has {len(ref_params)} params, but "
-                            f"Rank {rank_idx} has {len(rank_params)} params."
+                            f"CRITICAL ERROR: Parameter count mismatch! Rank 0 has {len(ref_params)} params, but Rank {rank_idx} has {len(rank_params)} params."
                         )
                         mismatch_found = True
-                        
+
                     for name, shape, dtype, req_grad in ref_params:
                         if name not in rank_dict:
-                            print(f"CRITICAL ERROR: Parameter '{name}' in Rank 0 is missing in Rank {rank_idx}!")
+                            print(
+                                f"CRITICAL ERROR: Parameter '{name}' in Rank 0 is missing in Rank {rank_idx}!"
+                            )
                             mismatch_found = True
                         else:
                             _, r_shape, r_dtype, r_req_grad = rank_dict[name]
                             if shape != r_shape:
-                                print(f"CRITICAL ERROR: Parameter '{name}' shape mismatch! Rank 0: {shape}, Rank {rank_idx}: {r_shape}")
+                                print(
+                                    f"CRITICAL ERROR: Parameter '{name}' shape mismatch! Rank 0: {shape}, Rank {rank_idx}: {r_shape}"
+                                )
                                 mismatch_found = True
                             if dtype != r_dtype:
-                                print(f"CRITICAL ERROR: Parameter '{name}' dtype mismatch! Rank 0: {dtype}, Rank {rank_idx}: {r_dtype}")
+                                print(
+                                    f"CRITICAL ERROR: Parameter '{name}' dtype mismatch! Rank 0: {dtype}, Rank {rank_idx}: {r_dtype}"
+                                )
                                 mismatch_found = True
                             if req_grad != r_req_grad:
-                                print(f"CRITICAL ERROR: Parameter '{name}' requires_grad mismatch! Rank 0: {req_grad}, Rank {rank_idx}: {r_req_grad}")
+                                print(
+                                    f"CRITICAL ERROR: Parameter '{name}' requires_grad mismatch! Rank 0: {req_grad}, Rank {rank_idx}: {r_req_grad}"
+                                )
                                 mismatch_found = True
-                                
+
                     for name in rank_dict:
                         if name not in ref_dict:
-                            print(f"CRITICAL ERROR: Parameter '{name}' in Rank {rank_idx} is missing in Rank 0!")
+                            print(
+                                f"CRITICAL ERROR: Parameter '{name}' in Rank {rank_idx} is missing in Rank 0!"
+                            )
                             mismatch_found = True
-                            
+
                 if mismatch_found:
-                    print("CRITICAL: PARAMETER OR FEATURE STRUCTURAL MISMATCH DETECTED ACROSS RANKS! Raising error to avoid DDP hang.")
-                    raise RuntimeError("Parameter/feature structural mismatch detected across ranks before DDP preparation.")
-                
-                print("SUCCESS: All model parameters and input features are perfectly consistent across all ranks!")
+                    print(
+                        "CRITICAL: PARAMETER OR FEATURE STRUCTURAL MISMATCH DETECTED ACROSS RANKS! Raising error to avoid DDP hang."
+                    )
+                    raise RuntimeError(
+                        "Parameter/feature structural mismatch detected across ranks before DDP preparation."
+                    )
+                else:
+                    print(
+                        "SUCCESS: All model parameters and input features are perfectly consistent across all ranks!"
+                    )
         except Exception as check_err:
             print(f"WARNING: Rank consistency check encountered an issue: {check_err}")
 
@@ -412,7 +518,9 @@ def main():
     )
 
     if checkpoint_to_try:
-        args.resume_from, step = load_checkpoint(accelerator, checkpoint_to_try, fallback_checkpoint)
+        args.resume_from, step = load_checkpoint(
+            accelerator, checkpoint_to_try, fallback_checkpoint
+        )
 
     progress_bar = tqdm(total=args.steps, initial=step, desc="Training")
 
