@@ -63,6 +63,7 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
 
         return images, img_masks, state, lang_tokens, lang_masks
 
+    # pylint: disable=arguments-differ
     def forward(self, batch: dict[str, torch.Tensor]):
         images, img_masks, state, lang_tokens, lang_masks = self._prepare_batch(batch)
 
@@ -75,6 +76,7 @@ class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
 
         return self._forward(images, img_masks, lang_tokens, lang_masks, state)
 
+    # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
     def _forward(self, images, img_masks, lang_tokens, lang_masks, state):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(

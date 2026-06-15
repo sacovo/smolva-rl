@@ -55,7 +55,7 @@ class FastActionTokenizer:
         Returns:
             list of lists of integers
         """
-        batch_size, H, D = quantized.shape
+        batch_size = quantized.shape[0]
         flattened = []
         for b in range(batch_size):
             # Column-first flattening: [C(1,1), C(2,1), ..., C(1,2), ..., C(D,H)]

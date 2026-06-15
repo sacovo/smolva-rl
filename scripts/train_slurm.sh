@@ -80,8 +80,8 @@ fi
 uv run accelerate launch \
     $LAUNCH_ARGS \
     --num_machines 1 \
-    --num_processes $NUM_GPUS \
+    --num_processes "$NUM_GPUS" \
     --mixed_precision bf16 \
-    $TRAIN_SCRIPT $TRAIN_ARGS
+    "$TRAIN_SCRIPT" "$TRAIN_ARGS"
 
 echo "Job finished at $(date)"

@@ -1,5 +1,5 @@
 import torch
-import torch.nn as nn
+from torch import nn
 import torch.nn.functional as F
 from dataclasses import dataclass
 from transformers import AutoTokenizer
@@ -51,6 +51,9 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
             "physical-intelligence/fast",
         )
         self.action_processor = processor_class(bpe_tokenizer=bpe_tokenizer)
+        # Initialize tokenizer by encoding dummy actions to set time_horizon and action_dim for decoding
+        dummy_actions = np.zeros((1, config.chunk_size, config.max_action_dim))
+        self.action_processor(dummy_actions)
 
         # Define Token Replacement Mapping
         self.action_token_ids = list(range(48000, 48000 + config.num_fast_tokens))
@@ -140,10 +143,17 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
         """Extract and prepare components from the batch."""
         images, img_masks = modeling_smolvla.SmolVLAPolicy.prepare_images(self, batch)
         state = modeling_smolvla.SmolVLAPolicy.prepare_state(self, batch)
+        
+        # Ensure input tensors match the VLM model's dtype
+        dtype = self.vlm_with_expert.vlm.dtype
+        images = [img.to(dtype) for img in images]
+        state = state.to(dtype)
+
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         return images, img_masks, state, lang_tokens, lang_masks
 
+    # pylint: disable=arguments-differ,too-many-locals
     def forward(self, batch: dict[str, torch.Tensor]):
         """Forward pass with AR loss on FAST tokens, including observation state."""
         images, img_masks, state, lang_tokens, lang_masks = self._prepare_batch(batch)
@@ -219,10 +229,14 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
             images, img_masks, lang_tokens, lang_masks, state=state
         )
 
+        # Compute how many tokens are required for the action chunk of size chunk_size
+        dummy = np.zeros((1, chunk_size, self.config.max_action_dim))
+        num_new_tokens = len(self.action_processor(dummy)[0])
+
         output_ids = self.vlm_with_expert.vlm.generate(
             inputs_embeds=prefix_embs,
             attention_mask=prefix_pad_masks,
-            max_new_tokens=chunk_size,
+            max_new_tokens=num_new_tokens,
             do_sample=False,
             use_cache=True,
         )

@@ -131,7 +131,7 @@ def main():
 
     # Load weights into the policy module
     missing_keys, unexpected_keys = policy.load_state_dict(clean_state_dict, strict=False)
-    print(f"Weights loaded successfully!")
+    print("Weights loaded successfully!")
     print(f"Missing keys (should be empty or minimal): {len(missing_keys)}")
     print(f"Unexpected keys (should be empty or minimal): {len(unexpected_keys)}")
     if len(missing_keys) > 0:

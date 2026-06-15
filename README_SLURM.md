@@ -1,48 +1,125 @@
 # Slurm Training Setup for smolvla-rl
 
-This project supports parallel training on a Slurm cluster with automatic checkpointing and resuming.
+This project supports parallel training on a Slurm cluster with automatic checkpointing and resuming, using reproducible Python-based submit scripts.
 
 ## Scripts
 
-- `scripts/train_slurm.sh`: A generic Slurm submission script that uses `accelerate` for multi-GPU training.
-- `scripts/submit_critic.sh`: A convenience wrapper for training the critic.
+- `scripts/submit_critic.py`: Python submission script for training the critic.
+- `scripts/submit_recap.py`: Python submission script for training the RECAP policy.
+- `scripts/submit_utils.py`: Shared helper module containing Slurm logic, configuration merging, and script submission.
+- `scripts/compute_advantages.sh`: A Slurm submission script to pre-compute advantages and thresholds on a single GPU.
+
+---
+
+## Reproducible Python Submission Setup
+
+The Python submit scripts allow configuring both Slurm and training parameters entirely via CLI arguments or by passing a JSON/YAML configuration file. 
+
+To ensure reproducibility and ease of restarting, the scripts merge the configs (CLI parameters override file configurations), dynamically generate the SBATCH script, and store the final resolved configuration file in `runs/configuration/` with timestamps.
+
+### Slurm Configuration CLI Arguments
+The submission scripts accept the following Slurm configuration parameters:
+* `--nodes`: Number of nodes (default: `1`)
+* `--ntasks-per-node`: Number of tasks per node (default: `1`)
+* `--cpus-per-task`: CPUs per task (default: `16`)
+* `--gres`: GPUs request (default: `gpu:4`)
+* `--time`: Time limit (default: `24:00:00`)
+* `--mem`: Memory limit (default: `64G`)
+* `--job-name`: Custom job name (defaults to auto-generated descriptive name)
+* `--output`: Output log path (default: `logs/%x_%j.out`)
+* `--error`: Error log path (default: `logs/%x_%j.err`)
+* `--config`: Path to config file (JSON or YAML)
+* `--dry-run`: Dry run to print the generated sbatch script without submitting it to Slurm
+
+Any arguments not listed above are treated as training arguments and passed directly to the training script.
+
+### Configuration File Layout
+You can specify both Slurm configuration and training parameters in a single YAML or JSON file:
+
+**JSON Config Example (`config.json`):**
+```json
+{
+  "slurm": {
+    "mem": "128G",
+    "gres": "gpu:8"
+  },
+  "training": {
+    "dataset_repo_id": "lerobot/droid_100",
+    "steps": 20000,
+    "batch_size": 16,
+    "accumulation_steps": 16
+  }
+}
+```
+
+---
 
 ## How to use
 
-### Training the Critic
+### 1. Training the Critic
 
-To submit a training job for the critic:
-
+Submit the critic training job via the Python script:
 ```bash
-./scripts/submit_critic.sh <dataset_repo_id>
+python scripts/submit_critic.py --dataset_repo_id lerobot/droid_100 --steps 20000 --batch_size 16 --accumulation_steps 16
 ```
 
-Example:
+Using a configuration file:
 ```bash
-./scripts/submit_critic.sh fhnw/rover_test --steps 5000 --batch_size 8
+python scripts/submit_critic.py --config config.json
 ```
+
+Overriding a configuration file parameter via CLI (CLI always takes precedence):
+```bash
+python scripts/submit_critic.py --config config.json --mem 64G --steps 50000
+```
+
+> [!TIP]
+> **Memory Optimization**: Since 3-camera datasets like `lerobot/droid_100` have a high memory footprint, always use smaller batch sizes per GPU coupled with gradient accumulation. We recommend:
+> - Critic: `--batch_size 16 --accumulation_steps 16` (effective batch size 256 per process) or `--batch_size 8 --accumulation_steps 32` for lower-end GPU memory.
+
+### 2. Training the RECAP Policy
+
+Once the Critic is trained, you can submit the RECAP policy training job. We support **two different execution modes** for the policy training:
+
+#### Mode A: High-Speed Offline Advantage Mode (RECOMMENDED 🚀)
+Since the Critic is frozen during policy training, the expected returns $V(s)$ and temporal advantages $A_t$ for all frames in the dataset are completely static. 
+
+By pre-computing all advantages once on a fast GPU (like your local **RTX 3090** with local SSD I/O speed) and saving them to disk, you can **completely skip loading the Critic on the cluster GPUs** during policy training!
+
+##### Step A1: Pre-compute Advantages Directly on the Cluster
+To submit the precomputation job:
+```bash
+sbatch scripts/compute_advantages.sh lerobot/droid_100 outputs/checkpoints_critic/critic/checkpoint_final.pt \
+    --cameras observation.images.exterior_image_1_left observation.images.wrist_image_left \
+    --batch_size 32 \
+    --num_workers 4 \
+    --save_dir outputs/recap_phase1
+```
+This single-GPU job runs very quickly (usually under 3 minutes) and generates:
+1. `outputs/recap_phase1/task_thresholds_lerobot_droid_100.json` (Thresholds)
+2. `outputs/recap_phase1/task_advantages_lerobot_droid_100.npy` (Binary advantages array)
+
+##### Step A2: Launch the Policy Job on SLURM
+Submit your RECAP policy job. The script will automatically detect the pre-computed files, load them in a fraction of a millisecond, **bypass loading the Critic entirely**, and start training at maximum speed:
+```bash
+python scripts/submit_recap.py --dataset_repo_id lerobot/droid_100 --critic_checkpoint outputs/checkpoints_critic/critic/checkpoint_final.pt --steps 20000 --batch_size 8 --accumulation_steps 8 --wandb_project smolvla-recap
+```
+
+Alternatively, you can submit using a configuration file:
+```bash
+python scripts/submit_recap.py --config recap_config.json
+```
+
+---
+
+#### Mode B: Standard On-the-Fly Mode
+If you prefer not to pre-compute offline, you can compute advantages on the fly:
+```bash
+python scripts/submit_recap.py --dataset_repo_id lerobot/droid_100 --critic_checkpoint outputs/checkpoints_critic/critic/checkpoint_final.pt --steps 20000 --batch_size 4 --accumulation_steps 16 --wandb_project smolvla-recap
+```
+
+---
 
 ### Resuming Training
 
-The scripts are designed to automatically resume from the latest checkpoint if the job is interrupted (e.g., due to the 24h limit). Simply submit the same command again, and it will pick up from where it left off.
-
-This is achieved via the `--resume_from auto` flag, which looks for `state_*.pt` directories in the output directory.
-
-### Training Other Models (e.g., Policy)
-
-To train a different model using the same Slurm setup:
-
-```bash
-sbatch scripts/train_slurm.sh path/to/your/train_script.py --arg1 val1 --arg2 val2
-```
-
-The `train_slurm.sh` script will:
-1. Detect the number of available GPUs.
-2. Launch the training using `accelerate launch`.
-3. Enable `bf16` mixed precision (ideal for SmolVLM on modern GPUs).
-4. Automatically append `--resume_from auto` to your arguments.
-
-## Requirements
-
-- `uv` must be installed on the cluster.
-- The training script should support `--resume_from` and handle the step counter correctly (similar to `src/lerobot_policy_smolvla_rl/train_critic.py`).
+The scripts are designed to automatically resume from the latest checkpoint if the job is interrupted (e.g., due to the 24h limit). Simply submit the same command again, and the training script will automatically look for the latest checkpoint using the `--resume_from auto` option, which is automatically appended if not present.

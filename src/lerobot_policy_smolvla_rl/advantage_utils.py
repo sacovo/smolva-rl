@@ -52,6 +52,7 @@ def extract_future_batch(batch):
     return future_batch
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 def compute_temporal_advantage(
     critic, pre_critic, batch, future_batch, support, has_future
 ):
@@ -76,6 +77,7 @@ def compute_temporal_advantage(
     return advantage, v_s, v_s_future
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
 def get_task_thresholds(
     critic_model,
     dataset,
@@ -92,7 +94,7 @@ def get_task_thresholds(
 
     if os.path.exists(save_path):
         print(f"Loading advantage thresholds from {save_path}")
-        with open(save_path, "r") as f:
+        with open(save_path, "r", encoding="utf-8") as f:
             str_keys = json.load(f)
             return {int(k): v for k, v in str_keys.items()}
 
@@ -166,7 +168,7 @@ def get_task_thresholds(
 
     # Save to JSON
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, "w") as f:
+    with open(save_path, "w", encoding="utf-8") as f:
         json.dump(task_thresholds, f, indent=2)
 
     print(f"Saved thresholds to {save_path}")

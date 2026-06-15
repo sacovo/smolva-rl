@@ -11,7 +11,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
-from lerobot_policy_smolvla_rl.ds_utils import get_episode_lengths, get_max_task_lengths
+from lerobot_policy_smolvla_rl.ds_utils import get_episode_lengths
 
 
 def parse_args():
@@ -28,7 +28,12 @@ def parse_args():
         type=str,
         nargs="+",
         default=None,
-        help="List of camera keys to use (e.g. observation.images.exterior_image_1_left observation.images.wrist_image_left). If None, all cameras in the dataset are used.",
+        help=(
+            "List of camera keys to use "
+            "(e.g. observation.images.exterior_image_1_left "
+            "observation.images.wrist_image_left). "
+            "If None, all cameras in the dataset are used."
+        ),
     )
     parser.add_argument(
         "--delay",
@@ -39,13 +44,14 @@ def parse_args():
     return parser.parse_args()
 
 
+# pylint: disable=too-many-statements,too-many-locals
 def main():
     args = parse_args()
 
     # Configure PyTorch multiprocessing sharing strategy to prevent
     # "RuntimeError: received 0 items of ancdata" from open file descriptor/shared memory limits
     try:
-        import torch.multiprocessing as mp
+        import torch.multiprocessing as mp  # pylint: disable=import-outside-toplevel
         mp.set_sharing_strategy("file_system")
     except Exception as e:
         print(f"Warning: could not set sharing strategy: {e}")
@@ -152,7 +158,7 @@ def main():
         task_thresholds[int(t)] = float(threshold)
 
     # Save thresholds to JSON
-    with open(thresholds_path, "w") as f:
+    with open(thresholds_path, "w", encoding="utf-8") as f:
         json.dump(task_thresholds, f, indent=2)
     print(f"Saved task thresholds to {thresholds_path}")
 

@@ -35,6 +35,6 @@ echo "Extra arguments: $EXTRA_ARGS"
 uv run python src/lerobot_policy_smolvla_rl/compute_thresholds.py \
     --dataset_repo_id "$DATASET" \
     --critic_checkpoint "$CRITIC_CHECKPOINT" \
-    $EXTRA_ARGS
+    "$EXTRA_ARGS"
 
 echo "Job finished at $(date)"

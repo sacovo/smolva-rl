@@ -34,6 +34,7 @@ def get_episode_lengths(dataset: LeRobotDataset):
     return torch.tensor(dataset.meta.episodes["length"])
 
 
+# pylint: disable=too-many-arguments,too-many-positional-arguments
 def calculate_returns(
     episode_lengths,
     max_lengths,
@@ -51,6 +52,7 @@ def calculate_returns(
     return returns
 
 
+# pylint: disable=too-many-locals
 def process_batch(batch, model, camera_keys, device):
     processor = model.processor
     batch_size = batch["observation.state"].shape[0]

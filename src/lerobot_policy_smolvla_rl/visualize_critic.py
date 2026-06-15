@@ -12,10 +12,12 @@ import sys
 # Add src to sys.path to allow importing from lerobot_policy_smolvla_rl
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
+# pylint: disable=wrong-import-position
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -84,6 +86,7 @@ def parse_args():
     return parser.parse_args()
 
 
+# pylint: disable=too-many-branches,too-many-statements,too-many-locals
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -167,7 +170,7 @@ def main():
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting"):
-            logits, probs = model(pre(batch))
+            _, probs = model(pre(batch))
             expected_value = (probs * support).sum(dim=-1)  # (B,)
 
             batch_eps = batch["episode_index"].cpu().numpy()
@@ -298,8 +301,6 @@ def main():
         ax_adv.legend(loc="upper right")
 
         # Plot Boolean bar
-        from matplotlib.colors import ListedColormap
-
         cmap_bool = ListedColormap(["red", "green"])
         # We need to map boolean True/False to 1/0 for the colormap (0=red, 1=green)
         bool_array = all_advantage_bools.astype(int)[None, :]

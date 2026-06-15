@@ -32,4 +32,4 @@ sbatch scripts/train_slurm.sh \
     --dataset_repo_id "$DATASET" \
     --critic_checkpoint "$CRITIC_CHECKPOINT" \
     --job_name "$JOB_NAME" \
-    $EXTRA_ARGS
+    "$EXTRA_ARGS"

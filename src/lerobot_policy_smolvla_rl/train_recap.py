@@ -8,10 +8,6 @@ from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
 from diffusers.optimization import get_scheduler
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-try:
-    from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-except ImportError:
-    StreamingLeRobotDataset = None
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from torch.utils.data import DataLoader
@@ -19,6 +15,7 @@ from tqdm import tqdm
 
 from lerobot_policy_smolvla_rl import SmolVLARECAP, SmolVLARECAPConfig
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.checkpoint_utils import resolve_checkpoints, load_checkpoint
 from lerobot_policy_smolvla_rl.advantage_utils import (
     FutureFrameWrapper,
     extract_future_batch,
@@ -106,11 +103,7 @@ def parse_args():
         default=None,
         help="Limit the dataset to load only the first N episodes (useful to save memory or speed up testing)",
     )
-    parser.add_argument(
-        "--streaming",
-        action="store_true",
-        help="Stream the dataset directly from Hugging Face Hub without downloading it locally (requires LeRobot >= 3.0)",
-    )
+
     parser.add_argument(
         "--pretrained_policy_path",
         type=str,
@@ -122,7 +115,12 @@ def parse_args():
         type=str,
         nargs="+",
         default=None,
-        help="List of camera keys to use (e.g. observation.images.exterior_image_1_left observation.images.wrist_image_left). If None, all cameras in the dataset are used.",
+        help=(
+            "List of camera keys to use "
+            "(e.g. observation.images.exterior_image_1_left "
+            "observation.images.wrist_image_left). "
+            "If None, all cameras in the dataset are used."
+        ),
     )
     parser.add_argument(
         "--tolerance_s",
@@ -133,25 +131,15 @@ def parse_args():
     return parser.parse_args()
 
 
-def streaming_collate_fn(batch):
-    from PIL import Image
-    from torch.utils.data._utils.collate import default_collate
-    import numpy as np
-    for item in batch:
-        for k, v in item.items():
-            if isinstance(v, Image.Image):
-                # Convert PIL Image to [C, H, W] float32 tensor scaled to [0, 1]
-                item[k] = torch.from_numpy(np.array(v).transpose(2, 0, 1)).float() / 255.0
-    return default_collate(batch)
 
-
+# pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-nested-blocks
 def main():
     args = parse_args()
 
     # Configure PyTorch multiprocessing sharing strategy to prevent
     # "RuntimeError: received 0 items of ancdata" from open file descriptor/shared memory limits
     try:
-        import torch.multiprocessing as mp
+        import torch.multiprocessing as mp  # pylint: disable=import-outside-toplevel
         mp.set_sharing_strategy("file_system")
     except Exception as e:
         print(f"Warning: could not set sharing strategy: {e}")
@@ -174,7 +162,7 @@ def main():
     episodes_to_load = args.episodes
     if episodes_to_load is None and args.limit_episodes is not None:
         try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata  # pylint: disable=import-outside-toplevel
             meta = LeRobotDatasetMetadata(args.dataset_repo_id)
             total = meta.total_episodes
             episodes_to_load = list(range(min(args.limit_episodes, total)))
@@ -182,21 +170,14 @@ def main():
         except Exception as e:
             print(f"Warning: could not load dataset metadata to limit episodes: {e}")
 
-    dataset_class = LeRobotDataset
-    if args.streaming:
-        if StreamingLeRobotDataset is None:
-            raise ImportError("StreamingLeRobotDataset could not be imported. Please make sure you are using LeRobot >= 3.0.")
-        dataset_class = StreamingLeRobotDataset
-        print("Using StreamingLeRobotDataset to stream directly from HF Hub...")
-
     # 1. Load Dataset
     print(f"Loading dataset: {args.dataset_repo_id}")
     try:
         with accelerator.local_main_process_first():
-            dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
+            dataset = LeRobotDataset(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
     except Exception as e:
         print(f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}")
-        dataset = dataset_class(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
+        dataset = LeRobotDataset(args.dataset_repo_id, episodes=episodes_to_load, tolerance_s=args.tolerance_s)
 
     # 2. Check for precomputed advantages (.npy)
     precomputed_advantages = None
@@ -211,6 +192,7 @@ def main():
     
     # 3. Initialize/Load Critic (only if pre-computed advantages do not exist)
     critic = None
+    pre_critic = None
     camera_map = {}
     features = dataset_to_policy_features(dataset.meta.features)
     if args.cameras:
@@ -299,13 +281,13 @@ def main():
         accelerator.wait_for_everyone()
 
         if not accelerator.is_main_process:
-            with open(thresholds_save_path, "r") as f:
+            with open(thresholds_save_path, "r", encoding="utf-8") as f:
                 str_keys = json.load(f)
                 task_thresholds = {int(k): v for k, v in str_keys.items()}
     else:
         # Load thresholds directly from JSON
         print(f"Loading pre-computed advantage thresholds from {thresholds_save_path}")
-        with open(thresholds_save_path, "r") as f:
+        with open(thresholds_save_path, "r", encoding="utf-8") as f:
             str_keys = json.load(f)
             task_thresholds = {int(k): v for k, v in str_keys.items()}
 
@@ -317,17 +299,11 @@ def main():
         # High-Speed Offline Mode: use the raw dataset directly (no future wrappers needed!)
         wrapped_dataset = dataset
 
-    num_workers = args.num_workers
-    if args.streaming and num_workers > 0:
-        print(f"WARNING: StreamingLeRobotDataset with num_workers > 0 is known to cause Segmentation Faults. Automatically setting num_workers=0 for safety.")
-        num_workers = 0
-
     dataloader = DataLoader(
         wrapped_dataset,
         batch_size=args.batch_size,
-        shuffle=True if not args.streaming else False,
-        num_workers=num_workers,
-        collate_fn=streaming_collate_fn if args.streaming else None,
+        shuffle=True,
+        num_workers=args.num_workers,
     )
 
     # 3. Initialize RECAP Model
@@ -351,7 +327,7 @@ def main():
     if args.pretrained_policy_path:
         print(f"Loading pretrained policy weights from {args.pretrained_policy_path}")
         if os.path.isdir(args.pretrained_policy_path):
-            from safetensors.torch import load_file
+            from safetensors.torch import load_file  # pylint: disable=import-outside-toplevel
             safetensors_path = os.path.join(args.pretrained_policy_path, "model.safetensors")
             if os.path.exists(safetensors_path):
                 state_dict = load_file(safetensors_path)
@@ -399,21 +375,7 @@ def main():
     output_dir = os.path.join(args.save_dir, args.model_save_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.resume_from == "auto":
-        if os.path.exists(output_dir):
-            checkpoints = [
-                d
-                for d in os.listdir(output_dir)
-                if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
-            ]
-            if checkpoints:
-                # Sort by step number (stripping any file extension like .pt)
-                latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[1].split(".")[0]))
-                args.resume_from = os.path.join(output_dir, latest_checkpoint)
-            else:
-                args.resume_from = None
-        else:
-            args.resume_from = None
+    checkpoint_to_try, fallback_checkpoint = resolve_checkpoints(args.resume_from, output_dir)
 
     # Verify input_features and model parameters consistency across all ranks
     if accelerator.use_distributed:
@@ -449,7 +411,11 @@ def main():
                     rank_dict = {item[0]: item for item in rank_params}
                     
                     if len(ref_params) != len(rank_params):
-                        print(f"CRITICAL ERROR: Parameter count mismatch! Rank 0 has {len(ref_params)} params, but Rank {rank_idx} has {len(rank_params)} params.")
+                        print(
+                            f"CRITICAL ERROR: Parameter count mismatch! "
+                            f"Rank 0 has {len(ref_params)} params, but "
+                            f"Rank {rank_idx} has {len(rank_params)} params."
+                        )
                         mismatch_found = True
                         
                     for name, shape, dtype, req_grad in ref_params:
@@ -457,7 +423,7 @@ def main():
                             print(f"CRITICAL ERROR: Parameter '{name}' in Rank 0 is missing in Rank {rank_idx}!")
                             mismatch_found = True
                         else:
-                            r_name, r_shape, r_dtype, r_req_grad = rank_dict[name]
+                            _, r_shape, r_dtype, r_req_grad = rank_dict[name]
                             if shape != r_shape:
                                 print(f"CRITICAL ERROR: Parameter '{name}' shape mismatch! Rank 0: {shape}, Rank {rank_idx}: {r_shape}")
                                 mismatch_found = True
@@ -476,8 +442,8 @@ def main():
                 if mismatch_found:
                     print("CRITICAL: PARAMETER OR FEATURE STRUCTURAL MISMATCH DETECTED ACROSS RANKS! Raising error to avoid DDP hang.")
                     raise RuntimeError("Parameter/feature structural mismatch detected across ranks before DDP preparation.")
-                else:
-                    print("SUCCESS: All model parameters and input features are perfectly consistent across all ranks!")
+                
+                print("SUCCESS: All model parameters and input features are perfectly consistent across all ranks!")
         except Exception as check_err:
             print(f"WARNING: Rank consistency check encountered an issue: {check_err}")
 
@@ -486,15 +452,8 @@ def main():
     )
 
     step = 0
-    if args.resume_from:
-        accelerator.load_state(args.resume_from)
-        try:
-            step = int(os.path.basename(args.resume_from).split("_")[1].split(".")[0])
-            print(f"Resumed training state from {args.resume_from} at step {step}")
-        except (ValueError, IndexError):
-            print(
-                f"Resumed training state from {args.resume_from}, but could not determine step. Starting from 0."
-            )
+    if checkpoint_to_try:
+        args.resume_from, step = load_checkpoint(accelerator, checkpoint_to_try, fallback_checkpoint)
 
     # 4. Training Loop
     progress_bar = tqdm(total=args.steps, initial=step, desc="RECAP Phase 1")

@@ -84,14 +84,24 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         self._apply_ki_patch()
 
         # Ensure projection layers and expert are in the same dtype as the VLM
-        self.vlm_with_expert.lm_expert.to(self.vlm_with_expert.vlm.dtype)
-        self.action_in_proj.to(self.vlm_with_expert.vlm.dtype)
-        self.action_out_proj.to(self.vlm_with_expert.vlm.dtype)
+        vlm_dtype = self.vlm_with_expert.vlm.dtype
+        self.vlm_with_expert.lm_expert.to(vlm_dtype)
+        self.action_in_proj.to(vlm_dtype)
+        self.state_proj.to(vlm_dtype)
+        self.action_time_mlp_in.to(vlm_dtype)
+        self.action_time_mlp_out.to(vlm_dtype)
+        self.fast_wrapper.to(vlm_dtype)
+
+    def embed_suffix(self, noisy_actions, timestep):
+        # Cast noisy_actions to projection weights dtype to prevent mat1/mat2 dtype mismatch (Float vs BFloat16)
+        noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
+        return super().embed_suffix(noisy_actions, timestep)
 
     def _apply_ki_patch(self):
         """Patch the forward_attn_layer to implement Knowledge Insulation."""
         original_forward_attn = self.vlm_with_expert.forward_attn_layer
 
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
         def ki_forward_attn_layer(
             model_layers,
             inputs_embeds,
@@ -146,9 +156,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                         dim=1,
                     )
                     return [unified_att_output], None
-                else:
-                    # Cross-attention mode: separate attention outputs
-                    return [vlm_out[0], expert_out[1]], None
+
+                # Cross-attention mode: separate attention outputs
+                return [vlm_out[0], expert_out[1]], None
 
             return original_forward_attn(
                 model_layers,
@@ -163,14 +173,17 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
 
         self.vlm_with_expert.forward_attn_layer = ki_forward_attn_layer
 
+    # pylint: disable=arguments-differ
     def forward(self, batch, camera_keys=None, advantage=None):
         return self.compute_loss(batch, camera_keys=camera_keys, advantage=advantage)
 
+    # pylint: disable=too-many-locals,unused-argument
     def compute_loss(self, batch, camera_keys=None, advantage=None):
         """
         Compute combined loss: AR loss on FAST tokens + Flow Matching loss on continuous actions.
         """
         # 1. Prepare batch components (includes observation state)
+        # pylint: disable=protected-access
         images, img_masks, state, lang_tokens, lang_masks = (
             self.fast_wrapper._prepare_batch(batch)
         )
@@ -358,20 +371,41 @@ class SmolVLARECAPPolicy(PreTrainedPolicy):
     def predict_action_chunk(
         self,
         batch: dict[str, Tensor],
-        noise: Tensor | None = None,
+        noise: Tensor | None = None,  # pylint: disable=unused-argument
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Predict a chunk of actions."""
+        """Predict a chunk of actions using the flow-matching expert."""
         self.eval()
 
-        # Currently, SmolVLARECAP's generate_action is used for inference.
-        # It handles prefix embedding (images + state + language) internally.
-        actions = self.model.generate_action(batch, chunk_size=self.config.chunk_size)
+        # Handle history tracking queues if needed
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
-        # Convert back to torch tensor if it's numpy
-        if not isinstance(actions, torch.Tensor):
-            actions = torch.from_numpy(actions).to(
-                device=self.model.vlm_with_expert.vlm.device
-            )
+        images, img_masks = modeling_smolvla.SmolVLAPolicy.prepare_images(self, batch)
+        state = modeling_smolvla.SmolVLAPolicy.prepare_state(self, batch)
+        
+        # Ensure correct dtype for inputs
+        dtype = self.model.vlm_with_expert.vlm.dtype
+        images = [img.to(dtype) for img in images]
+        state = state.to(dtype)
+
+        lang_tokens = batch["observation.language.tokens"]
+        lang_masks = batch["observation.language.attention_mask"]
+
+        # Predict actions using the flow-matching expert
+        actions = self.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+        )
+
+        if "action" in self.config.output_features:
+            action_dim = self.config.output_features["action"].shape[0]
+            actions = actions[:, :, :action_dim]
 
         return actions
+
+    def forward(self, batch: dict[str, Tensor], **kwargs) -> dict[str, Tensor]:
+        raise NotImplementedError("Use self.model directly for forward/training")
+
+    def get_optim_params(self) -> dict:
+        return self.parameters()

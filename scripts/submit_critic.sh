@@ -29,4 +29,4 @@ sbatch scripts/train_slurm.sh \
     src/lerobot_policy_smolvla_rl/train_critic.py \
     --dataset_repo_id "$DATASET" \
     --job_name "$JOB_NAME" \
-    $EXTRA_ARGS
+    "$EXTRA_ARGS"
