@@ -10,7 +10,6 @@ RobustDataset       — wraps a LeRobotDataset and silently retries on corrupt
 CudaPrefetcher      — overlaps host-to-device transfer of the next batch with
                       the current batch's forward/backward pass via a background
                       CUDA stream.
-streaming_collate_fn — collate function for StreamingLeRobotDataset (PIL→tensor).
 add_dataloader_args  — registers the shared DataLoader CLI flags on an argparse
                        ArgumentParser.
 build_dataloader     — constructs a DataLoader from parsed args + dataset,
@@ -136,27 +135,6 @@ class CudaPrefetcher:
         return batch
 
 
-# ---------------------------------------------------------------------------
-# streaming_collate_fn
-# ---------------------------------------------------------------------------
-
-def streaming_collate_fn(batch):
-    """Collate function for StreamingLeRobotDataset.
-
-    Converts PIL Images in each sample to ``[C, H, W]`` float32 tensors
-    scaled to ``[0, 1]`` before passing to the default collate.
-    """
-    import numpy as np
-    from PIL import Image
-    from torch.utils.data._utils.collate import default_collate
-
-    for item in batch:
-        for k, v in item.items():
-            if isinstance(v, Image.Image):
-                item[k] = (
-                    torch.from_numpy(np.array(v).transpose(2, 0, 1)).float() / 255.0
-                )
-    return default_collate(batch)
 
 
 # ---------------------------------------------------------------------------
@@ -207,28 +185,24 @@ def build_dataloader(
     *,
     shuffle: bool = True,
     device: torch.device | None = None,
-    is_streaming: bool = False,
 ) -> DataLoader | CudaPrefetcher:
     """Build a DataLoader (+ optional wrappers) from parsed CLI *args*.
 
     Parameters
     ----------
     dataset:
-        The base dataset.  If ``args.skip_bad_samples`` is True and
-        ``is_streaming`` is False, it will be wrapped in :class:`RobustDataset`.
+        The base dataset.  If ``args.skip_bad_samples`` is True, it will be wrapped in :class:`RobustDataset`.
     args:
         Parsed argparse namespace.  Must contain the flags registered by
         :func:`add_dataloader_args`.
     shuffle:
-        Whether to shuffle the DataLoader.  Ignored for streaming datasets.
+        Whether to shuffle the DataLoader.
     device:
         Target CUDA device for :class:`CudaPrefetcher`.  If *None*, the
         prefetcher is disabled even when ``args.prefetch_to_gpu`` is True.
-    is_streaming:
-        When True, disables worker-based features incompatible with streaming.
     """
     # Optionally wrap for robustness against corrupt video files
-    if args.skip_bad_samples and not is_streaming:
+    if args.skip_bad_samples:
         if not isinstance(dataset, RobustDataset):
             dataset = RobustDataset(dataset, max_retries=10)
             logger.info(
@@ -236,24 +210,16 @@ def build_dataloader(
             )
 
     num_workers = args.num_workers
-    if is_streaming and num_workers > 0:
-        logger.warning(
-            "StreamingLeRobotDataset with num_workers > 0 is known to cause "
-            "Segmentation Faults. Setting num_workers=0 for safety."
-        )
-        num_workers = 0
-
     prefetch_factor = args.prefetch_factor if num_workers > 0 else None
 
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle if not is_streaming else False,
+        shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=(not is_streaming),
+        pin_memory=True,
         prefetch_factor=prefetch_factor,
         persistent_workers=(num_workers > 0),
-        collate_fn=streaming_collate_fn if is_streaming else None,
     )
 
     # Optionally wrap with CUDA prefetcher

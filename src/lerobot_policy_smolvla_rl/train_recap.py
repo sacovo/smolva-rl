@@ -345,10 +345,10 @@ def main():
         loader_dataset = dataset
 
     dataloader = build_dataloader(
+        loader_dataset,
         args,
         shuffle=True,
         device=accelerator.device,
-        is_streaming=args.streaming,
     )
 
     # 3. Initialize RECAP Model

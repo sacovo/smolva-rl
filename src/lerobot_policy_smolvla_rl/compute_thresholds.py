@@ -150,7 +150,6 @@ def main():
         args,
         shuffle=False,
         device=device_obj,
-        is_streaming=False,
     )
 
     # sample_idx -> scalar float

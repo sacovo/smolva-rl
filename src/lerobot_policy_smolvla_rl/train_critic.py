@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 
@@ -11,11 +12,10 @@ from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
-try:
-    from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-except ImportError:
-    StreamingLeRobotDataset = None
-
+from lerobot_policy_smolvla_rl.checkpoint_utils import (
+    resolve_checkpoints,
+    load_checkpoint,
+)
 from lerobot_policy_smolvla_rl.dataloader_utils import (
     add_dataloader_args,
     build_dataloader,
@@ -26,14 +26,6 @@ from lerobot_policy_smolvla_rl.ds_utils import (
     get_max_task_lengths,
 )
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
-from lerobot_policy_smolvla_rl.smolvla_critic import (
-    SmolVLACrictic,
-    SmolVLMCriticConfig,
-)
-from lerobot_policy_smolvla_rl.checkpoint_utils import (
-    resolve_checkpoints,
-    load_checkpoint,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +175,6 @@ def main():
     # Configure PyTorch multiprocessing sharing strategy to prevent
     # "RuntimeError: received 0 items of ancdata" from open file descriptor/shared memory limits
     try:
-        import torch.multiprocessing as mp
-
         import torch.multiprocessing as mp  # pylint: disable=import-outside-toplevel
 
         mp.set_sharing_strategy("file_system")
@@ -220,21 +210,12 @@ def main():
             print(f"Warning: could not load dataset metadata to limit episodes: {e}")
 
     dataset_class = LeRobotDataset
-    if args.streaming:
-        if StreamingLeRobotDataset is None:
-            raise ImportError(
-                "StreamingLeRobotDataset could not be imported. Please make sure you are using LeRobot >= 3.0."
-            )
-        dataset_class = StreamingLeRobotDataset
-        print("Using StreamingLeRobotDataset to stream directly from HF Hub...")
-
     print(f"Loading dataset: {args.dataset_repo_id}")
     dataset_kwargs = {
         "episodes": episodes_to_load,
         "tolerance_s": args.tolerance_s,
+        "video_backend": args.video_backend,
     }
-    if not args.streaming:
-        dataset_kwargs["video_backend"] = args.video_backend
 
     try:
         with accelerator.local_main_process_first():
@@ -258,11 +239,10 @@ def main():
     max_lengths = max_lengths.to(accelerator.device)
 
     dataloader = build_dataloader(
+        dataset,
         args,
         shuffle=True,
         device=device,
-        is_streaming=args.streaming,
-        pin_memory=True,
     )
 
     print(
@@ -391,23 +371,9 @@ def main():
     output_dir = os.path.join(args.save_dir, args.model_save_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.resume_from == "auto":
-        if os.path.exists(output_dir):
-            checkpoints = [
-                d
-                for d in os.listdir(output_dir)
-                if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
-            ]
-            if checkpoints:
-                # Sort by step number (stripping any file extension like .pt)
-                latest_checkpoint = max(
-                    checkpoints, key=lambda x: int(x.split("_")[1].split(".")[0])
-                )
-                args.resume_from = os.path.join(output_dir, latest_checkpoint)
-            else:
-                args.resume_from = None
-        else:
-            args.resume_from = None
+    checkpoint_to_try, fallback_checkpoint = resolve_checkpoints(
+        args.resume_from, output_dir
+    )
 
     # Verify input_features and model parameters consistency across all ranks
     if accelerator.use_distributed:

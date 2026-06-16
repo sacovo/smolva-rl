@@ -17,7 +17,6 @@ sys.path.append(os.path.join(os.getcwd(), "src"))
 from lerobot_policy_smolvla_rl.dataloader_utils import (
     RobustDataset,
     CudaPrefetcher,
-    streaming_collate_fn,
     add_dataloader_args,
     build_dataloader,
 )
@@ -198,39 +197,6 @@ def test_cuda_prefetcher_basic():
             next(iterator)
 
 
-# ---------------------------------------------------------------------------
-# streaming_collate_fn Tests
-# ---------------------------------------------------------------------------
-
-def test_streaming_collate_fn():
-    # Arrange
-    img1 = Image.new("RGB", (10, 10), color="red")
-    img2 = Image.new("RGB", (10, 10), color="blue")
-    
-    batch = [
-        {"image": img1, "label": torch.tensor(1), "info": "first"},
-        {"image": img2, "label": torch.tensor(2), "info": "second"},
-    ]
-
-    # Act
-    collated = streaming_collate_fn(batch)
-
-    # Assert
-    # Images should be converted to torch tensors of shape [3, 10, 10]
-    assert isinstance(collated["image"], torch.Tensor)
-    assert collated["image"].shape == (2, 3, 10, 10)
-    assert collated["image"].dtype == torch.float32
-    
-    # Values should be scaled to [0, 1]
-    assert collated["image"].min() >= 0.0
-    assert collated["image"].max() <= 1.0
-    
-    # Labels should be standard collated tensors
-    assert torch.equal(collated["label"], torch.tensor([1, 2]))
-    
-    # Non-tensor/non-image values collate to a list of strings
-    assert collated["info"] == ["first", "second"]
-
 
 # ---------------------------------------------------------------------------
 # build_dataloader Tests
@@ -270,17 +236,6 @@ def test_build_dataloader_no_wrap_when_disabled():
     assert not isinstance(loader.dataset, RobustDataset)
     assert loader.dataset is base_dataset
 
-
-def test_build_dataloader_no_wrap_for_streaming():
-    # Arrange
-    base_dataset = MockBaseDataset([{"obs": i} for i in range(10)])
-    args = DummyArgs(skip_bad_samples=True)
-
-    # Act
-    loader = build_dataloader(base_dataset, args, shuffle=False, is_streaming=True)
-
-    # Assert
-    assert not isinstance(loader.dataset, RobustDataset)
 
 
 def test_build_dataloader_wraps_with_prefetcher_when_cuda():
