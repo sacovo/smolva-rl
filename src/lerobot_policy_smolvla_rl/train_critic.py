@@ -217,16 +217,7 @@ def main():
         "video_backend": args.video_backend,
     }
 
-    try:
-        with accelerator.local_main_process_first():
-            dataset = dataset_class(
-                args.dataset_repo_id,
-                **dataset_kwargs,
-            )
-    except Exception as e:
-        print(
-            f"Warning: local_main_process_first failed during dataset load, falling back to direct load: {e}"
-        )
+    with accelerator.local_main_process_first():
         dataset = dataset_class(
             args.dataset_repo_id,
             **dataset_kwargs,
@@ -297,13 +288,7 @@ def main():
                 del input_features[cam]
 
     config.input_features = input_features
-    try:
-        with accelerator.local_main_process_first():
-            model = SmolVLACrictic(config).to(device)
-    except Exception as e:
-        print(
-            f"Warning: local_main_process_first failed during model load, falling back to direct load: {e}"
-        )
+    with accelerator.local_main_process_first():
         model = SmolVLACrictic(config).to(device)
 
     # Load pretrained critic weights if provided
