@@ -87,7 +87,7 @@ def load_and_merge_config(config_path, cli_slurm, cli_training_dict):
                 slurm_keys = {
                     "nodes", "ntasks_per_node", "ntasks-per-node",
                     "cpus_per_task", "cpus-per-task", "gres", "time", "mem",
-                    "job_name", "job-name", "output", "error"
+                    "job_name", "job-name", "output", "error", "partition"
                 }
                 for k, v in file_config.items():
                     # normalize key dashes to underscores
@@ -157,9 +157,12 @@ def generate_sbatch_script(train_script, slurm_config, training_args_list):
     job_name = slurm_config.get("job_name") or slurm_config.get("job-name", "smolvla-rl")
     output_log = slurm_config.get("output", "logs/%x_%j.out")
     error_log = slurm_config.get("error", "logs/%x_%j.err")
+    partition = slurm_config.get("partition")
 
     # Construct args string
     args_str = " ".join(training_args_list)
+
+    partition_line = f"#SBATCH --partition={partition}\n" if partition else ""
 
     sbatch_content = f"""#!/bin/bash
 #SBATCH --job-name={job_name}
@@ -171,7 +174,7 @@ def generate_sbatch_script(train_script, slurm_config, training_args_list):
 #SBATCH --mem={mem}
 #SBATCH --output={output_log}
 #SBATCH --error={error_log}
-
+{partition_line}
 mkdir -p logs
 
 export PATH="$HOME/.local/bin:$PATH"

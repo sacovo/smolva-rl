@@ -30,6 +30,7 @@ def main():
     slurm_group.add_argument("--job-name", type=str, default=None)
     slurm_group.add_argument("--output", type=str, default=None)
     slurm_group.add_argument("--error", type=str, default=None)
+    slurm_group.add_argument("--partition", type=str, default=None)
     
     # Submission arguments
     parser.add_argument("--config", type=str, default=None, help="Path to config JSON/YAML file")
