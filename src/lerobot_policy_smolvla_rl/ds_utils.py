@@ -43,6 +43,13 @@ def calculate_returns(
     frame_idxs,
     post_goal_buffer=0,
 ):
+    if not isinstance(episode_idxs, torch.Tensor):
+        episode_idxs = torch.tensor(episode_idxs, dtype=torch.long)
+    if not isinstance(frame_idxs, torch.Tensor):
+        frame_idxs = torch.tensor(frame_idxs, dtype=torch.long)
+    if not isinstance(task_idxs, torch.Tensor):
+        task_idxs = torch.tensor(task_idxs, dtype=torch.long)
+
     T = episode_lengths[episode_idxs]  # Shape: [batch_size]
     # Remaining steps until goal. Goal is shifted by post_goal_buffer.
     rem_steps = torch.clamp(T - post_goal_buffer - frame_idxs - 1, min=0)

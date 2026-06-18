@@ -525,9 +525,16 @@ def main():
             with accelerator.accumulate(model):
                 # Label advantage
                 with torch.no_grad():
+                    def to_numpy(val):
+                        if hasattr(val, "cpu"):
+                            val = val.cpu()
+                        if hasattr(val, "numpy"):
+                            return val.numpy()
+                        return np.array(val)
+
                     if precomputed_advantages is not None:
                         # High-Speed Offline Mode: direct array lookup using absolute index
-                        batch_indices = batch["index"].cpu().numpy()
+                        batch_indices = to_numpy(batch["index"])
                         # NaN entries = frames corrupt at precompute time; treat as 0
                         # (neutral). RobustDataset already replaced them with a valid
                         # sample, so the looked-up index is a stand-in anyway.
@@ -544,7 +551,7 @@ def main():
                         )
 
                     # Compare advantage against task-specific epsilon_l
-                    task_indices = batch["task_index"].cpu().numpy()
+                    task_indices = to_numpy(batch["task_index"])
                     batch_thresholds = torch.tensor(
                         [task_thresholds[int(t)] for t in task_indices],
                         dtype=torch.float32,

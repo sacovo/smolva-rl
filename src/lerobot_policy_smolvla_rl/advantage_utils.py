@@ -129,10 +129,17 @@ def get_task_thresholds(
             _, probs = critic_model(critic_batch)
             v_s = (probs * support).sum(dim=-1).cpu().numpy()
 
+            def to_numpy(val):
+                if hasattr(val, "cpu"):
+                    val = val.cpu()
+                if hasattr(val, "numpy"):
+                    return val.numpy()
+                return np.array(val)
+
             all_vs_list.append(v_s)
-            all_tasks_list.append(batch["task_index"].numpy())
-            all_episodes_list.append(batch["episode_index"].numpy())
-            all_frames_list.append(batch["frame_index"].numpy())
+            all_tasks_list.append(to_numpy(batch["task_index"]))
+            all_episodes_list.append(to_numpy(batch["episode_index"]))
+            all_frames_list.append(to_numpy(batch["frame_index"]))
 
     all_vs = np.concatenate(all_vs_list)
     all_tasks = np.concatenate(all_tasks_list)

@@ -173,10 +173,17 @@ def main():
             _, probs = critic(critic_batch)
             v_s = (probs * support).sum(dim=-1).cpu().numpy()
 
-            sample_indices = batch["index"].numpy()
-            episode_indices = batch["episode_index"].numpy()
-            frame_indices = batch["frame_index"].numpy()
-            task_indices = batch["task_index"].numpy()
+            def to_numpy(val):
+                if hasattr(val, "cpu"):
+                    val = val.cpu()
+                if hasattr(val, "numpy"):
+                    return val.numpy()
+                return np.array(val)
+
+            sample_indices = to_numpy(batch["index"])
+            episode_indices = to_numpy(batch["episode_index"])
+            frame_indices = to_numpy(batch["frame_index"])
+            task_indices = to_numpy(batch["task_index"])
 
             for idx, v, ep, fr, task in zip(
                 sample_indices, v_s, episode_indices, frame_indices, task_indices

@@ -173,8 +173,16 @@ def main():
             _, probs = model(pre(batch))
             expected_value = (probs * support).sum(dim=-1)  # (B,)
 
-            batch_eps = batch["episode_index"].cpu().numpy()
-            batch_frames = batch["frame_index"].cpu().numpy()
+            def to_numpy(val):
+                if hasattr(val, "cpu"):
+                    val = val.cpu()
+                if hasattr(val, "numpy"):
+                    return val.numpy()
+                return np.array(val)
+
+            batch_eps = to_numpy(batch["episode_index"])
+            batch_frames = to_numpy(batch["frame_index"])
+            batch_tasks = to_numpy(batch["task_index"])
 
             p_cpu = probs.cpu()
             ev_cpu = expected_value.cpu()
@@ -190,8 +198,8 @@ def main():
             )
 
             for i in range(len(batch_eps)):
-                frame_idx = batch["frame_index"][i].item()
-                ep_idx = batch["episode_index"][i].item()
+                frame_idx = int(batch_frames[i])
+                ep_idx = int(batch_eps[i])
 
                 results_by_episode[ep_idx]["probs"][frame_idx, :] = p_cpu[i]
                 results_by_episode[ep_idx]["expected_values"][frame_idx] = ev_cpu[i]
@@ -199,7 +207,7 @@ def main():
                 results_by_episode[ep_idx]["gt_values"][frame_idx] = (
                     returns[i].cpu().item()
                 )
-                results_by_episode[ep_idx]["task_index"] = batch["task_index"][i].item()
+                results_by_episode[ep_idx]["task_index"] = int(batch_tasks[i])
 
     # Calculate temporal advantages for all episodes to compute task-specific thresholds
     task_advantages = {}
