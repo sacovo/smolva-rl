@@ -22,6 +22,7 @@ from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCrit
 from lerobot_policy_smolvla_rl.checkpoint_utils import (
     resolve_checkpoints,
     load_checkpoint,
+    parse_duration_to_seconds,
 )
 from lerobot_policy_smolvla_rl.advantage_utils import (
     FutureFrameWrapper,
@@ -140,11 +141,25 @@ def parse_args():
         default=0.0001,
         help="Tolerance in seconds for timestamp matching when loading video frames",
     )
+    parser.add_argument(
+        "--duration",
+        type=str,
+        default=None,
+        help="Maximum training duration (in hours or HH:MM:SS format). As soon as the elapsed time approaches this duration, the script saves its state and exits.",
+    )
+    parser.add_argument(
+        "--duration_buffer",
+        type=int,
+        default=10 * 60, # 10 minutes
+        help="Buffer time in seconds to subtract from duration to ensure clean state saving before timeout",
+    )
     return parser.parse_args()
 
 
 # pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-nested-blocks
 def main():
+    import time
+    start_time = time.time()
     args = parse_args()
 
     logging.basicConfig(
@@ -512,11 +527,28 @@ def main():
             accelerator, checkpoint_to_try, fallback_checkpoint
         )
 
+    max_duration_seconds = parse_duration_to_seconds(args.duration)
+
     # 4. Training Loop
     progress_bar = tqdm(total=args.steps, initial=step, desc="RECAP Phase 1")
 
     while step < args.steps:
         for batch in dataloader:
+            if max_duration_seconds is not None:
+                elapsed = time.time() - start_time
+                if elapsed >= max_duration_seconds - args.duration_buffer:
+                    print(
+                        f"Approaching duration limit ({elapsed:.1f}s / {max_duration_seconds}s). "
+                        f"Saving state at step {step} and exiting cleanly..."
+                    )
+                    save_path = os.path.join(output_dir, f"state_{step}.pt")
+                    accelerator.wait_for_everyone()
+                    accelerator.save_state(save_path)
+                    print(f"State saved to {save_path}. Exiting.")
+                    progress_bar.close()
+                    accelerator.end_training()
+                    return
+
             if camera_map:
                 batch = {camera_map.get(k, k): v for k, v in batch.items()}
             if step >= args.steps:

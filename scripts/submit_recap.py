@@ -31,6 +31,8 @@ def main():
     slurm_group.add_argument("--output", type=str, default=None)
     slurm_group.add_argument("--error", type=str, default=None)
     slurm_group.add_argument("--partition", type=str, default=None)
+    slurm_group.add_argument("--num-jobs", type=int, default=None, help="Number of times to submit the job sequentially with dependencies")
+    slurm_group.add_argument("--dependency-type", type=str, default=None, choices=["afterany", "afterok", "after", "afternotok"], help="Slurm dependency type (default: afterany)")
     
     # Submission arguments
     parser.add_argument("--config", type=str, default=None, help="Path to config JSON/YAML file")
@@ -64,6 +66,13 @@ def main():
     slurm_config.setdefault("mem", "64G")
     slurm_config.setdefault("output", "logs/%x_%j.out")
     slurm_config.setdefault("error", "logs/%x_%j.err")
+    slurm_config.setdefault("num_jobs", 1)
+    slurm_config.setdefault("dependency_type", "afterany")
+    
+    # Automatically propagate Slurm time limit to training script duration limit
+    slurm_time = slurm_config.get("time")
+    if slurm_time and "duration" not in training_config:
+        training_config["duration"] = slurm_time
     
     # Resolve job name
     dataset = training_config.get("dataset_repo_id")
@@ -88,7 +97,12 @@ def main():
         training_args_list
     )
     
-    submit_sbatch(sbatch_script, dry_run=parsed_args.dry_run)
+    submit_sbatch(
+        sbatch_script,
+        num_jobs=slurm_config["num_jobs"],
+        dependency_type=slurm_config["dependency_type"],
+        dry_run=parsed_args.dry_run
+    )
 
 if __name__ == "__main__":
     main()

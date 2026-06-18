@@ -28,6 +28,8 @@ The submission scripts accept the following Slurm configuration parameters:
 * `--job-name`: Custom job name (defaults to auto-generated descriptive name)
 * `--output`: Output log path (default: `logs/%x_%j.out`)
 * `--error`: Error log path (default: `logs/%x_%j.err`)
+* `--num-jobs`: Number of times to submit the job sequentially with dependencies (default: `1`)
+* `--dependency-type`: Slurm dependency type, e.g. `afterany`, `afterok`, `after` (default: `afterany`)
 * `--config`: Path to config file (JSON or YAML)
 * `--dry-run`: Dry run to print the generated sbatch script without submitting it to Slurm
 
@@ -123,3 +125,26 @@ python scripts/submit_recap.py --dataset_repo_id lerobot/droid_100 --critic_chec
 ### Resuming Training
 
 The scripts are designed to automatically resume from the latest checkpoint if the job is interrupted (e.g., due to the 24h limit). Simply submit the same command again, and the training script will automatically look for the latest checkpoint using the `--resume_from auto` option, which is automatically appended if not present.
+
+### Sequential Multi-Job Submission (Chaining)
+
+To automate sequential training across multiple time windows on a Slurm cluster, you can use the `--num-jobs` and `--dependency-type` arguments. This will submit the job multiple times, setting up dependencies between each run so they execute one after the other.
+
+For example, to kick off 5 sequential training windows to reach a target of 100k steps (where each run will resume from where the previous one timed out or finished):
+```bash
+python scripts/submit_recap.py \
+    --dataset_repo_id lerobot/droid_100 \
+    --critic_checkpoint outputs/checkpoints_critic/critic/checkpoint_final.pt \
+    --steps 100000 \
+    --batch_size 8 \
+    --accumulation_steps 8 \
+    --time 04:00:00 \
+    --num-jobs 5 \
+    --dependency-type afterany
+```
+
+- `--num-jobs 5`: Submits 5 jobs to Slurm. Job 2 runs only after Job 1 completes/terminates, Job 3 after Job 2, etc.
+- `--dependency-type afterany`: By default, `afterany` is used so the next job is executed regardless of how the previous job ended (useful because Slurm timeouts count as a termination but not success). If you only want subsequent jobs to run if the previous one succeeded (exited code 0), specify `afterok`.
+- Checked-in and resumed configurations automatically load the latest saved checkpoint using the `--resume_from auto` argument appended to the accelerating launching command.
+- If a chained job launches but the previous runs already successfully completed the target number of steps (e.g., reached 100k steps in Job 3 of 5), the subsequent jobs will load the final state, detect that they have already reached the target steps, and exit immediately and cleanly.
+

@@ -103,3 +103,44 @@ def load_checkpoint(accelerator, checkpoint_to_try, fallback_checkpoint=None):
             )
 
     return loaded_path, step
+
+
+def parse_duration_to_seconds(duration):
+    """
+    Parses duration into seconds.
+    If duration is a float/int, it is treated as hours.
+    If duration is a string:
+      - Can be a number (float/int) in string form (treated as hours).
+      - Can be in HH:MM:SS format.
+      - Can be in MM:SS format.
+    Returns duration in seconds, or None if invalid/None.
+    """
+    if duration is None:
+        return None
+    if isinstance(duration, (int, float)):
+        return duration * 3600.0
+    
+    # Try parsing string
+    duration = str(duration).strip()
+    if not duration:
+        return None
+        
+    # Check HH:MM:SS or MM:SS format
+    if ":" in duration:
+        parts = duration.split(":")
+        try:
+            if len(parts) == 3:  # HH:MM:SS
+                h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                return h * 3600.0 + m * 60.0 + s
+            elif len(parts) == 2:  # MM:SS
+                m, s = int(parts[0]), int(parts[1])
+                return m * 60.0 + s
+        except ValueError:
+            pass
+            
+    # Try parsing as float hours
+    try:
+        return float(duration) * 3600.0
+    except ValueError:
+        raise ValueError(f"Invalid duration format: '{duration}'. Must be a number (hours) or HH:MM:SS.")
+

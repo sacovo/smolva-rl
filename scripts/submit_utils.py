@@ -87,7 +87,8 @@ def load_and_merge_config(config_path, cli_slurm, cli_training_dict):
                 slurm_keys = {
                     "nodes", "ntasks_per_node", "ntasks-per-node",
                     "cpus_per_task", "cpus-per-task", "gres", "time", "mem",
-                    "job_name", "job-name", "output", "error", "partition"
+                    "job_name", "job-name", "output", "error", "partition",
+                    "num_jobs", "num-jobs", "dependency_type", "dependency-type"
                 }
                 for k, v in file_config.items():
                     # normalize key dashes to underscores
@@ -186,6 +187,8 @@ export PYTHONFAULTHANDLER=1
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export CUDA_LAUNCH_BLOCKING=1
 export NCCL_DEBUG=INFO
+export NCCL_SHM_DISABLE=1
+export NCCL_CUMEM_HOST_ENABLE=0
 
 # Detect number of GPUs assigned by Slurm
 if [ -n "$SLURM_GPUS_ON_NODE" ]; then
@@ -229,31 +232,69 @@ echo "Job finished at $(date)"
 """
     return sbatch_content
 
-def submit_sbatch(sbatch_content, dry_run=False):
+def extract_job_id(sbatch_output):
+    """
+    Extracts the numeric job ID from the sbatch command output.
+    Typically: "Submitted batch job 123456" -> "123456"
+    """
+    if not sbatch_output:
+        return None
+    parts = sbatch_output.strip().split()
+    if parts:
+        return parts[-1]
+    return None
+
+def submit_sbatch(sbatch_content, num_jobs=1, dependency_type="afterany", dry_run=False):
     """
     Submits the dynamic sbatch script to Slurm.
+    Supports submitting multiple jobs sequentially with dependencies.
     """
-    if dry_run:
-        print("--- DRY RUN: Generated SBATCH Script ---")
-        print(sbatch_content)
-        print("----------------------------------------")
-        return "dry_run_job_id"
+    dependency_job_id = None
     
-    try:
-        process = subprocess.Popen(
-            ["sbatch"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = process.communicate(input=sbatch_content)
-        if process.returncode != 0:
-            raise RuntimeError(f"sbatch submission failed: {stderr}")
-        print(stdout.strip())
-        return stdout.strip()
-    except FileNotFoundError:
-        print("Warning: sbatch command not found. Is Slurm installed?")
-        print("Writing script to stdout instead:")
-        print(sbatch_content)
-        return "mock_job_id"
+    for i in range(num_jobs):
+        if num_jobs > 1:
+            print(f"\n--- Submitting job {i+1}/{num_jobs} ---")
+            
+        dependency = f"{dependency_type}:{dependency_job_id}" if dependency_job_id else None
+        
+        # In dry_run or fallback scenarios, mock the dependency ID for display/logging
+        if dry_run and i > 0 and not dependency_job_id:
+            dependency = f"{dependency_type}:dry_run_job_id_{i}"
+            
+        if dry_run:
+            print("--- DRY RUN: Generated SBATCH Script ---")
+            if dependency:
+                print(f"# (Submitted with dependency: --dependency={dependency})")
+            print(sbatch_content)
+            print("----------------------------------------")
+            submit_output = f"Submitted batch job dry_run_job_id_{i+1}"
+        else:
+            try:
+                cmd = ["sbatch"]
+                if dependency:
+                    cmd.append(f"--dependency={dependency}")
+                
+                process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate(input=sbatch_content)
+                if process.returncode != 0:
+                    raise RuntimeError(f"sbatch submission failed: {stderr}")
+                
+                submit_output = stdout.strip()
+                print(submit_output)
+            except FileNotFoundError:
+                print("Warning: sbatch command not found. Is Slurm installed?")
+                if dependency:
+                    print(f"# (Submitted with dependency: --dependency={dependency})")
+                print("Writing script to stdout instead:")
+                print(sbatch_content)
+                submit_output = f"Submitted batch job mock_job_id_{i+1}"
+                
+        dependency_job_id = extract_job_id(submit_output)
+        if not dependency_job_id and num_jobs > 1:
+            print("Warning: Could not extract job ID. Subsequent jobs will not have a dependency.")
