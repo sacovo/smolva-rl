@@ -207,11 +207,20 @@ def main():
 
     # 1. Load Dataset
     print(f"Loading dataset: {args.dataset_repo_id}")
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.datasets.factory import resolve_delta_timestamps
+    
+    ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
+    # Instantiate dummy config to resolve delta_timestamps
+    dummy_config = SmolVLARECAPConfig(chunk_size=args.action_chunk_size)
+    delta_timestamps = resolve_delta_timestamps(dummy_config, ds_meta)
+
     with accelerator.local_main_process_first():
         dataset = LeRobotDataset(
             args.dataset_repo_id,
             episodes=episodes_to_load,
             tolerance_s=args.tolerance_s,
+            delta_timestamps=delta_timestamps,
         )
 
     # 2. Check for precomputed advantages (.npy)
@@ -354,7 +363,7 @@ def main():
         max_action_dim=action_dim,
         input_features=input_features,
         action_stats=dataset.meta.stats.get("action"),
-        chunk_size=1,
+        chunk_size=args.action_chunk_size,
         n_action_steps=1,
     )
     with accelerator.local_main_process_first():
@@ -634,8 +643,71 @@ def main():
     accelerator.wait_for_everyone()
     model = accelerator.unwrap_model(model)
     torch.save(model.state_dict(), save_path)
-
     print(f"Training completed. Final model saved to {save_path}")
+
+    # Convert and migrate checkpoint to LeRobot format
+    if accelerator.is_main_process:
+        print("Converting and migrating policy to LeRobot format...")
+        try:
+            exported_dir = os.path.join(output_dir, "exported")
+            os.makedirs(exported_dir, exist_ok=True)
+            
+            from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy
+            
+            action_stats = dataset.meta.stats.get("action")
+            if action_stats is not None:
+                action_stats = {
+                    k: v.tolist() if isinstance(v, np.ndarray) else v
+                    for k, v in action_stats.items()
+                }
+
+            config = SmolVLARECAPConfig(
+                num_vlm_layers=args.num_vlm_layers,
+                max_action_dim=action_dim,
+                input_features=input_features,
+                action_stats=action_stats,
+                chunk_size=args.action_chunk_size,
+                n_action_steps=1, # Default to 1, can be overridden during evaluation
+                device="cpu",
+            )
+            config.output_features = output_features
+            
+            policy = SmolVLARECAPPolicy(config)
+            
+            # Map weights to policy format
+            clean_state_dict = {}
+            for k, v in model.state_dict().items():
+                if k.startswith("module."):
+                    k = k[7:]
+                if k.startswith("_orig_mod."):
+                    k = k[10:]
+                if not k.startswith("model."):
+                    k = "model." + k
+                clean_state_dict[k] = v
+                
+            policy.load_state_dict(clean_state_dict, strict=False)
+            policy.save_pretrained(exported_dir)
+            print(f"Base policy exported to {exported_dir}")
+            
+            # Run migration script preloading our package to register 'smolvla_recap'
+            import subprocess
+            migrated_dir = os.path.join(output_dir, "migrated")
+            cmd = [
+                ".venv/bin/python",
+                "-c",
+                "import lerobot_policy_smolvla_rl; from lerobot.processor.migrate_policy_normalization import main; main()",
+                "--pretrained-path", exported_dir,
+                "--output-dir", migrated_dir
+            ]
+            print(f"Running: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+            print(f"Policy successfully migrated to: {migrated_dir}")
+            
+        except Exception as export_err:
+            print(f"Warning: Failed to automatically export and migrate policy: {export_err}")
+            import traceback
+            traceback.print_exc()
+
     accelerator.end_training()
 
 

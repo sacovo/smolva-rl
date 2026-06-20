@@ -125,7 +125,6 @@ def main():
     # 3. Load Exported LeRobot Policy
     if not args.quiet:
         print(f"Loading policy from: {args.policy_path} on device: {args.device}...")
-    # Load config to determine policy class
     config = PreTrainedConfig.from_pretrained(args.policy_path)
     if config.type == "smolvla_recap":
         policy = SmolVLARECAPPolicy.from_pretrained(args.policy_path, device=args.device)
@@ -133,6 +132,7 @@ def main():
         policy = SmolVLAPolicy.from_pretrained(args.policy_path, device=args.device)
     else:
         raise ValueError(f"Unknown policy type in config: {config.type}")
+    policy.to(args.device)
     policy.eval()
 
     # Inspect policy config to see what cameras and features it expects

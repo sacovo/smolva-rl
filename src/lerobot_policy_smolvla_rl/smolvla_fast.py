@@ -22,7 +22,7 @@ from lerobot.utils.constants import (
 class SmolVLAFastConfig(SmolVLAConfig):
     num_fast_tokens: int = 1024
     model_id: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
-    action_stats: dict[str, np.ndarray] | None = None
+    action_stats: dict[str, list[float]] | None = None
 
 
 class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
@@ -78,8 +78,8 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
         if self.action_stats is None:
             return actions
 
-        q01 = self.action_stats.get("q01", self.action_stats.get("min"))
-        q99 = self.action_stats.get("q99", self.action_stats.get("max"))
+        q01 = np.array(self.action_stats.get("q01", self.action_stats.get("min")))
+        q99 = np.array(self.action_stats.get("q99", self.action_stats.get("max")))
         # Linear mapping from [q01, q99] to [-1, 1]
         normalized = 2.0 * (actions - q01) / (q99 - q01 + 1e-8) - 1.0
         return normalized
@@ -89,8 +89,8 @@ class SmolVLAFast(modeling_smolvla.VLAFlowMatching):
         if self.action_stats is None:
             return normalized
 
-        q01 = self.action_stats.get("q01", self.action_stats.get("min"))
-        q99 = self.action_stats.get("q99", self.action_stats.get("max"))
+        q01 = np.array(self.action_stats.get("q01", self.action_stats.get("min")))
+        q99 = np.array(self.action_stats.get("q99", self.action_stats.get("max")))
         actions = (normalized + 1.0) / 2.0 * (q99 - q01 + 1e-8) + q01
         return actions
 

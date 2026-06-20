@@ -64,6 +64,18 @@ def parse_args():
         help="Disable advantage conditioning",
     )
     parser.add_argument(
+        "--action_chunk_size",
+        type=int,
+        default=50,
+        help="Action chunk size used during training/inference",
+    )
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=1,
+        help="Number of action steps to execute per policy call during inference",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cpu",
@@ -91,6 +103,14 @@ def main():
     print(f"Dataset features loaded. Action dimension: {action_dim}")
     print(f"Input features: {list(input_features.keys())}")
 
+    action_stats = dataset.meta.stats.get("action")
+    if action_stats is not None:
+        import numpy as np
+        action_stats = {
+            k: v.tolist() if isinstance(v, np.ndarray) else v
+            for k, v in action_stats.items()
+        }
+
     # 2. Build Policy Configuration
     print("Building SmolVLARECAPConfig...")
     config = SmolVLARECAPConfig(
@@ -100,9 +120,9 @@ def main():
         model_id=args.model_id,
         max_action_dim=action_dim,
         input_features=input_features,
-        action_stats=dataset.meta.stats.get("action"),
-        chunk_size=1,
-        n_action_steps=1,
+        action_stats=action_stats,
+        chunk_size=args.action_chunk_size,
+        n_action_steps=args.n_action_steps,
         device=args.device,
     )
     config.output_features = output_features
