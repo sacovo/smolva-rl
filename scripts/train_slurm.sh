@@ -22,9 +22,8 @@ export PYTHONUNBUFFERED=1
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export PYTHONIOENCODING=utf-8
-export PYTHONFAULTHANDLER=1
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export CUDA_LAUNCH_BLOCKING=1
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export CUDA_LAUNCH_BLOCKING=1
 
 # Resolve NCCL Peer-to-Peer, shared memory, and InfiniBand communication failures on cluster nodes
 # export NCCL_P2P_DISABLE=1

@@ -182,13 +182,13 @@ export PATH="$HOME/.local/bin:$PATH"
 export PYTHONUNBUFFERED=1
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
-export PYTHONIOENCODING=utf-8
 export PYTHONFAULTHANDLER=1
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
-export CUDA_LAUNCH_BLOCKING=1
-export NCCL_DEBUG=INFO
-export NCCL_SHM_DISABLE=1
-export NCCL_CUMEM_HOST_ENABLE=0
+# Debugging flags (disabled for performance)
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export CUDA_LAUNCH_BLOCKING=1
+# export NCCL_DEBUG=INFO
+# export NCCL_SHM_DISABLE=1
+# export NCCL_CUMEM_HOST_ENABLE=0
 
 # Detect number of GPUs assigned by Slurm
 if [ -n "$SLURM_GPUS_ON_NODE" ]; then
