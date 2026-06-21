@@ -92,6 +92,12 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         self.action_time_mlp_out.to(vlm_dtype)
         self.fast_wrapper.to(vlm_dtype)
 
+        # Unfreeze VLM language model parameters (including embed_tokens and lm_head)
+        # for RECAP co-training while keeping the vision encoder frozen.
+        for name, param in self.vlm_with_expert.vlm.named_parameters():
+            if "vision_model" not in name:
+                param.requires_grad = True
+
     def embed_suffix(self, noisy_actions, timestep):
         # Cast noisy_actions to projection weights dtype to prevent mat1/mat2 dtype mismatch (Float vs BFloat16)
         noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
