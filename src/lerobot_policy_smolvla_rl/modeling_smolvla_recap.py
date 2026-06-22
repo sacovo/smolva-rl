@@ -320,11 +320,13 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
         
         tau_expanded = tau[:, :, None]
-        noised_actions = (
-            tau_expanded * actions.to(device=device, dtype=expert_dtype)
-            + (1 - tau_expanded) * omega
-        )
-        target_flow = omega - actions.to(device=device, dtype=expert_dtype)
+        actions_fm = actions.to(device=device, dtype=expert_dtype)
+        # Flow matching interpolation — MUST match the base VLAFlowMatching
+        # convention used by sample_actions() at inference:
+        #   x_t = t * noise + (1 - t) * actions   (t=0 → clean, t=1 → noise)
+        #   u_t = noise - actions                   (target velocity)
+        noised_actions = tau_expanded * omega + (1 - tau_expanded) * actions_fm
+        target_flow = omega - actions_fm
 
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
             noised_actions, tau.squeeze(1)

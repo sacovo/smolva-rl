@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from diffusers.optimization import get_scheduler
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
@@ -193,6 +192,12 @@ def parse_args():
         help="Accumulate over multiple steps",
     )
     parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping (0 to disable)",
+    )
+    parser.add_argument(
         "--resume_from",
         type=str,
         default=None,
@@ -210,6 +215,12 @@ def parse_args():
         type=str,
         default=None,
         help="Path to pretrained model checkpoint (.pt) or exported directory containing model.safetensors to finetune from",
+    )
+    parser.add_argument(
+        "--keep_last_n_checkpoints",
+        type=int,
+        default=5,
+        help="Keep only the last N checkpoints (0 to keep all)",
     )
     parser.add_argument(
         "--cameras",
@@ -438,11 +449,15 @@ def main():
         # High-Speed Offline Mode: use the raw dataset directly (no future wrappers needed!)
         loader_dataset = dataset
 
+    # Build DataLoader WITHOUT CudaPrefetcher — Accelerate handles device
+    # placement.  Wrapping with CudaPrefetcher before accelerator.prepare()
+    # would conflict with DDP's DistributedSampler and Accelerate's own
+    # host-to-device transfer.
     dataloader = build_dataloader(
         loader_dataset,
         args,
         shuffle=True,
-        device=accelerator.device,
+        device=None,  # Disable CudaPrefetcher; Accelerate manages devices
     )
 
     # 3. Initialize RECAP Model
@@ -502,19 +517,36 @@ def main():
 
     pre_recap = model.get_pre_processor(dataset)
 
+    # Only include trainable parameters in the optimizer — frozen vision
+    # encoder params would waste optimizer state memory (momentum/variance)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    n_total = sum(1 for _ in model.parameters())
+    print(f"Optimizer: {len(trainable_params)}/{n_total} trainable parameters")
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(args.beta1, args.beta2),
     )
 
-    scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.steps,
-    )
+    # Cosine schedule with linear warmup and configurable min_lr floor.
+    # diffusers' get_scheduler("cosine") doesn't support eta_min/lr_end in
+    # this version, so we build a LambdaLR directly.
+    import math
+
+    def lr_lambda(current_step):
+        if current_step < args.warmup_steps:
+            return float(current_step) / float(max(1, args.warmup_steps))
+        progress = float(current_step - args.warmup_steps) / float(
+            max(1, args.steps - args.warmup_steps)
+        )
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Interpolate between 1.0 and min_lr/lr
+        min_factor = args.min_lr / args.lr if args.lr > 0 else 0.0
+        return min_factor + (1.0 - min_factor) * cosine_decay
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     output_dir = os.path.join(args.save_dir, args.model_save_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -707,12 +739,15 @@ def main():
                 )
 
                 accelerator.backward(total_loss)
+                if args.max_grad_norm > 0:
+                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
                 if step % args.log_freq == 0:
                     lr = optimizer.param_groups[0]["lr"]
+                    adv_frac = sum(advantage_bool) / max(len(advantage_bool), 1)
                     accelerator.log(
                         {
                             "total_loss": total_loss.item(),
@@ -720,16 +755,34 @@ def main():
                             "flow_loss": flow_loss.item(),
                             "lr": lr,
                             "step": step,
+                            "advantage_positive_frac": adv_frac,
+                            "advantage_mean": advantage.mean().item(),
                         }
                     )
                     progress_bar.set_postfix(
-                        {"loss": f"{total_loss.item():.4f}", "lr": f"{lr:.2e}"}
+                        {"loss": f"{total_loss.item():.4f}", "lr": f"{lr:.2e}", "adv+": f"{adv_frac:.0%}"}
                     )
 
                 if (step + 1) % args.save_freq == 0:
                     save_path = os.path.join(output_dir, f"state_{step + 1}.pt")
                     accelerator.wait_for_everyone()
                     accelerator.save_state(save_path)
+
+                    # Clean up old checkpoints to avoid filling disk
+                    if args.keep_last_n_checkpoints > 0 and accelerator.is_main_process:
+                        existing = [
+                            d for d in os.listdir(output_dir)
+                            if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
+                        ]
+                        existing.sort(
+                            key=lambda x: int(x.split("_")[1].split(".")[0]),
+                            reverse=True,
+                        )
+                        for old_ckpt in existing[args.keep_last_n_checkpoints:]:
+                            old_path = os.path.join(output_dir, old_ckpt)
+                            import shutil
+                            shutil.rmtree(old_path, ignore_errors=True)
+                            print(f"Removed old checkpoint: {old_path}")
 
                 step += 1
                 progress_bar.update(1)
