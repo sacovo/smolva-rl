@@ -52,6 +52,10 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                     "model_id",
                     "action_stats",
                     "use_advantage_conditioning",
+                    "adv_dropout_rate",
+                    "cfg_weight",
+                    "ar_loss_weight",
+                    "fm_loss_weight",
                 ]
             },
         )
@@ -73,6 +77,20 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 }
             )
             self.vlm_with_expert.vlm.resize_token_embeddings(len(self.tokenizer))
+
+            # Initialize advantage token embeddings to match the norm of
+            # existing trained embeddings.  resize_token_embeddings produces
+            # near-zero rows (std ≈ 0.02) that are effectively invisible to
+            # attention – the model would need an impractical number of steps
+            # to learn them from scratch.
+            with torch.no_grad():
+                embed = self.vlm_with_expert.vlm.get_input_embeddings()
+                mean_norm = embed.weight[:-2].norm(dim=1).mean()
+                for row in (-2, -1):
+                    embed.weight[row] = (
+                        F.normalize(embed.weight[row], dim=0) * mean_norm
+                    )
+
             self.adv_pos_id = self.tokenizer.convert_tokens_to_ids(
                 "<advantage_positive>"
             )
@@ -127,17 +145,22 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 vlm_hidden = inputs_embeds[0]
                 expert_hidden = inputs_embeds[1]
 
-                # Run VLM update normally
-                vlm_out, _ = original_forward_attn(
-                    model_layers,
-                    [vlm_hidden, None],
-                    layer_idx,
-                    position_ids,
-                    attention_mask,
-                    batch_size,
-                    head_dim,
-                    **kwargs,
-                )
+                # Run VLM update with no_grad — the FM loss must not update
+                # VLM layer weights.  The VLM output serves only as frozen
+                # context (KV) for the expert's cross-attention.
+                with torch.no_grad():
+                    vlm_out, _ = original_forward_attn(
+                        model_layers,
+                        [vlm_hidden, None],
+                        layer_idx,
+                        position_ids,
+                        attention_mask,
+                        batch_size,
+                        head_dim,
+                        **kwargs,
+                    )
+                # Detach outputs to sever any residual graph edges
+                vlm_out = [v.detach() if v is not None else None for v in vlm_out]
 
                 # Run Expert update with detached VLM hidden states (Knowledge Insulation)
                 expert_out, _ = original_forward_attn(
@@ -195,6 +218,12 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         )
 
         # 2. Add Advantage conditioning to lang_tokens if active
+        if self.config.use_advantage_conditioning and advantage is not None:
+            # Dropout: randomly drop the advantage indicator during training
+            # so the model also learns to act unconditionally (required for CFG).
+            if self.training and torch.rand(1).item() < self.config.adv_dropout_rate:
+                advantage = None
+
         if self.config.use_advantage_conditioning and advantage is not None:
             device = lang_tokens.device
             adv_tokens = torch.tensor(
@@ -261,10 +290,27 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         )
 
         # 5. Action Expert (Flow Matching loss)
+        # Complete Knowledge Insulation: freeze ALL VLM parameters during the
+        # FM forward pass.  This prevents FM gradients from leaking into the
+        # VLM backbone through ANY layer — including cross-attention layers
+        # and residual/MLP processing — not just the self-attention layers
+        # covered by the KI patch on forward_attn_layer.
+        prefix_embs_fm = prefix_embs.detach()
+        prefix_pad_masks_fm = prefix_pad_masks.detach()
+
+        # Temporarily freeze VLM parameters so PyTorch does not track
+        # gradient contributions from VLM weights during FM forward.
+        # The AR loss backward (computed earlier in the graph) is unaffected
+        # because those operations were recorded when params had grad=True.
+        vlm_param_grad_states = {}
+        for name, param in self.vlm_with_expert.vlm.named_parameters():
+            vlm_param_grad_states[name] = param.requires_grad
+            param.requires_grad_(False)
+
         expert_dtype = self.vlm_with_expert.vlm.dtype
 
-        bsize = prefix_embs.shape[0]
-        device = prefix_embs.device
+        bsize = prefix_embs_fm.shape[0]
+        device = prefix_embs_fm.device
         
         actions = batch[ACTION]
         if actions.ndim == 2:
@@ -284,21 +330,28 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             noised_actions, tau.squeeze(1)
         )
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        pad_masks = torch.cat([prefix_pad_masks_fm, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = modeling_smolvla.make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        # Run unified forward pass with Knowledge Insulation patch active
+        # Run unified forward pass with Knowledge Insulation:
+        # - KI patch on forward_attn_layer handles self-attention layers
+        #   (torch.no_grad for efficiency)
+        # - VLM param freeze handles cross-attention layers and residual/MLP
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
+            inputs_embeds=[prefix_embs_fm, suffix_embs],
             use_cache=False,
             fill_kv_cache=False,
         )
+
+        # Restore VLM parameter grad states (needed for AR loss backward)
+        for name, param in self.vlm_with_expert.vlm.named_parameters():
+            param.requires_grad_(vlm_param_grad_states[name])
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -310,12 +363,61 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             predicted_flow.to(torch.float32), target_flow.to(torch.float32)
         )
 
-        total_loss = ar_loss + flow_loss
+        total_loss = self.config.ar_loss_weight * ar_loss + self.config.fm_loss_weight * flow_loss
         return total_loss, ar_loss, flow_loss
 
     def generate_action(self, batch, chunk_size=None):
-        """Generate action tokens including observation state."""
+        """Generate action tokens including observation state with positive advantage conditioning."""
+        if self.config.use_advantage_conditioning:
+            batch = dict(batch)
+            lang_tokens = batch["observation.language.tokens"]
+            lang_masks = batch["observation.language.attention_mask"]
+            device = lang_tokens.device
+            adv_tokens = torch.full(
+                (lang_tokens.shape[0], 1),
+                self.adv_pos_id,
+                dtype=torch.long,
+                device=device,
+            )
+            batch["observation.language.tokens"] = torch.cat([lang_tokens, adv_tokens], dim=1)
+            batch["observation.language.attention_mask"] = torch.cat(
+                [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
+            )
         return self.fast_wrapper.generate_action(batch, chunk_size=chunk_size)
+
+    def sample_actions(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        noise=None,
+        **kwargs,
+    ):
+        """Override to append positive advantage conditioning during evaluation/inference."""
+        if self.config.use_advantage_conditioning:
+            device = lang_tokens.device
+            adv_tokens = torch.full(
+                (lang_tokens.shape[0], 1),
+                self.adv_pos_id,
+                dtype=torch.long,
+                device=device,
+            )
+            lang_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
+            lang_masks = torch.cat(
+                [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
+            )
+
+        return super().sample_actions(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            noise=noise,
+            **kwargs,
+        )
 
     def get_pre_processor(self, dataset):
         return self.fast_wrapper.get_pre_processor(dataset)

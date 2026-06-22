@@ -621,8 +621,17 @@ def main():
 
     step = 0
     if checkpoint_to_try:
+        print(f"Checkpoint to try: {checkpoint_to_try}")
+        if fallback_checkpoint:
+            print(f"Fallback checkpoint: {fallback_checkpoint}")
         args.resume_from, step = load_checkpoint(
             accelerator, checkpoint_to_try, fallback_checkpoint
+        )
+    else:
+        print(
+            f"WARNING: No checkpoint found to resume from. "
+            f"resolve_checkpoints('{args.resume_from}', '{output_dir}') "
+            f"returned None. Training will start from step 0."
         )
 
     max_duration_seconds = parse_duration_to_seconds(args.duration)
