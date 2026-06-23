@@ -172,6 +172,8 @@ def parse_args():
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--num_vlm_layers", type=int, default=-1)
     parser.add_argument("--critic_num_vlm_layers", type=int, default=8)
+    parser.add_argument("--ar_loss_weight", type=float, default=1.0, help="Weight for autoregressive loss")
+    parser.add_argument("--fm_loss_weight", type=float, default=1.0, help="Weight for flow matching loss")
     parser.add_argument("--save_dir", type=str, default="outputs/recap_phase1")
     parser.add_argument(
         "--model_save_name",
@@ -312,7 +314,7 @@ def main():
     
     ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
     # Instantiate dummy config to resolve delta_timestamps
-    dummy_config = SmolVLARECAPConfig(chunk_size=args.action_chunk_size)
+    dummy_config = SmolVLARECAPConfig(chunk_size=args.action_chunk_size, n_action_steps=1)
     delta_timestamps = resolve_delta_timestamps(dummy_config, ds_meta)
 
     with accelerator.local_main_process_first():
@@ -469,6 +471,8 @@ def main():
         action_stats=dataset.meta.stats.get("action"),
         chunk_size=args.action_chunk_size,
         n_action_steps=1,
+        ar_loss_weight=args.ar_loss_weight,
+        fm_loss_weight=args.fm_loss_weight,
     )
     with accelerator.local_main_process_first():
         model = SmolVLARECAP(recap_config).to(device)
