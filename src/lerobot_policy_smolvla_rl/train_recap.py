@@ -174,6 +174,12 @@ def parse_args():
     parser.add_argument("--critic_num_vlm_layers", type=int, default=8)
     parser.add_argument("--ar_loss_weight", type=float, default=1.0, help="Weight for autoregressive loss")
     parser.add_argument("--fm_loss_weight", type=float, default=1.0, help="Weight for flow matching loss")
+    parser.add_argument(
+        "--loss_n_action_steps",
+        type=int,
+        default=0,
+        help="Number of action steps to include in flow matching loss (0 = full chunk_size)",
+    )
     parser.add_argument("--save_dir", type=str, default="outputs/recap_phase1")
     parser.add_argument(
         "--model_save_name",
@@ -473,6 +479,7 @@ def main():
         n_action_steps=1,
         ar_loss_weight=args.ar_loss_weight,
         fm_loss_weight=args.fm_loss_weight,
+        loss_n_action_steps=args.loss_n_action_steps,
     )
     with accelerator.local_main_process_first():
         model = SmolVLARECAP(recap_config).to(device)

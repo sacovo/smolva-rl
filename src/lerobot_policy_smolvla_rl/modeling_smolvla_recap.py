@@ -56,6 +56,7 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                     "cfg_weight",
                     "ar_loss_weight",
                     "fm_loss_weight",
+                    "loss_n_action_steps",
                 ]
             },
         )
@@ -361,9 +362,13 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             suffix_out.to(next(self.action_out_proj.parameters()).dtype)
         )
 
-        flow_loss = F.mse_loss(
-            predicted_flow.to(torch.float32), target_flow.to(torch.float32)
-        )
+        pred = predicted_flow.to(torch.float32)
+        target = target_flow.to(torch.float32)
+        if self.config.loss_n_action_steps > 0:
+            n = self.config.loss_n_action_steps
+            pred = pred[:, :n]
+            target = target[:, :n]
+        flow_loss = F.mse_loss(pred, target)
 
         total_loss = self.config.ar_loss_weight * ar_loss + self.config.fm_loss_weight * flow_loss
         return total_loss, ar_loss, flow_loss

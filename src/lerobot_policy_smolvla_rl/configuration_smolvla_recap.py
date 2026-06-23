@@ -19,3 +19,9 @@ class SmolVLARECAPConfig(SmolVLAConfig):
     # Loss weights for the combined objective.
     ar_loss_weight: float = 1.0
     fm_loss_weight: float = 1.0
+    # Number of action steps to include in the flow matching loss.
+    # 0 = use full chunk_size (default behavior).
+    # When set to a positive value, only the first N steps of the predicted
+    # and target flow are used for computing MSE, focusing gradients on the
+    # action steps that are actually executed at inference.
+    loss_n_action_steps: int = 0
