@@ -864,6 +864,24 @@ def main():
             print(f"Running: {' '.join(cmd)}")
             subprocess.run(cmd, check=True)
             print(f"Policy successfully migrated to: {migrated_dir}")
+
+            # Overwrite the empty migrated processors with ones containing the actual dataset stats
+            print("Populating migrated processors with dataset statistics...")
+            stats_tensors = {}
+            if dataset.meta.stats is not None:
+                for feature_name, stat_dict in dataset.meta.stats.items():
+                    stats_tensors[feature_name] = {}
+                    for stat_name, val in stat_dict.items():
+                        stats_tensors[feature_name][stat_name] = torch.tensor(val)
+            
+            from lerobot.policies.factory import make_pre_post_processors
+            preprocessor, postprocessor = make_pre_post_processors(
+                policy_cfg=config,
+                dataset_stats=stats_tensors,
+            )
+            preprocessor.save_pretrained(migrated_dir)
+            postprocessor.save_pretrained(migrated_dir)
+            print(f"Successfully populated migrated processors with statistics in: {migrated_dir}")
             
         except Exception as export_err:
             print(f"Warning: Failed to automatically export and migrate policy: {export_err}")

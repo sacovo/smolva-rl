@@ -400,31 +400,99 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         lang_masks,
         state,
         noise=None,
+        cfg_weight=None,
         **kwargs,
     ):
-        """Override to append positive advantage conditioning during evaluation/inference."""
-        if self.config.use_advantage_conditioning:
-            device = lang_tokens.device
-            adv_tokens = torch.full(
-                (lang_tokens.shape[0], 1),
-                self.adv_pos_id,
-                dtype=torch.long,
-                device=device,
+        """Override to append advantage conditioning and apply Classifier-Free Guidance during inference."""
+        if cfg_weight is None:
+            cfg_weight = getattr(self.config, "cfg_weight", 1.0)
+            
+        use_adv = self.config.use_advantage_conditioning
+
+        # Temporary state for denoise_step override
+        self._cfg_weight = cfg_weight
+        self._in_cfg_mode = use_adv and cfg_weight != 1.0
+        
+        if not use_adv:
+            return super().sample_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
             )
+
+        device = lang_tokens.device
+        bsize = lang_tokens.shape[0]
+        
+        adv_tokens = torch.full(
+            (bsize, 1),
+            self.adv_pos_id,
+            dtype=torch.long,
+            device=device,
+        )
+
+        if cfg_weight == 1.0:
+            # Standard conditional generation (No CFG)
             lang_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
             lang_masks = torch.cat(
                 [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
             )
+            return super().sample_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            )
+        
+        elif cfg_weight == 0.0:
+            # Standard unconditional generation (No CFG)
+            self._in_cfg_mode = False  # Ensure no CFG blending
+            return super().sample_actions(
+                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            )
 
-        return super().sample_actions(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            state,
-            noise=noise,
-            **kwargs,
+        # CFG Mode (cfg_weight != 1.0 and != 0.0)
+        # We need to double the batch size. First half is unconditional, second half is conditional.
+        # Pad unconditional with 0s and mask=False to match sequence length of conditional
+        uncond_tokens = torch.cat([lang_tokens, torch.zeros_like(adv_tokens)], dim=1)
+        uncond_masks = torch.cat([lang_masks, torch.zeros_like(adv_tokens, dtype=torch.bool)], dim=1)
+        
+        cond_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
+        cond_masks = torch.cat([lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1)
+        
+        # Double all inputs: [uncond, cond]
+        lang_tokens = torch.cat([uncond_tokens, cond_tokens], dim=0)
+        lang_masks = torch.cat([uncond_masks, cond_masks], dim=0)
+        
+        state = torch.cat([state, state], dim=0)
+        images = [torch.cat([img, img], dim=0) for img in images]
+        img_masks = [torch.cat([mask, mask], dim=0) for mask in img_masks]
+        
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            single_noise = self.sample_noise(actions_shape, device)
+            noise = torch.cat([single_noise, single_noise], dim=0)
+        else:
+            noise = torch.cat([noise, noise], dim=0)
+            
+        actions = super().sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
+        
+        # actions has shape (2 * bsize, chunk_size, action_dim)
+        # Both halves are identical because denoise_step returns identical blended v_t for both
+        return actions[:bsize]
+
+    def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
+        v_t = super().denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
+        
+        if getattr(self, "_in_cfg_mode", False):
+            bsize = v_t.shape[0] // 2
+            uncond_v_t = v_t[:bsize]
+            cond_v_t = v_t[bsize:]
+            
+            # CFG formula: uncond + w * (cond - uncond)
+            w = getattr(self, "_cfg_weight", 1.0)
+            cfg_v_t = uncond_v_t + w * (cond_v_t - uncond_v_t)
+            
+            # Duplicate so x_t remains identical for both halves in the ODE solver
+            v_t = torch.cat([cfg_v_t, cfg_v_t], dim=0)
+            
+        return v_t
 
     def get_pre_processor(self, dataset):
         return self.fast_wrapper.get_pre_processor(dataset)

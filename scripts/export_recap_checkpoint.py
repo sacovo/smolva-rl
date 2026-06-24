@@ -131,9 +131,16 @@ def main():
     print("Instantiating SmolVLARECAPPolicy...")
     policy = SmolVLARECAPPolicy(config)
 
-    # 4. Load weights from .pt state dict
+    # 4. Load weights from state dict (.safetensors or .pt)
     print(f"Loading state dict from: {args.checkpoint_path}")
-    state_dict = torch.load(args.checkpoint_path, map_location=args.device)
+    if args.checkpoint_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(args.checkpoint_path, device=args.device)
+    elif os.path.isdir(args.checkpoint_path) and os.path.exists(os.path.join(args.checkpoint_path, "model.safetensors")):
+        from safetensors.torch import load_file
+        state_dict = load_file(os.path.join(args.checkpoint_path, "model.safetensors"), device=args.device)
+    else:
+        state_dict = torch.load(args.checkpoint_path, map_location=args.device)
 
     # Clean state dict to match local model structure (strip DDP/wrapper prefixes)
     clean_state_dict = {}
