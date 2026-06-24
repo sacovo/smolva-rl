@@ -25,3 +25,9 @@ class SmolVLARECAPConfig(SmolVLAConfig):
     # and target flow are used for computing MSE, focusing gradients on the
     # action steps that are actually executed at inference.
     loss_n_action_steps: int = 0
+
+    # SnapFlow distillation settings
+    snapflow_enabled: bool = False          # Whether model was SnapFlow-distilled
+    snapflow_alpha: float = 0.5            # FM/consistency mixing ratio
+    snapflow_lambda: float = 0.1           # Consistency loss weight
+    snapflow_clamp: float = 20.0           # Velocity prediction clamp range
