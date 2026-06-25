@@ -27,6 +27,7 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
     - Action Expert trained with Flow Matching loss on continuous actions.
     - Knowledge Insulation (KI): No gradients from Action Expert to VLM.
     - Advantage Conditioning: Optional "<advantage_positive>/<advantage_negative>" tokens.
+    - SnapFlow for faster inference
     """
 
     def __init__(self, config: SmolVLARECAPConfig):
@@ -138,12 +139,12 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
     def embed_suffix(self, noisy_actions, timestep, target_time=None):
         # Cast noisy_actions to projection weights dtype to prevent mat1/mat2 dtype mismatch (Float vs BFloat16)
         noisy_actions = noisy_actions.to(dtype=self.action_in_proj.weight.dtype)
-        
+
         # Standard: project actions + fuse with timestep sinusoidal embedding
         action_emb = self.action_in_proj(noisy_actions)
         device = action_emb.device
         dtype = action_emb.dtype
-        
+
         time_emb = modeling_smolvla.create_sinusoidal_pos_embedding(
             timestep,
             self.vlm_with_expert.expert_hidden_size,
@@ -156,7 +157,7 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
-        
+
         # SnapFlow: add target-time embedding
         if target_time is not None:
             s_emb = modeling_smolvla.create_sinusoidal_pos_embedding(
@@ -169,9 +170,11 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             s_emb = s_emb[:, None, :].expand_as(action_emb)
             target_emb = self.target_time_mlp(s_emb)
             action_time_emb = action_time_emb + target_emb
-            
+
         bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        action_time_mask = torch.ones(
+            bsize, action_time_dim, dtype=torch.bool, device=device
+        )
         att_masks = [1] * self.config.chunk_size
         att_masks = torch.tensor(att_masks, dtype=action_time_emb.dtype, device=device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
@@ -259,9 +262,20 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         self.vlm_with_expert.forward_attn_layer = ki_forward_attn_layer
 
     # pylint: disable=arguments-differ
-    def forward(self, batch, camera_keys=None, advantage=None, mode="standard", alpha=0.5, lambda_c=0.1, clamp=20.0):
+    def forward(
+        self,
+        batch,
+        camera_keys=None,
+        advantage=None,
+        mode="standard",
+        alpha=0.5,
+        lambda_c=0.1,
+        clamp=20.0,
+    ):
         if mode == "snapflow":
-            return self.compute_loss_snapflow(batch, alpha=alpha, lambda_c=lambda_c, clamp=clamp)
+            return self.compute_loss_snapflow(
+                batch, alpha=alpha, lambda_c=lambda_c, clamp=clamp
+            )
         return self.compute_loss(batch, camera_keys=camera_keys, advantage=advantage)
 
     def compute_loss_snapflow(self, batch, alpha=0.5, lambda_c=0.1, clamp=20.0):
@@ -293,7 +307,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         )
 
         # 4. Cache VLM prefix KV cache (once per batch)
-        prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+            prefix_pad_masks, prefix_att_masks
+        )
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
@@ -313,11 +329,17 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             suffix_len = suffix_pad_masks.shape[1]
             batch_size = prefix_pad_masks.shape[0]
             prefix_len = prefix_pad_masks.shape[1]
-            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size, suffix_len, prefix_len
+            )
 
-            suffix_att_2d_masks = modeling_smolvla.make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            suffix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+                suffix_pad_masks, suffix_att_masks
+            )
 
-            full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+            full_att_2d_masks = torch.cat(
+                [prefix_pad_2d_masks, suffix_att_2d_masks], dim=2
+            )
             prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
@@ -331,7 +353,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             )
             suffix_out = outputs_embeds[1]
             suffix_out = suffix_out[:, -self.config.chunk_size :]
-            v_t = self.action_out_proj(suffix_out.to(next(self.action_out_proj.parameters()).dtype))
+            v_t = self.action_out_proj(
+                suffix_out.to(next(self.action_out_proj.parameters()).dtype)
+            )
             return v_t.to(torch.float32)
 
         # 5. Extract actions
@@ -347,12 +371,14 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # === Flow Matching Component ===
         tau = torch.rand((bsize, 1), device=device, dtype=expert_dtype)
         omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
-        
+
         tau_expanded = tau[:, :, None]
         noised_actions = tau_expanded * omega + (1 - tau_expanded) * actions_fm
         target_flow = omega - actions_fm
 
-        predicted_flow = expert_forward_fn(noised_actions, tau.squeeze(1), tau.squeeze(1))
+        predicted_flow = expert_forward_fn(
+            noised_actions, tau.squeeze(1), tau.squeeze(1)
+        )
 
         pred_fm = predicted_flow
         target_fm = target_flow
@@ -499,14 +525,14 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
 
         bsize = prefix_embs_fm.shape[0]
         device = prefix_embs_fm.device
-        
+
         actions = batch[ACTION]
         if actions.ndim == 2:
             actions = actions.unsqueeze(1)
-            
+
         tau = torch.rand((bsize, 1), device=device, dtype=expert_dtype)
         omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
-        
+
         tau_expanded = tau[:, :, None]
         actions_fm = actions.to(device=device, dtype=expert_dtype)
         # Flow matching interpolation — MUST match the base VLAFlowMatching
@@ -557,7 +583,10 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             target = target[:, :n]
         flow_loss = F.mse_loss(pred, target)
 
-        total_loss = self.config.ar_loss_weight * ar_loss + self.config.fm_loss_weight * flow_loss
+        total_loss = (
+            self.config.ar_loss_weight * ar_loss
+            + self.config.fm_loss_weight * flow_loss
+        )
         return total_loss, ar_loss, flow_loss
 
     def generate_action(self, batch, chunk_size=None):
@@ -573,7 +602,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 dtype=torch.long,
                 device=device,
             )
-            batch["observation.language.tokens"] = torch.cat([lang_tokens, adv_tokens], dim=1)
+            batch["observation.language.tokens"] = torch.cat(
+                [lang_tokens, adv_tokens], dim=1
+            )
             batch["observation.language.attention_mask"] = torch.cat(
                 [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
             )
@@ -593,18 +624,18 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         """Override to append advantage conditioning and apply Classifier-Free Guidance during inference."""
         if cfg_weight is None:
             cfg_weight = getattr(self.config, "cfg_weight", 1.0)
-            
+
         use_adv = self.config.use_advantage_conditioning
 
         # Temporary state for denoise_step override
         self._cfg_weight = cfg_weight
         self._in_cfg_mode = use_adv and cfg_weight != 1.0
-        
+
         if self.config.snapflow_enabled:
             # SnapFlow 1-step inference
             device = lang_tokens.device
             bsize = lang_tokens.shape[0]
-            
+
             if not use_adv:
                 pass
             else:
@@ -619,28 +650,41 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                     # Standard conditional generation (No CFG)
                     lang_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
                     lang_masks = torch.cat(
-                        [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
+                        [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)],
+                        dim=1,
                     )
                 elif cfg_weight == 0.0:
                     self._in_cfg_mode = False  # Ensure no CFG blending
                 else:
                     # CFG Mode (cfg_weight != 1.0 and != 0.0)
-                    uncond_tokens = torch.cat([lang_tokens, torch.zeros_like(adv_tokens)], dim=1)
-                    uncond_masks = torch.cat([lang_masks, torch.zeros_like(adv_tokens, dtype=torch.bool)], dim=1)
-                    
+                    uncond_tokens = torch.cat(
+                        [lang_tokens, torch.zeros_like(adv_tokens)], dim=1
+                    )
+                    uncond_masks = torch.cat(
+                        [lang_masks, torch.zeros_like(adv_tokens, dtype=torch.bool)],
+                        dim=1,
+                    )
+
                     cond_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
-                    cond_masks = torch.cat([lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1)
-                    
+                    cond_masks = torch.cat(
+                        [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)],
+                        dim=1,
+                    )
+
                     # Double all inputs: [uncond, cond]
                     lang_tokens = torch.cat([uncond_tokens, cond_tokens], dim=0)
                     lang_masks = torch.cat([uncond_masks, cond_masks], dim=0)
-                    
+
                     state = torch.cat([state, state], dim=0)
                     images = [torch.cat([img, img], dim=0) for img in images]
                     img_masks = [torch.cat([mask, mask], dim=0) for mask in img_masks]
-                    
+
                     if noise is None:
-                        actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+                        actions_shape = (
+                            bsize,
+                            self.config.chunk_size,
+                            self.config.max_action_dim,
+                        )
                         single_noise = self.sample_noise(actions_shape, device)
                         noise = torch.cat([single_noise, single_noise], dim=0)
                     else:
@@ -649,14 +693,20 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             final_bsize = state.shape[0]
             final_device = state.device
             if noise is None:
-                actions_shape = (final_bsize, self.config.chunk_size, self.config.max_action_dim)
+                actions_shape = (
+                    final_bsize,
+                    self.config.chunk_size,
+                    self.config.max_action_dim,
+                )
                 noise = self.sample_noise(actions_shape, final_device)
-            
+
             # Cache VLM prefix
             prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
                 images, img_masks, lang_tokens, lang_masks, state=state
             )
-            prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+                prefix_pad_masks, prefix_att_masks
+            )
             prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
             _, past_key_values = self.vlm_with_expert.forward(
                 attention_mask=prefix_att_2d_masks,
@@ -666,18 +716,53 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 use_cache=self.config.use_cache,
                 fill_kv_cache=True,
             )
-            
+
             # Single denoise step: t=1 → s=0 (full jump)
             t = torch.ones(final_bsize, device=final_device)
             s = torch.zeros(final_bsize, device=final_device)
-            v_t = self.denoise_step_snapflow(noise, prefix_pad_masks, past_key_values, t, s)
+
+            def denoise_step_partial_call(input_x_t, current_timestep=t):
+                return self.denoise_step_snapflow(
+                    input_x_t, prefix_pad_masks, past_key_values, current_timestep, s
+                )
+
+            if (
+                getattr(self, "_rtc_enabled", lambda: False)()
+                and getattr(self, "rtc_processor", None) is not None
+            ):
+                inference_delay = kwargs.get("inference_delay")
+                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                execution_horizon = kwargs.get("execution_horizon")
+
+                # If CFG is enabled, we need to double prev_chunk_left_over to match batch size
+                if (
+                    prev_chunk_left_over is not None
+                    and use_adv
+                    and cfg_weight != 1.0
+                    and cfg_weight != 0.0
+                ):
+                    prev_chunk_left_over = torch.cat(
+                        [prev_chunk_left_over, prev_chunk_left_over], dim=0
+                    )
+
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=noise,
+                    prev_chunk_left_over=prev_chunk_left_over,
+                    inference_delay=inference_delay,
+                    time=1.0,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=execution_horizon,
+                )
+            else:
+                v_t = denoise_step_partial_call(noise)
+
             x_0 = noise - v_t  # x_t + dt * v_t where dt = -1.0
-            
+
             if use_adv and cfg_weight != 1.0 and cfg_weight != 0.0:
                 # Return only the first half (since both halves will be identical after blending)
                 return x_0[:bsize]
             return x_0
-        
+
         if not use_adv:
             return super().sample_actions(
                 images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
@@ -685,7 +770,7 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
 
         device = lang_tokens.device
         bsize = lang_tokens.shape[0]
-        
+
         adv_tokens = torch.full(
             (bsize, 1),
             self.adv_pos_id,
@@ -702,7 +787,7 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             return super().sample_actions(
                 images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
             )
-        
+
         elif cfg_weight == 0.0:
             # Standard unconditional generation (No CFG)
             self._in_cfg_mode = False  # Ensure no CFG blending
@@ -714,43 +799,62 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # We need to double the batch size. First half is unconditional, second half is conditional.
         # Pad unconditional with 0s and mask=False to match sequence length of conditional
         uncond_tokens = torch.cat([lang_tokens, torch.zeros_like(adv_tokens)], dim=1)
-        uncond_masks = torch.cat([lang_masks, torch.zeros_like(adv_tokens, dtype=torch.bool)], dim=1)
-        
+        uncond_masks = torch.cat(
+            [lang_masks, torch.zeros_like(adv_tokens, dtype=torch.bool)], dim=1
+        )
+
         cond_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
-        cond_masks = torch.cat([lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1)
-        
+        cond_masks = torch.cat(
+            [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
+        )
+
         # Double all inputs: [uncond, cond]
         lang_tokens = torch.cat([uncond_tokens, cond_tokens], dim=0)
         lang_masks = torch.cat([uncond_masks, cond_masks], dim=0)
-        
+
         state = torch.cat([state, state], dim=0)
         images = [torch.cat([img, img], dim=0) for img in images]
         img_masks = [torch.cat([mask, mask], dim=0) for mask in img_masks]
-        
+
         if noise is None:
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             single_noise = self.sample_noise(actions_shape, device)
             noise = torch.cat([single_noise, single_noise], dim=0)
         else:
             noise = torch.cat([noise, noise], dim=0)
-            
+
+        # If RTC is enabled and prev_chunk_left_over is passed, we must double it too
+        prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+        if prev_chunk_left_over is not None:
+            kwargs["prev_chunk_left_over"] = torch.cat(
+                [prev_chunk_left_over, prev_chunk_left_over], dim=0
+            )
+
         actions = super().sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
-        
+
         # actions has shape (2 * bsize, chunk_size, action_dim)
         # Both halves are identical because denoise_step returns identical blended v_t for both
         return actions[:bsize]
 
-    def denoise_step_snapflow(self, x_t, prefix_pad_masks, past_key_values, timestep, target_time):
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, target_time=target_time)
+    def denoise_step_snapflow(
+        self, x_t, prefix_pad_masks, past_key_values, timestep, target_time
+    ):
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            x_t, timestep, target_time=target_time
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+            batch_size, suffix_len, prefix_len
+        )
 
-        suffix_att_2d_masks = modeling_smolvla.make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        suffix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+            suffix_pad_masks, suffix_att_masks
+        )
 
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
@@ -767,40 +871,42 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out.to(next(self.action_out_proj.parameters()).dtype))
-        
+        v_t = self.action_out_proj(
+            suffix_out.to(next(self.action_out_proj.parameters()).dtype)
+        )
+
         # Clamp velocity prediction magnitude
         v_t = v_t.clamp(-self.config.snapflow_clamp, self.config.snapflow_clamp)
-        
+
         if getattr(self, "_in_cfg_mode", False):
             bsize = v_t.shape[0] // 2
             uncond_v_t = v_t[:bsize]
             cond_v_t = v_t[bsize:]
-            
+
             # CFG formula: uncond + w * (cond - uncond)
             w = getattr(self, "_cfg_weight", 1.0)
             cfg_v_t = uncond_v_t + w * (cond_v_t - uncond_v_t)
-            
+
             # Duplicate so x_t remains identical for both halves
             v_t = torch.cat([cfg_v_t, cfg_v_t], dim=0)
-            
+
         return v_t
 
     def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
         v_t = super().denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
-        
+
         if getattr(self, "_in_cfg_mode", False):
             bsize = v_t.shape[0] // 2
             uncond_v_t = v_t[:bsize]
             cond_v_t = v_t[bsize:]
-            
+
             # CFG formula: uncond + w * (cond - uncond)
             w = getattr(self, "_cfg_weight", 1.0)
             cfg_v_t = uncond_v_t + w * (cond_v_t - uncond_v_t)
-            
+
             # Duplicate so x_t remains identical for both halves in the ODE solver
             v_t = torch.cat([cfg_v_t, cfg_v_t], dim=0)
-            
+
         return v_t
 
     def get_pre_processor(self, dataset):
@@ -876,7 +982,7 @@ class SmolVLARECAPPolicy(PreTrainedPolicy):
 
         images, img_masks = modeling_smolvla.SmolVLAPolicy.prepare_images(self, batch)
         state = modeling_smolvla.SmolVLAPolicy.prepare_state(self, batch)
-        
+
         # Ensure correct dtype for inputs
         dtype = self.model.vlm_with_expert.vlm.dtype
         images = [img.to(dtype) for img in images]
