@@ -246,7 +246,8 @@ def main():
 
     # Load episode-level success flags if available
     if "success" in dataset.meta.episodes.column_names:
-        success_list = dataset.meta.episodes["success"].to_pylist()
+        success_col = dataset.meta.episodes["success"]
+        success_list = success_col.to_pylist() if hasattr(success_col, "to_pylist") else list(success_col)
         success_flags = torch.tensor(success_list, dtype=torch.bool, device=accelerator.device)
         print(f"Loaded episode success flags. Successful episodes: {success_flags.sum().item()} / {len(success_flags)}")
     else:

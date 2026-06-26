@@ -111,7 +111,8 @@ def calculate_ds_returns(dataset: LeRobotDataset, batch_size=1024):
     max_lengths = get_max_task_lengths(dataset)
 
     if "success" in dataset.meta.episodes.column_names:
-        success_list = dataset.meta.episodes["success"].to_pylist()
+        success_col = dataset.meta.episodes["success"]
+        success_list = success_col.to_pylist() if hasattr(success_col, "to_pylist") else list(success_col)
         success_flags = torch.tensor(success_list, dtype=torch.bool)
     else:
         success_flags = None
