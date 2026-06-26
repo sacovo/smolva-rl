@@ -4,7 +4,11 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import os
 from tqdm import tqdm
-from lerobot_policy_smolvla_rl.ds_utils import get_episode_lengths
+from lerobot_policy_smolvla_rl.ds_utils import (
+    get_episode_lengths,
+    get_max_task_lengths,
+    calculate_returns as calculate_returns_fn,
+)
 
 
 class FutureFrameWrapper(Dataset):
@@ -54,11 +58,21 @@ def extract_future_batch(batch):
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments
 def compute_temporal_advantage(
-    critic, pre_critic, batch, future_batch, support, has_future
+    critic, pre_critic, batch, future_batch, support, has_future,
+    actual_returns=None, future_returns=None,
 ):
     """
-    Computes A(s_t) = V(s_{t+chunk_size}) - V(s_t) on the fly.
-    If not has_future, V(s_{t+chunk_size}) = 0.0.
+    Computes the N-step TD advantage per the pi0.6 paper:
+    A(s_t) = sum(r_{t:t+N-1}) + V(s_{t+N}) - V(s_t)
+
+    Rewritten using actual returns:
+    A(s_t) = (R_t - V(s_t)) - (R_{t+N} - V(s_{t+N}))
+
+    When actual_returns / future_returns are None, falls back to the
+    pure temporal difference V(s_{t+N}) - V(s_t) (no reward sum).
+
+    If not has_future (end of episode), both R_{t+N} and V(s_{t+N})
+    are 0, so A(s_t) = R_t - V(s_t)  (Monte Carlo advantage).
     """
     # 1. Current V(s_t)
     critic_batch = pre_critic(batch)
@@ -73,7 +87,16 @@ def compute_temporal_advantage(
     # Where not has_future, v_s_future should be 0.0
     v_s_future = torch.where(has_future, v_s_future, torch.zeros_like(v_s_future))
 
-    advantage = v_s_future - v_s
+    if actual_returns is not None and future_returns is not None:
+        # N-step TD advantage: (R_t - V_t) - (R_{t+N} - V_{t+N})
+        future_returns = torch.where(has_future, future_returns, torch.zeros_like(future_returns))
+        mc_error_current = actual_returns - v_s
+        mc_error_future = future_returns - v_s_future
+        advantage = mc_error_current - mc_error_future
+    else:
+        # Fallback: pure temporal difference (no reward sum)
+        advantage = v_s_future - v_s
+
     return advantage, v_s, v_s_future
 
 
@@ -90,6 +113,8 @@ def get_task_thresholds(
 ):
     """
     Computes or loads task-specific advantage thresholds (epsilon_l).
+    Uses the pi0.6 N-step TD advantage:
+    A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})
     """
 
     if os.path.exists(save_path):
@@ -116,10 +141,7 @@ def get_task_thresholds(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting V(s)"):
             # Move relevant parts to device if not already
-            # pre_critic usually handles device transfer or we assume batch is on CPU and handled by model inside
-            # Wait, pre_critic returns a dictionary that might need device transfer.
             critic_batch = pre_critic(batch)
-            # Make sure critic_batch is on device
             for k, v in critic_batch.items():
                 if isinstance(v, torch.Tensor):
                     critic_batch[k] = v.to(device)
@@ -146,24 +168,48 @@ def get_task_thresholds(
     all_episodes = np.concatenate(all_episodes_list)
     all_frames = np.concatenate(all_frames_list)
 
-    ep_lengths = get_episode_lengths(dataset).numpy()
+    ep_lengths = get_episode_lengths(dataset)
+    max_lengths = get_max_task_lengths(dataset)
 
+    # Load success flags for return calculation
+    if "success" in dataset.meta.episodes.column_names:
+        success_col = dataset.meta.episodes["success"]
+        success_list = success_col.to_pylist() if hasattr(success_col, "to_pylist") else list(success_col)
+        success_flags = torch.tensor(success_list, dtype=torch.bool)
+    else:
+        success_flags = None
+
+    # Precompute actual normalized returns for all frames (vectorized)
+    all_returns = calculate_returns_fn(
+        ep_lengths,
+        max_lengths,
+        torch.tensor(all_tasks.astype(np.int64)),
+        torch.tensor(all_episodes.astype(np.int64)),
+        torch.tensor(all_frames.astype(np.int64)),
+        success_flags=success_flags,
+    ).numpy()
+
+    # Compute N-step TD advantages: A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})
     advantages = np.zeros(len(dataset), dtype=np.float32)
+    ep_lengths_np = ep_lengths.numpy()
     for i in range(len(dataset)):
-        ep_idx = all_episodes[i]
-        frame_idx = all_frames[i]
-        ep_len = ep_lengths[ep_idx]
+        ep_idx = int(all_episodes[i])
+        frame_idx = int(all_frames[i])
+        ep_len = ep_lengths_np[ep_idx]
 
         v_current = all_vs[i]
+        r_current = all_returns[i]
+        mc_error_current = r_current - v_current
 
         future_frame = frame_idx + chunk_size
         if future_frame >= ep_len:
-            v_future = 0.0
+            # Past episode end: MC advantage
+            advantages[i] = mc_error_current
         else:
-            # We assume indices within the same episode are contiguous.
-            v_future = all_vs[i + chunk_size]
-
-        advantages[i] = v_future - v_current
+            # N-step TD advantage
+            future_idx = i + chunk_size
+            mc_error_future = all_returns[future_idx] - all_vs[future_idx]
+            advantages[i] = mc_error_current - mc_error_future
 
     # 3. Calculate 30th percentile per task
     task_thresholds = {}

@@ -122,10 +122,17 @@ time_to_completion = torch.clamp(normalized_indices, 0, config.num_bins - 1).lon
 
 **Policy Conditioning (`train_recap.py` & `advantage_utils.py`)**
 
-The policy uses a Temporal Difference (TD) approach to calculate the advantage of an action chunk. It compares the state value before and after the action chunk is executed: $A(s_t) = V(s_{t+\text{chunk\_size}}) - V(s_t)$. The expected return $V(s)$ is computed as the expected value of the critic's predicted C51 distribution: $V(s) = \sum (p_i \cdot z_i)$, where $z_i$ is the support value of bin $i$.
+The policy uses an N-step TD advantage following the π₀.₆ paper. The advantage of an action chunk is computed as:
+$$A(s_t, a_t) = \sum_{t'=t}^{t+N-1} r_{t'} + V(s_{t+N}) - V(s_t)$$
+
+This can be rewritten using actual (Monte Carlo) returns $R_t$:
+$$A(s_t, a_t) = (R_t - V(s_t)) - (R_{t+N} - V(s_{t+N}))$$
+
+When $t+N$ is past the episode end, the advantage degenerates to the Monte Carlo advantage $A(s_t) = R_t - V(s_t)$. The expected return $V(s)$ is computed as the expected value of the critic's predicted C51 distribution: $V(s) = \sum (p_i \cdot z_i)$, where $z_i$ is the support value of bin $i$.
 
 ```python
-def compute_temporal_advantage(critic, pre_critic, batch, future_batch, support, has_future):
+def compute_temporal_advantage(critic, pre_critic, batch, future_batch, support, has_future,
+                               actual_returns=None, future_returns=None):
     # 1. Current V(s_t)
     critic_batch = pre_critic(batch)
     _, probs = critic(critic_batch)
@@ -135,15 +142,17 @@ def compute_temporal_advantage(critic, pre_critic, batch, future_batch, support,
     future_critic_batch = pre_critic(future_batch)
     _, future_probs = critic(future_critic_batch)
     v_s_future = (future_probs * support).sum(dim=-1)
-
-    # Where not has_future, v_s_future should be 0.0 (task completion)
     v_s_future = torch.where(has_future, v_s_future, torch.zeros_like(v_s_future))
 
-    advantage = v_s_future - v_s
+    # N-step TD advantage: (R_t - V_t) - (R_{t+N} - V_{t+N})
+    future_returns = torch.where(has_future, future_returns, torch.zeros_like(future_returns))
+    mc_error_current = actual_returns - v_s
+    mc_error_future = future_returns - v_s_future
+    advantage = mc_error_current - mc_error_future
     return advantage, v_s, v_s_future
 ```
 
-This advantage is then compared against a task-specific threshold $\epsilon_l$ (calculated from the dataset distribution of values) to determine if the action was "good" (`<advantage_positive>`) or "bad" (`<advantage_negative>`).
+This advantage is then compared against a task-specific threshold $\epsilon_l$ (set to the 30th percentile of advantage values for task $l$) to determine if the action was "good" (`<advantage_positive>`) or "bad" (`<advantage_negative>`).
 
 ```python
 # Compare advantage against task-specific epsilon_l

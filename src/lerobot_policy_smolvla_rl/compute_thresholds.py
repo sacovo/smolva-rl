@@ -15,7 +15,7 @@ from lerobot_policy_smolvla_rl.dataloader_utils import (
     build_dataloader,
 )
 from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
-from lerobot_policy_smolvla_rl.ds_utils import get_episode_lengths, get_max_task_lengths
+from lerobot_policy_smolvla_rl.ds_utils import get_episode_lengths, get_max_task_lengths, calculate_returns
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +105,15 @@ def main():
     print(f"Loading dataset: {args.dataset_repo_id}")
     dataset = LeRobotDataset(args.dataset_repo_id)
     episode_lengths = get_episode_lengths(dataset).numpy()
+    max_lengths = get_max_task_lengths(dataset)
+
+    # Load success flags for return calculation
+    if "success" in dataset.meta.episodes.column_names:
+        success_col = dataset.meta.episodes["success"]
+        success_list = success_col.to_pylist() if hasattr(success_col, "to_pylist") else list(success_col)
+        success_flags = torch.tensor(success_list, dtype=torch.bool)
+    else:
+        success_flags = None
 
     # Build episode-start lookup: ep_from[ep_idx] = first absolute sample index of that episode.
     # This lets us resolve (ep_idx, future_frame_idx) -> absolute sample index without relying
@@ -205,25 +214,46 @@ def main():
         )
     print(f"  Evaluated {n_seen} samples ({n_skipped} skipped / corrupt).")
 
-    # ── Step 2/3: Compute temporal advantages ────────────────────────────────
-    # advantages[i] = V(s_{i + chunk_size}) - V(s_i)
+    # ── Step 2/3: Compute N-step TD advantages ───────────────────────────────
+    # Paper (pi0.6) formula: A_t = sum(r_{t:t+N-1}) + V(s_{t+N}) - V(s_t)
+    # Rewritten using actual returns: A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})
+    # When t+N >= T (near episode end): degenerates to MC advantage = R_t - V_t
     # For corrupt samples (not in vs_by_idx) or when the future frame is also
     # corrupt: leave as NaN.  train_recap.py calls np.nan_to_num(..., nan=0.0).
-    print("Step 2/3: Computing temporal advantages...")
+    print("Step 2/3: Computing N-step TD advantages...")
     advantages = np.full(len(dataset), np.nan, dtype=np.float32)
+
+    # Precompute actual (normalized) returns for all frames that have metadata
+    ep_lengths_tensor = torch.tensor(episode_lengths)
+    sorted_indices = sorted(meta_by_idx.keys())
+    all_ep_idxs = torch.tensor([meta_by_idx[i][0] for i in sorted_indices], dtype=torch.long)
+    all_frame_idxs = torch.tensor([meta_by_idx[i][1] for i in sorted_indices], dtype=torch.long)
+    all_task_idxs = torch.tensor([meta_by_idx[i][2] for i in sorted_indices], dtype=torch.long)
+    all_rets = calculate_returns(
+        ep_lengths_tensor, max_lengths,
+        all_task_idxs, all_ep_idxs, all_frame_idxs,
+        success_flags=success_flags,
+    )
+    returns_by_idx: dict[int, float] = {
+        idx: float(r) for idx, r in zip(sorted_indices, all_rets)
+    }
 
     for sample_idx, v_current in vs_by_idx.items():
         ep_idx, frame_idx, _ = meta_by_idx[sample_idx]
         ep_len = episode_lengths[ep_idx]
+        r_current = returns_by_idx[sample_idx]
+        mc_error_current = r_current - v_current  # R_t - V(s_t)
+
         future_frame = frame_idx + args.action_chunk_size
 
         if future_frame >= ep_len:
-            # Terminal frame: future value is 0
-            advantages[sample_idx] = 0.0 - v_current
+            # Past episode end: MC advantage (R_{t+N} and V_{t+N} are both 0)
+            advantages[sample_idx] = mc_error_current
         else:
             future_sample_idx = int(ep_from[ep_idx]) + future_frame
-            if future_sample_idx in vs_by_idx:
-                advantages[sample_idx] = vs_by_idx[future_sample_idx] - v_current
+            if future_sample_idx in vs_by_idx and future_sample_idx in returns_by_idx:
+                mc_error_future = returns_by_idx[future_sample_idx] - vs_by_idx[future_sample_idx]
+                advantages[sample_idx] = mc_error_current - mc_error_future
             # else: future frame was also corrupt — leave NaN
 
     n_nan = int(np.isnan(advantages).sum())
