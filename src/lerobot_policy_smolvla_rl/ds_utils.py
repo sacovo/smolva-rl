@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
+C_FAIL = 10000
+
+
 def get_max_task_lengths(dataset: LeRobotDataset):
     """For each distinct task determine the maximum length and return the dictionary mapping task to max length
 
@@ -42,6 +45,7 @@ def calculate_returns(
     episode_idxs,
     frame_idxs,
     post_goal_buffer=0,
+    success_flags=None,
 ):
     if not isinstance(episode_idxs, torch.Tensor):
         episode_idxs = torch.tensor(episode_idxs, dtype=torch.long)
@@ -52,7 +56,11 @@ def calculate_returns(
 
     T = episode_lengths[episode_idxs]  # Shape: [batch_size]
     # Remaining steps until goal. Goal is shifted by post_goal_buffer.
-    rem_steps = torch.clamp(T - post_goal_buffer - frame_idxs - 1, min=0)
+    rem_steps = torch.clamp(T - post_goal_buffer - frame_idxs - 1, min=0).float()
+
+    if success_flags is not None:
+        batch_success = success_flags[episode_idxs]
+        rem_steps = torch.where(batch_success, rem_steps, rem_steps + C_FAIL)
 
     max_lens = max_lengths[task_idxs]  # Max lengths for the tasks in the batch
     returns = -(rem_steps / max_lens)  # Normalize values between (-1, 0)
@@ -102,6 +110,12 @@ def calculate_ds_returns(dataset: LeRobotDataset, batch_size=1024):
     episode_lengths = get_episode_lengths(dataset)
     max_lengths = get_max_task_lengths(dataset)
 
+    if "success" in dataset.meta.episodes.column_names:
+        success_list = dataset.meta.episodes["success"].to_pylist()
+        success_flags = torch.tensor(success_list, dtype=torch.bool)
+    else:
+        success_flags = None
+
     returns = []
 
     for batch in batched(dataset, n=batch_size):  # type: ignore
@@ -111,7 +125,12 @@ def calculate_ds_returns(dataset: LeRobotDataset, batch_size=1024):
 
         returns.append(
             calculate_returns(
-                episode_lengths, max_lengths, task_idxs, episode_idxs, frame_idxs
+                episode_lengths,
+                max_lengths,
+                task_idxs,
+                episode_idxs,
+                frame_idxs,
+                success_flags=success_flags,
             )
         )
 

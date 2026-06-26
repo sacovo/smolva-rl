@@ -27,4 +27,25 @@ https://huggingface.co/datasets/IPEC-COMMUNITY/utaustin_mutex_lerobot
 
 
 Critic network:
-- 
+- Bins normalized returns between \([-1.0, 0.0]\) to classify time-to-completion.
+
+## RECAP Training Stages
+
+The RECAP training pipeline consists of three phases:
+
+1. **Phase 1: Pretraining** (Pretrained VLA using large datasets and critic advantage values).
+2. **Phase 2: Supervised Finetuning (Imitation Finetuning)**:
+   - Finetunes the VLA on task-specific demonstration data.
+   - Run the script with the `--expert_mode` flag to bypass the critic and treat all demonstration frames as having a positive advantage (`advantage_bool = True`).
+   - Example command:
+     ```bash
+     python src/lerobot_policy_smolvla_rl/train_recap.py \
+         --dataset_repo_id <dataset_id> \
+         --expert_mode \
+         --steps 100000
+     ```
+3. **Phase 3: Rollout and Policy Enhancement**:
+   - Collects rollout data (e.g. using `scripts/record_eval.py`) with expert/human interventions. Success outcomes are saved in the episode-level metadata (`success` column in `meta/episodes.parquet`).
+   - **Critic Finetuning**: Run `train_critic.py`. Failed episodes are penalized with a terminal penalty of `-C_FAIL` (normalized to push them to the lowest value bin `0`).
+   - **Policy Enhancement**: Run `train_recap.py` (without `--expert_mode`). Advantage is determined using the critic. Any frames with human/expert interventions (`batch["intervention"] == True`) automatically override the critic and receive a positive advantage signal (`advantage_bool = True`).
+

@@ -12,8 +12,6 @@ from lerobot.policies.smolvla import modeling_smolvla
 
 from lerobot.utils.constants import OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
-C_FAIL = 10000
-
 
 def pad_tensor(tensor, max_len, pad_value=0):
     b, d = tensor.shape[:2]

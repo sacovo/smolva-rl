@@ -68,15 +68,33 @@ def parse_args():
     )
     parser.add_argument(
         "--use_videos",
-        action="store_true",
-        default=False,
-        help="Encode and store visual frames as mp4 videos (False saves as raw PNG/JPEG images, which is faster to write)"
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Encode and store visual frames as mp4 videos (default: True)"
     )
     parser.add_argument(
         "--task_id",
         type=int,
         default=None,
         help="Optional specific task ID to record (e.g. 0). If None, records all tasks in the suite."
+    )
+    parser.add_argument(
+        "--cfg_weight",
+        type=float,
+        default=1.5,
+        help="Classifier-Free Guidance weight for the RECAP policy"
+    )
+    parser.add_argument(
+        "--n_action_steps",
+        type=int,
+        default=20,
+        help="Number of action steps to execute"
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        default=False,
+        help="Run environment in headless mode without window display"
     )
     return parser.parse_args()
 
@@ -355,7 +373,14 @@ def main():
     # 1. Load original dataset specs to copy features specification
     print("Loading metadata of original LIBERO dataset to clone features specifications...")
     orig_meta = LeRobotDatasetMetadata("HuggingFaceVLA/libero")
-    features = orig_meta.features
+    
+    # Map image features to video features if use_videos is enabled
+    features = {}
+    for key, val in orig_meta.features.items():
+        val_copy = dict(val)
+        if args.use_videos and val_copy.get("dtype") == "image":
+            val_copy["dtype"] = "video"
+        features[key] = val_copy
     
     # Ensure reward, success, and intervention features are defined in our dataset
     if "reward" not in features:
@@ -414,6 +439,13 @@ def main():
     policy_cfg.pretrained_path = Path(args.policy_path)
     policy_cfg.device = args.device
     
+    if getattr(args, "cfg_weight", None) is not None:
+        policy_cfg.cfg_weight = args.cfg_weight
+        print(f"Overriding policy cfg_weight to: {policy_cfg.cfg_weight}")
+    if getattr(args, "n_action_steps", None) is not None:
+        policy_cfg.n_action_steps = args.n_action_steps
+        print(f"Overriding policy n_action_steps to: {policy_cfg.n_action_steps}")
+        
     policy = make_policy(policy_cfg, env_cfg=env_cfg)
     policy.eval()
     
@@ -428,27 +460,29 @@ def main():
     # 5. Initialize Gamepad and GUI
     gamepad = GamepadController()
     
-    headless = False
+    headless = args.headless
     window_name = "LIBERO Interaction - Press ENTER to toggle Policy vs Human control"
-    try:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 512, 512)
-        print("X11 Graphics display detected. Live window visualization and keyboard manual intervention are ENABLED.")
-        print("Keyboard Controls (when Human Control is active):")
-        print("  W / S : forward / backward translation (+/- dx)")
-        print("  A / D : left / right translation (+/- dy)")
-        print("  Q / E : up / down translation (+/- dz)")
-        print("  U / O : roll rotation (+/- droll)")
-        print("  I / K : pitch rotation (+/- dpitch)")
-        print("  J / L : yaw rotation (+/- dyaw)")
-        print("  SPACE : toggle gripper open/closed")
-        print("  ENTER : toggle Policy Control vs Human Control")
-    except Exception:
-        print("X11 Graphics display not detected. Running in HEADLESS mode (Policy/Gamepad only, keyboard interface disabled).")
-        headless = True
+    if not headless:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, 512, 512)
+            print("X11 Graphics display detected. Live window visualization and keyboard manual intervention are ENABLED.")
+            print("Keyboard Controls (when Human Control is active):")
+            print("  W / S : forward / backward translation (+/- dx)")
+            print("  A / D : left / right translation (+/- dy)")
+            print("  Q / E : up / down translation (+/- dz)")
+            print("  U / O : roll rotation (+/- droll)")
+            print("  I / K : pitch rotation (+/- dpitch)")
+            print("  J / L : yaw rotation (+/- dyaw)")
+            print("  SPACE : toggle gripper open/closed")
+            print("  ENTER : toggle Policy Control vs Human Control")
+        except Exception:
+            print("X11 Graphics display not detected. Running in HEADLESS mode (Policy/Gamepad only, keyboard interface disabled).")
+            headless = True
         
     # 6. Recording Loop
     episode_idx = 0
+    episode_successes = []
     
     for task_id in task_ids:
         vec_env = task_envs_dict[task_id]
@@ -624,11 +658,43 @@ def main():
                 
             dataset.save_episode()
             episode_idx += 1
+            episode_successes.append(success)
             
     # Finalize the dataset and cleanup GUI
     dataset.finalize()
     if not headless:
         cv2.destroyAllWindows()
+        
+    # Append success column to episodes parquet file(s)
+    episodes_dir = Path(root_dir) / "meta" / "episodes"
+    episodes_files = []
+    if episodes_dir.exists():
+        episodes_files = list(episodes_dir.glob("**/*.parquet"))
+    else:
+        # Fallback to single file if using older LeRobot version
+        single_path = Path(root_dir) / "meta" / "episodes.parquet"
+        if single_path.exists():
+            episodes_files = [single_path]
+            
+    if episodes_files:
+        import pyarrow.parquet as pq
+        import pyarrow as pa
+        print(f"Injecting success metadata into episodes files: {episodes_files}...")
+        for ep_file in episodes_files:
+            table = pq.read_table(ep_file)
+            if "episode_index" in table.column_names:
+                indices = table["episode_index"].to_pylist()
+                file_successes = [episode_successes[idx] for idx in indices]
+            else:
+                file_successes = episode_successes[:len(table)]
+                
+            if "success" in table.column_names:
+                success_idx = table.column_names.index("success")
+                table = table.set_column(success_idx, "success", pa.array(file_successes, type=pa.bool_()))
+            else:
+                table = table.append_column("success", pa.array(file_successes, type=pa.bool_()))
+            pq.write_table(table, ep_file)
+        print("Successfully injected success metadata!")
         
     print(f"\n=======================================================")
     print(f"Successfully recorded and finalized dataset!")

@@ -199,7 +199,7 @@ def main():
     subprocess.run(cmd, check=True)
     print(f"Policy successfully migrated to: {args.output_dir}")
 
-    # 7. Overwrite the empty migrated processors with ones containing the actual dataset stats
+    # 7. Load the migrated processors and inject the actual dataset statistics
     print("Populating migrated processors with dataset statistics...")
     stats_tensors = {}
     if dataset.meta.stats is not None:
@@ -211,8 +211,20 @@ def main():
     from lerobot.policies.factory import make_pre_post_processors
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
-        dataset_stats=stats_tensors,
+        pretrained_path=args.output_dir,
     )
+    # Inject stats into normalizer/unnormalizer steps via load_state_dict
+    # which properly updates both stats and _tensor_stats for serialization.
+    flat_stats = {}
+    for feat_name, stat_dict in stats_tensors.items():
+        for stat_name, val in stat_dict.items():
+            flat_stats[f"{feat_name}.{stat_name}"] = val
+    for step in preprocessor.steps:
+        if hasattr(step, 'load_state_dict') and hasattr(step, 'norm_map'):
+            step.load_state_dict(flat_stats)
+    for step in postprocessor.steps:
+        if hasattr(step, 'load_state_dict') and hasattr(step, 'norm_map'):
+            step.load_state_dict(flat_stats)
     preprocessor.save_pretrained(args.output_dir)
     postprocessor.save_pretrained(args.output_dir)
     print(f"Successfully populated migrated processors with statistics in: {args.output_dir}")

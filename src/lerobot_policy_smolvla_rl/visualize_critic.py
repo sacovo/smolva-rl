@@ -138,6 +138,17 @@ def main():
     max_lengths = get_max_task_lengths(dataset)
     episode_lengths = get_episode_lengths(dataset)
 
+    # Check for episode success metadata in full dataset
+    episode_successes = {}
+    if "success" in dataset.meta.episodes.column_names:
+        success_list = dataset.meta.episodes["success"]
+        if hasattr(success_list, "to_pylist"):
+            success_list = success_list.to_pylist()
+        episode_indices = dataset.meta.episodes["episode_index"]
+        if hasattr(episode_indices, "to_pylist"):
+            episode_indices = episode_indices.to_pylist()
+        episode_successes = {idx: s for idx, s in zip(episode_indices, success_list)}
+
     print(f"Loading dataset: {args.dataset_repo_id}")
 
     # Reload if we only use the smaller ds
@@ -296,7 +307,16 @@ def main():
         colors = ["green" if a > threshold else "red" for a in all_advantages]
         ax_adv.bar(np.arange(T) + 0.5, all_advantages, color=colors, width=1.0)
         ax_adv.set_ylabel("Advantage")
-        ax_adv.set_title(f"Critic Output - Episode {ep_idx}")
+        
+        # Color and label title by success status if available
+        title_color = "black"
+        success_status = ""
+        if ep_idx in episode_successes:
+            is_success = episode_successes[ep_idx]
+            success_status = " (SUCCESS)" if is_success else " (FAILURE)"
+            title_color = "green" if is_success else "red"
+        ax_adv.set_title(f"Critic Output - Episode {ep_idx}{success_status}", color=title_color, fontweight="bold")
+        
         ax_adv.axhline(0, color="black", linewidth=1)
         ax_adv.axhline(
             threshold,
@@ -347,7 +367,10 @@ def main():
         ax_hm.set_ylabel("Time-to-Completion (steps)")
         ax_hm.legend(loc="lower left")
 
-        output_path = os.path.join(args.output_dir, f"episode_{ep_idx}_critic.png")
+        status_suffix = ""
+        if ep_idx in episode_successes:
+            status_suffix = "_success" if episode_successes[ep_idx] else "_failure"
+        output_path = os.path.join(args.output_dir, f"episode_{ep_idx}_critic{status_suffix}.png")
         plt.savefig(output_path, bbox_inches="tight", pad_inches=0.05)
         plt.close()
         print(f"Saved plot to {output_path}")

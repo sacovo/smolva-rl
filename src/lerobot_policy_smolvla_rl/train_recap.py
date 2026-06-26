@@ -122,7 +122,14 @@ def patch_lerobot_dataset_reader():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train SmolVLA RECAP (Phase 1)")
+    parser = argparse.ArgumentParser(
+        description="Train SmolVLA RECAP (Phase 2: Supervised/Imitation Finetuning or Phase 3: Rollout and Policy Enhancement)"
+    )
+    parser.add_argument(
+        "--expert_mode",
+        action="store_true",
+        help="Enable Phase 2 Supervised/Imitation Finetuning. Bypasses the critic and treats all expert demonstration frames as advantageous.",
+    )
     parser.add_argument("--dataset_repo_id", type=str, required=True)
     parser.add_argument(
         "--episodes",
@@ -334,15 +341,16 @@ def main():
     # 2. Check for precomputed advantages (.npy)
     precomputed_advantages = None
     safe_repo_name = args.dataset_repo_id.replace("/", "_")
-    advantages_path = args.precomputed_advantages
-    if not advantages_path:
-        advantages_path = os.path.join(
-            args.save_dir, f"task_advantages_{safe_repo_name}.npy"
-        )
+    if not args.expert_mode:
+        advantages_path = args.precomputed_advantages
+        if not advantages_path:
+            advantages_path = os.path.join(
+                args.save_dir, f"task_advantages_{safe_repo_name}.npy"
+            )
 
-    if os.path.exists(advantages_path):
-        print(f"Loading pre-computed advantages from {advantages_path}")
-        precomputed_advantages = np.load(advantages_path)
+        if os.path.exists(advantages_path):
+            print(f"Loading pre-computed advantages from {advantages_path}")
+            precomputed_advantages = np.load(advantages_path)
 
     # 3. Initialize/Load Critic (only if pre-computed advantages do not exist)
     critic = None
@@ -394,63 +402,69 @@ def main():
             f"task_thresholds_{safe_repo_name}.json",
         )
 
-    if precomputed_advantages is None:
-        if not args.critic_checkpoint:
-            raise ValueError(
-                "Critic checkpoint is needed for RECAP training unless pre-computed advantages are provided"
+    task_thresholds = None
+    support = None
+    if not args.expert_mode:
+        if precomputed_advantages is None:
+            if not args.critic_checkpoint:
+                raise ValueError(
+                    "Critic checkpoint is needed for RECAP training unless pre-computed advantages are provided or expert_mode is enabled"
+                )
+
+            print(f"Loading critic from {args.critic_checkpoint}")
+            # Initialize config for critic
+            critic_config = SmolVLMCriticConfig(
+                num_bins=201,
+                num_vlm_layers=args.critic_num_vlm_layers,
+                input_features=input_features,
             )
+            with accelerator.local_main_process_first():
+                critic = SmolVLACrictic(critic_config).to(device)
+                critic.load_state_dict(
+                    torch.load(args.critic_checkpoint, map_location="cpu")
+                )
 
-        print(f"Loading critic from {args.critic_checkpoint}")
-        # Initialize config for critic
-        critic_config = SmolVLMCriticConfig(
-            num_bins=201,
-            num_vlm_layers=args.critic_num_vlm_layers,
-            input_features=input_features,
-        )
-        with accelerator.local_main_process_first():
-            critic = SmolVLACrictic(critic_config).to(device)
-            critic.load_state_dict(
-                torch.load(args.critic_checkpoint, map_location="cpu")
+            critic.eval()
+
+            support = torch.linspace(
+                critic.config.vmin,
+                critic.config.vmax,
+                critic.config.num_bins,
+                device=device,
             )
+            pre_critic = critic.get_pre_processor(dataset)
 
-        critic.eval()
+            # Calculate epsilon_l per task based on the raw dataset (only on main process to avoid multi-GPU I/O bottlenecks)
+            if accelerator.is_main_process:
+                task_thresholds = get_task_thresholds(
+                    critic,
+                    dataset,
+                    support,
+                    args.action_chunk_size,
+                    thresholds_save_path,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    batch_size=8,
+                    num_workers=0,  # use 0 workers to prevent multiprocessing shm/forking pickler crashes on HPC nodes
+                )
 
-        support = torch.linspace(
-            critic.config.vmin,
-            critic.config.vmax,
-            critic.config.num_bins,
-            device=device,
-        )
-        pre_critic = critic.get_pre_processor(dataset)
+            accelerator.wait_for_everyone()
 
-        # Calculate epsilon_l per task based on the raw dataset (only on main process to avoid multi-GPU I/O bottlenecks)
-        if accelerator.is_main_process:
-            task_thresholds = get_task_thresholds(
-                critic,
-                dataset,
-                support,
-                args.action_chunk_size,
-                thresholds_save_path,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                batch_size=8,
-                num_workers=0,  # use 0 workers to prevent multiprocessing shm/forking pickler crashes on HPC nodes
-            )
-
-        accelerator.wait_for_everyone()
-
-        if not accelerator.is_main_process:
+            if not accelerator.is_main_process:
+                with open(thresholds_save_path, "r", encoding="utf-8") as f:
+                    str_keys = json.load(f)
+                    task_thresholds = {int(k): v for k, v in str_keys.items()}
+        else:
+            # Load thresholds directly from JSON
+            print(f"Loading pre-computed advantage thresholds from {thresholds_save_path}")
             with open(thresholds_save_path, "r", encoding="utf-8") as f:
                 str_keys = json.load(f)
                 task_thresholds = {int(k): v for k, v in str_keys.items()}
-    else:
-        # Load thresholds directly from JSON
-        print(f"Loading pre-computed advantage thresholds from {thresholds_save_path}")
-        with open(thresholds_save_path, "r", encoding="utf-8") as f:
-            str_keys = json.load(f)
-            task_thresholds = {int(k): v for k, v in str_keys.items()}
 
     # 4. Wrap/Load Dataloader
-    if precomputed_advantages is None:
+    if args.expert_mode:
+        # Expert mode uses raw dataset (all frames advantageous)
+        loader_dataset = dataset
+    elif precomputed_advantages is None:
         # Wrap dataset to include future frames on the fly for on-the-fly calculation
         loader_dataset = FutureFrameWrapper(dataset, args.action_chunk_size)
     else:
@@ -707,40 +721,52 @@ def main():
             with accelerator.accumulate(model):
                 # Label advantage
                 with torch.no_grad():
-                    def to_numpy(val):
-                        if hasattr(val, "cpu"):
-                            val = val.cpu()
-                        if hasattr(val, "numpy"):
-                            return val.numpy()
-                        return np.array(val)
-
-                    if precomputed_advantages is not None:
-                        # High-Speed Offline Mode: direct array lookup using absolute index
-                        batch_indices = to_numpy(batch["index"])
-                        # NaN entries = frames corrupt at precompute time; treat as 0
-                        # (neutral). RobustDataset already replaced them with a valid
-                        # sample, so the looked-up index is a stand-in anyway.
-                        raw_adv = np.nan_to_num(
-                            precomputed_advantages[batch_indices], nan=0.0
-                        )
-                        advantage = torch.tensor(raw_adv, device=device)
+                    if args.expert_mode:
+                        batch_size = batch["task_index"].shape[0]
+                        advantage_bool = [True] * batch_size
+                        advantage = torch.ones(batch_size, device=device)  # dummy for logging
                     else:
-                        # On-the-fly Mode: compute using Critic forward passes
-                        future_batch = extract_future_batch(batch)
-                        has_future = batch["has_future"].to(device)
-                        advantage, _, _ = compute_temporal_advantage(
-                            critic, pre_critic, batch, future_batch, support, has_future
+                        def to_numpy(val):
+                            if hasattr(val, "cpu"):
+                                val = val.cpu()
+                            if hasattr(val, "numpy"):
+                                return val.numpy()
+                            return np.array(val)
+
+                        if precomputed_advantages is not None:
+                            # High-Speed Offline Mode: direct array lookup using absolute index
+                            batch_indices = to_numpy(batch["index"])
+                            # NaN entries = frames corrupt at precompute time; treat as 0
+                            # (neutral). RobustDataset already replaced them with a valid
+                            # sample, so the looked-up index is a stand-in anyway.
+                            raw_adv = np.nan_to_num(
+                                precomputed_advantages[batch_indices], nan=0.0
+                            )
+                            advantage = torch.tensor(raw_adv, device=device)
+                        else:
+                            # On-the-fly Mode: compute using Critic forward passes
+                            future_batch = extract_future_batch(batch)
+                            has_future = batch["has_future"].to(device)
+                            advantage, _, _ = compute_temporal_advantage(
+                                critic, pre_critic, batch, future_batch, support, has_future
+                            )
+
+                        # Compare advantage against task-specific epsilon_l
+                        task_indices = to_numpy(batch["task_index"])
+                        batch_thresholds = torch.tensor(
+                            [task_thresholds[int(t)] for t in task_indices],
+                            dtype=torch.float32,
+                            device=device,
                         )
 
-                    # Compare advantage against task-specific epsilon_l
-                    task_indices = to_numpy(batch["task_index"])
-                    batch_thresholds = torch.tensor(
-                        [task_thresholds[int(t)] for t in task_indices],
-                        dtype=torch.float32,
-                        device=device,
-                    )
+                        advantage_bool = (advantage > batch_thresholds).tolist()
 
-                    advantage_bool = (advantage > batch_thresholds).tolist()
+                        # Force positive advantage for expert/human interventions (Phase 3)
+                        if "intervention" in batch:
+                            interventions = batch["intervention"].flatten().cpu().numpy()
+                            for idx, intervened in enumerate(interventions):
+                                if intervened:
+                                    advantage_bool[idx] = True
 
                 # Prepare batch for RECAP (tokenization, normalization)
                 recap_batch = pre_recap(batch)
@@ -865,7 +891,7 @@ def main():
             subprocess.run(cmd, check=True)
             print(f"Policy successfully migrated to: {migrated_dir}")
 
-            # Overwrite the empty migrated processors with ones containing the actual dataset stats
+            # Load the migrated processors and inject dataset normalization stats
             print("Populating migrated processors with dataset statistics...")
             stats_tensors = {}
             if dataset.meta.stats is not None:
@@ -873,12 +899,24 @@ def main():
                     stats_tensors[feature_name] = {}
                     for stat_name, val in stat_dict.items():
                         stats_tensors[feature_name][stat_name] = torch.tensor(val)
-            
+
             from lerobot.policies.factory import make_pre_post_processors
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=config,
-                dataset_stats=stats_tensors,
+                pretrained_path=migrated_dir,
             )
+            # Inject stats into normalizer/unnormalizer steps via load_state_dict
+            # which properly updates both stats and _tensor_stats for serialization.
+            flat_stats = {}
+            for feat_name, stat_dict in stats_tensors.items():
+                for stat_name, val in stat_dict.items():
+                    flat_stats[f"{feat_name}.{stat_name}"] = val
+            for step in preprocessor.steps:
+                if hasattr(step, 'load_state_dict') and hasattr(step, 'norm_map'):
+                    step.load_state_dict(flat_stats)
+            for step in postprocessor.steps:
+                if hasattr(step, 'load_state_dict') and hasattr(step, 'norm_map'):
+                    step.load_state_dict(flat_stats)
             preprocessor.save_pretrained(migrated_dir)
             postprocessor.save_pretrained(migrated_dir)
             print(f"Successfully populated migrated processors with statistics in: {migrated_dir}")

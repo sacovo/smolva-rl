@@ -244,6 +244,15 @@ def main():
     episode_lengths = episode_lengths.to(accelerator.device)
     max_lengths = max_lengths.to(accelerator.device)
 
+    # Load episode-level success flags if available
+    if "success" in dataset.meta.episodes.column_names:
+        success_list = dataset.meta.episodes["success"].to_pylist()
+        success_flags = torch.tensor(success_list, dtype=torch.bool, device=accelerator.device)
+        print(f"Loaded episode success flags. Successful episodes: {success_flags.sum().item()} / {len(success_flags)}")
+    else:
+        success_flags = torch.ones(len(dataset.meta.episodes), dtype=torch.bool, device=accelerator.device)
+        print("No episode success metadata found. Defaulting all episodes to success=True.")
+
     dataloader = build_dataloader(
         dataset,
         args,
@@ -508,6 +517,7 @@ def main():
                     batch["task_index"],
                     batch["episode_index"],
                     batch["frame_index"],
+                    success_flags=success_flags,
                 )
 
                 # Map normalized returns [-1.0, 0.0] to bin indices [0, 200]
