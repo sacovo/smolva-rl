@@ -79,13 +79,17 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
     
     # 3. Training Loop (Overfitting)
     print("Starting training...")
+    pre_train = model.get_pre_processor(dataset)
     step = 0
     while step < steps:
         for batch in dataloader:
             if step >= steps:
                 break
             
-            # Prepare batch for model
+            # Preprocess batch (tokenizes language tasks, applies correct stats, etc.)
+            batch = pre_train(batch)
+            
+            # Prepare batch for model (move tensors to device)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             # Force advantage conditioning to True (positive advantage)
             advantage_bool = [True] * batch["observation.state"].shape[0]
