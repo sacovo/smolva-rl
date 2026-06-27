@@ -65,6 +65,10 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
         device=device,
         use_advantage_conditioning=True,
         adv_dropout_rate=0.0,
+        # Only optimise the first action step — inference uses n_action_steps=1
+        # so computing FM loss over the full chunk wastes capacity and slows
+        # convergence by chunk_size × for no gain in what the test measures.
+        loss_n_action_steps=1,
     )
     model_config.output_features = policy_cfg.output_features
     
@@ -112,8 +116,8 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
             ar_val = float(ar_loss.item())
             flow_val = float(flow_loss.item())
             results["losses"].append({"step": step, "loss": loss_val})
-            if step % 25 == 0:
-                print(f"Step {step}/{steps} - Loss: {loss_val:.4f} (AR: {ar_val:.4f}, FM: {flow_val:.4f})")
+            if step % 50 == 0:
+                print(f"Step {step}/{steps} - Loss: {loss_val:.4f} (AR: {ar_val:.4f}, FM step0: {flow_val:.4f})")
             step += 1
             
     # 4. Save Temporary Exported Model
@@ -246,7 +250,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset", type=str, default="sancov/smolvla_recap_libero_spatial")
     parser.add_argument("--pretrained_model", type=str, default="outputs/policies/recap_libero_pretrained")
     parser.add_argument("--output_dir", type=str, default="outputs/overfit_test")
-    parser.add_argument("--steps", type=int, default=250)
+    parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     args = parser.parse_args()
     
