@@ -208,7 +208,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
             if isinstance(pred, torch.Tensor):
                 pred = pred.cpu().numpy()
                 
-        gt_action = sample["action"].numpy()
+        gt_action = sample["action"][0].numpy()
         pred_action = pred[0]
         
         l1 = float(np.mean(np.abs(gt_action - pred_action)))
