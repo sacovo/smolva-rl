@@ -232,31 +232,33 @@ def main():
         all_expected_values = np.array(
             [res["expected_values"][i] for i in sorted_indices]
         )
+        all_gt_values = np.array(
+            [res["gt_values"][i] for i in sorted_indices]
+        )
         T = len(all_expected_values)
 
-        advantages = np.zeros(T)
-        for t in range(T):
-            v_current = all_expected_values[t]
-            future_t = t + args.action_chunk_size
-            if future_t >= T:
-                v_future = 0.0
-            else:
-                v_future = all_expected_values[future_t]
-            advantages[t] = v_future - v_current
-
+        # Monte Carlo advantage: A_t = R_t - V(s_t)
+        advantages = all_gt_values - all_expected_values
         res["advantages"] = advantages
 
         task_idx = res["task_index"]
-        if task_idx not in task_advantages:
-            task_advantages[task_idx] = []
-        task_advantages[task_idx].extend(advantages)
+        is_success = episode_successes.get(ep_idx, True)
 
-    # Compute thresholds (epsilon_l) per task
+        # Only use successful episodes for calculating threshold percentiles
+        if is_success:
+            if task_idx not in task_advantages:
+                task_advantages[task_idx] = []
+            task_advantages[task_idx].extend(advantages)
+
+    # Compute thresholds (epsilon_l) per task (using successful episodes only)
     task_thresholds = {}
     for task_idx, advs in task_advantages.items():
-        task_thresholds[task_idx] = np.percentile(advs, args.epsilon_l)
+        if len(advs) == 0:
+            task_thresholds[task_idx] = 0.0
+        else:
+            task_thresholds[task_idx] = np.percentile(advs, args.epsilon_l)
         print(
-            f"Task {task_idx} threshold (epsilon_l={args.epsilon_l}%): {task_thresholds[task_idx]:.4f}"
+            f"Task {task_idx} threshold (epsilon_l={args.epsilon_l}% from successes): {task_thresholds[task_idx]:.4f}"
         )
 
     for ep_idx in args.episodes:

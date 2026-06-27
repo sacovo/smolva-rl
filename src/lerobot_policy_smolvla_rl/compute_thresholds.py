@@ -239,22 +239,8 @@ def main():
     }
 
     for sample_idx, v_current in vs_by_idx.items():
-        ep_idx, frame_idx, _ = meta_by_idx[sample_idx]
-        ep_len = episode_lengths[ep_idx]
         r_current = returns_by_idx[sample_idx]
-        mc_error_current = r_current - v_current  # R_t - V(s_t)
-
-        future_frame = frame_idx + args.action_chunk_size
-
-        if future_frame >= ep_len:
-            # Past episode end: MC advantage (R_{t+N} and V_{t+N} are both 0)
-            advantages[sample_idx] = mc_error_current
-        else:
-            future_sample_idx = int(ep_from[ep_idx]) + future_frame
-            if future_sample_idx in vs_by_idx and future_sample_idx in returns_by_idx:
-                mc_error_future = returns_by_idx[future_sample_idx] - vs_by_idx[future_sample_idx]
-                advantages[sample_idx] = mc_error_current - mc_error_future
-            # else: future frame was also corrupt — leave NaN
+        advantages[sample_idx] = r_current - v_current
 
     n_nan = int(np.isnan(advantages).sum())
     print(
@@ -265,24 +251,34 @@ def main():
     print(f"Saved pre-computed advantages to {advantages_path}")
 
     # ── Step 3/3: Compute per-task thresholds (30th percentile) ─────────────
-    # Exclude NaN entries from threshold computation.
+    # Exclude NaN entries and failed episodes from threshold computation.
     print("Step 3/3: Computing 30th percentile task thresholds...")
     task_thresholds = {}
-    # Collect task labels only for samples that have a valid advantage
-    all_tasks = np.array(
-        [meta_by_idx[idx][2] for idx in sorted(vs_by_idx.keys())], dtype=np.int64
-    )
-    all_advs = advantages[sorted(vs_by_idx.keys())]
+    
+    # Collect task and advantage values only for successful episodes
+    valid_tasks = []
+    valid_advs = []
+    for idx in sorted(vs_by_idx.keys()):
+        ep_idx = meta_by_idx[idx][0]
+        is_success = True
+        if success_flags is not None:
+            is_success = bool(success_flags[ep_idx].item())
+        if is_success and not np.isnan(advantages[idx]):
+            valid_tasks.append(meta_by_idx[idx][2])
+            valid_advs.append(advantages[idx])
+            
+    valid_tasks = np.array(valid_tasks, dtype=np.int64)
+    valid_advs = np.array(valid_advs, dtype=np.float32)
 
-    unique_tasks = np.unique(all_tasks)
+    unique_tasks = np.unique(np.array([meta_by_idx[idx][2] for idx in vs_by_idx]))
     for t in unique_tasks:
-        mask = all_tasks == t
-        task_advs = all_advs[mask]
-        valid = task_advs[~np.isnan(task_advs)]
-        if len(valid) == 0:
-            logger.warning("Task %d has no valid advantages — skipping threshold.", t)
-            continue
-        task_thresholds[int(t)] = float(np.percentile(valid, 30))
+        mask = valid_tasks == t
+        task_advs = valid_advs[mask]
+        if len(task_advs) == 0:
+            logger.warning("Task %d has no successful episodes — defaulting threshold to 0.0.", t)
+            task_thresholds[int(t)] = 0.0
+        else:
+            task_thresholds[int(t)] = float(np.percentile(task_advs, 30))
 
     # Save thresholds to JSON
     with open(thresholds_path, "w", encoding="utf-8") as f:
