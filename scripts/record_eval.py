@@ -527,13 +527,14 @@ def main():
                 
                 # Apply preprocessors
                 policy_obs = env_preprocessor(obs_dict)
-                policy_obs = preprocessor(policy_obs)
                 
                 # Extract raw (unnormalized) observations for recording and visualization
                 img = obs_dict["observation.images.image"][0].cpu().numpy().transpose(1, 2, 0)
                 img2 = obs_dict["observation.images.image2"][0].cpu().numpy().transpose(1, 2, 0)
                 # State is processed by env_preprocessor (LiberoProcessorStep) and is stored in policy_obs
                 state = policy_obs["observation.state"][0].cpu().numpy()
+                
+                policy_obs = preprocessor(policy_obs)
                 
                 # Convert images from [0, 1] float back to [0, 255] uint8
                 if img.dtype != np.uint8:
