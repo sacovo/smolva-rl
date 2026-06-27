@@ -7,6 +7,7 @@ from lerobot_policy_smolvla_rl.ds_utils import (
 )
 import argparse
 import os
+import re
 import sys
 
 # Add src to sys.path to allow importing from lerobot_policy_smolvla_rl
@@ -41,10 +42,12 @@ def parse_args():
         "the Monte-Carlo (pre-training) regime.",
     )
     parser.add_argument(
-        "--epsilon_l",
+        "--positive_fraction",
         type=float,
-        default=30.0,
-        help="Percentile (0-100) for calculating the advantage threshold (epsilon_l) per task",
+        default=0.3,
+        help="Target fraction of frames labeled positive (advantage > epsilon_l). "
+        "Threshold = 100*(1-positive_fraction) percentile per task. Match the "
+        "value passed to compute_thresholds.py.",
     )
     parser.add_argument(
         "--dataset_repo_id",
@@ -92,6 +95,19 @@ def parse_args():
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Build filesystem-safe tags so each plot's filename identifies the dataset
+    # and the critic checkpoint it came from. The checkpoint tag combines its
+    # parent directory (usually the run/model name) with the file stem, since
+    # the file itself is often generically named (e.g. checkpoint_final.pt).
+    def _sanitize(text):
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_")
+
+    dataset_tag = _sanitize(args.dataset_repo_id)
+    ckpt_clean = args.checkpoint.rstrip("/")
+    ckpt_stem = os.path.splitext(os.path.basename(ckpt_clean))[0]
+    ckpt_parent = os.path.basename(os.path.dirname(ckpt_clean))
+    ckpt_tag = _sanitize(f"{ckpt_parent}_{ckpt_stem}" if ckpt_parent else ckpt_stem)
 
     print(f"Loading checkpoint from {args.checkpoint}")
     state_dict = torch.load(args.checkpoint, map_location=args.device)
@@ -261,15 +277,19 @@ def main():
                 task_advantages[task_idx] = []
             task_advantages[task_idx].extend(advantages)
 
-    # Compute thresholds (epsilon_l) per task (using successful episodes only)
+    # Compute thresholds (epsilon_l) per task (using successful episodes only).
+    # Threshold so that ~positive_fraction of frames are positive -> the
+    # 100*(1-positive_fraction) percentile (matches task_thresholds_from_advantages).
+    pct = 100.0 * (1.0 - args.positive_fraction)
     task_thresholds = {}
     for task_idx, advs in task_advantages.items():
         if len(advs) == 0:
             task_thresholds[task_idx] = 0.0
         else:
-            task_thresholds[task_idx] = np.percentile(advs, args.epsilon_l)
+            task_thresholds[task_idx] = np.percentile(advs, pct)
         print(
-            f"Task {task_idx} threshold (epsilon_l={args.epsilon_l}% from successes): {task_thresholds[task_idx]:.4f}"
+            f"Task {task_idx} threshold (positive_fraction={args.positive_fraction}, "
+            f"{pct:.0f}th pct from successes): {task_thresholds[task_idx]:.4f}"
         )
 
     for ep_idx in args.episodes:
@@ -383,7 +403,10 @@ def main():
         status_suffix = ""
         if ep_idx in episode_successes:
             status_suffix = "_success" if episode_successes[ep_idx] else "_failure"
-        output_path = os.path.join(args.output_dir, f"episode_{ep_idx}_critic{status_suffix}.png")
+        output_path = os.path.join(
+            args.output_dir,
+            f"episode_{ep_idx}_critic_{dataset_tag}_{ckpt_tag}{status_suffix}.png",
+        )
         plt.savefig(output_path, bbox_inches="tight", pad_inches=0.05)
         plt.close()
         print(f"Saved plot to {output_path}")
