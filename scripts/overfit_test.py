@@ -58,7 +58,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
     # Instantiate the model directly for training
     from lerobot_policy_smolvla_rl import SmolVLARECAPConfig
     model_config = SmolVLARECAPConfig(
-        num_vlm_layers=8,  # Reduce layers for quick overfitting
+        num_vlm_layers=policy_cfg.num_vlm_layers,
         chunk_size=policy_cfg.chunk_size,
         max_action_dim=policy_cfg.max_action_dim,
         input_features=policy_cfg.input_features,
@@ -123,7 +123,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
         action_stats = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in action_stats.items()}
         
     export_config = SmolVLARECAPConfig(
-        num_vlm_layers=8,
+        num_vlm_layers=policy_cfg.num_vlm_layers,
         max_action_dim=policy_cfg.max_action_dim,
         input_features=policy_cfg.input_features,
         action_stats=action_stats,
