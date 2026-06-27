@@ -453,7 +453,6 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        print(f"DEBUG: embed_prefix shapes - pad: {prefix_pad_masks.shape}, att: {prefix_att_masks.shape}")
 
         # 4. VLM Backbone (AR loss on FAST tokens)
         actions_np = batch[ACTION].cpu().numpy()
@@ -512,7 +511,6 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # covered by the KI patch on forward_attn_layer.
         prefix_embs_fm = prefix_embs.detach()
         prefix_pad_masks_fm = prefix_pad_masks.detach()
-        print(f"DEBUG: fm shapes - pad_fm: {prefix_pad_masks_fm.shape}, att: {prefix_att_masks.shape}")
 
         # Temporarily freeze VLM parameters so PyTorch does not track
         # gradient contributions from VLM weights during FM forward.
