@@ -172,7 +172,10 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
     
     # 5. Evaluate End-to-End Inference Alignment
     print("Running inference alignment checks...")
-    eval_policy = make_policy(PreTrainedConfig.from_pretrained(migrated_dir))
+    eval_policy = make_policy(
+        PreTrainedConfig.from_pretrained(migrated_dir),
+        ds_meta=dataset.meta
+    )
     eval_policy.to(device)
     eval_policy.eval()
     
