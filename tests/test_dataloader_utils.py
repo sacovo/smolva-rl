@@ -279,73 +279,79 @@ def test_train_recap_nan_handling():
     assert raw_adv[4] == 2.0
 
 
-def test_compute_thresholds_advantage_logic():
-    # Arrange
+def test_nstep_td_advantages_pure_td():
+    """With zero returns, the N-step TD advantage reduces to V(t+N) - V(t),
+    and the episode-end case to -V(t).  Exercises the real canonical function."""
+    from lerobot_policy_smolvla_rl.advantage_utils import (
+        nstep_td_advantages,
+        task_thresholds_from_advantages,
+    )
+
     episode_lengths = np.array([5, 5])
     ep_from = np.array([0, 5])
-    action_chunk_size = 2
+    advantage_horizon = 2
     dataset_len = 10
 
     # vs_by_idx has some missing (corrupt) indices, e.g. index 8 is missing
     vs_by_idx = {
         0: 0.1, 1: 0.2, 2: 0.3, 3: 0.4, 4: 0.5,
-        5: 0.2, 6: 0.4, 7: 0.6,          9: 0.8
+        5: 0.2, 6: 0.4, 7: 0.6,          9: 0.8,
     }
     meta_by_idx = {
         0: (0, 0, 1), 1: (0, 1, 1), 2: (0, 2, 1), 3: (0, 3, 1), 4: (0, 4, 1),
-        5: (1, 0, 2), 6: (1, 1, 2), 7: (1, 2, 2),               9: (1, 4, 2)
+        5: (1, 0, 2), 6: (1, 1, 2), 7: (1, 2, 2),               9: (1, 4, 2),
     }
+    # Zero returns -> A_t = (0 - V_t) - (0 - V_{t+N}) = V_{t+N} - V_t,
+    # terminal -> 0 - V_t.
+    returns_by_idx = {idx: 0.0 for idx in vs_by_idx}
 
-    # Act
-    # Replicate Step 2/3 and 3/3 of compute_thresholds.py
-    advantages = np.full(dataset_len, np.nan, dtype=np.float32)
-
-    for sample_idx, v_current in vs_by_idx.items():
-        ep_idx, frame_idx, _ = meta_by_idx[sample_idx]
-        ep_len = episode_lengths[ep_idx]
-        future_frame = frame_idx + action_chunk_size
-
-        if future_frame >= ep_len:
-            advantages[sample_idx] = 0.0 - v_current
-        else:
-            future_sample_idx = int(ep_from[ep_idx]) + future_frame
-            if future_sample_idx in vs_by_idx:
-                advantages[sample_idx] = vs_by_idx[future_sample_idx] - v_current
-
-    # Assert advantages are calculated properly, skipping NaNs and handling terminals
-    # Ep 0:
-    assert np.isclose(advantages[0], 0.2)  # V(2) - V(0) = 0.3 - 0.1 = 0.2
-    assert np.isclose(advantages[1], 0.2)  # V(3) - V(1) = 0.4 - 0.2 = 0.2
-    assert np.isclose(advantages[2], 0.2)  # V(4) - V(2) = 0.5 - 0.3 = 0.2
-    assert np.isclose(advantages[3], -0.4) # Terminal: 0.0 - V(3) = 0.0 - 0.4 = -0.4
-    assert np.isclose(advantages[4], -0.5) # Terminal: 0.0 - V(4) = 0.0 - 0.5 = -0.5
-    # Ep 1:
-    assert np.isclose(advantages[5], 0.4)  # V(7) - V(5) = 0.6 - 0.2 = 0.4
-    assert np.isnan(advantages[6])         # Future frame (8) is missing/corrupt -> NaN
-    assert np.isclose(advantages[7], 0.2)  # V(9) - V(7) = 0.8 - 0.6 = 0.2
-    assert np.isnan(advantages[8])         # Current frame (8) is missing/corrupt -> NaN
-    assert np.isclose(advantages[9], -0.8) # Terminal: 0.0 - V(9) = 0.0 - 0.8 = -0.8
-
-    # ── Replicate Threshold 30th percentile calculation (Step 3/3 of compute_thresholds) ───
-    task_thresholds = {}
-    all_tasks = np.array(
-        [meta_by_idx[idx][2] for idx in sorted(vs_by_idx.keys())], dtype=np.int64
+    advantages = nstep_td_advantages(
+        vs_by_idx, returns_by_idx, meta_by_idx, ep_from,
+        episode_lengths, advantage_horizon, size=dataset_len,
     )
-    all_advs = advantages[sorted(vs_by_idx.keys())]
 
-    unique_tasks = np.unique(all_tasks)
-    for t in unique_tasks:
-        mask = all_tasks == t
-        task_advs = all_advs[mask]
-        valid = task_advs[~np.isnan(task_advs)]
-        if len(valid) == 0:
-            continue
-        task_thresholds[int(t)] = float(np.percentile(valid, 30))
+    # Ep 0:
+    assert np.isclose(advantages[0], 0.2)  # V(2) - V(0) = 0.3 - 0.1
+    assert np.isclose(advantages[1], 0.2)  # V(3) - V(1) = 0.4 - 0.2
+    assert np.isclose(advantages[2], 0.2)  # V(4) - V(2) = 0.5 - 0.3
+    assert np.isclose(advantages[3], -0.4) # Terminal: 0.0 - V(3)
+    assert np.isclose(advantages[4], -0.5) # Terminal: 0.0 - V(4)
+    # Ep 1:
+    assert np.isclose(advantages[5], 0.4)  # V(7) - V(5) = 0.6 - 0.2
+    assert np.isnan(advantages[6])         # Future frame (8) missing/corrupt -> NaN
+    assert np.isclose(advantages[7], 0.2)  # V(9) - V(7) = 0.8 - 0.6
+    assert np.isnan(advantages[8])         # Current frame (8) missing/corrupt -> NaN
+    assert np.isclose(advantages[9], -0.8) # Terminal: 0.0 - V(9)
 
-    # Task 1 valid advantages: [0.2, 0.2, 0.2, -0.4, -0.5]
+    # Threshold = 30th percentile of valid (non-NaN, successful) advantages per task.
+    task_thresholds = task_thresholds_from_advantages(advantages, meta_by_idx)
     expected_t1 = float(np.percentile([-0.5, -0.4, 0.2, 0.2, 0.2], 30))
     assert np.isclose(task_thresholds[1], expected_t1)
-
-    # Task 2 valid advantages: [0.4, 0.2, -0.8] (excluding NaNs at indices 6 and 8)
     expected_t2 = float(np.percentile([-0.8, 0.2, 0.4], 30))
     assert np.isclose(task_thresholds[2], expected_t2)
+
+
+def test_nstep_td_advantages_includes_reward_term():
+    """The full N-step TD advantage must include the return (reward) terms:
+    A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})."""
+    from lerobot_policy_smolvla_rl.advantage_utils import nstep_td_advantages
+
+    episode_lengths = np.array([4])
+    ep_from = np.array([0])
+    vs_by_idx = {0: 0.1, 1: 0.3, 2: 0.5, 3: 0.2}
+    meta_by_idx = {0: (0, 0, 0), 1: (0, 1, 0), 2: (0, 2, 0), 3: (0, 3, 0)}
+    returns_by_idx = {0: -0.9, 1: -0.6, 2: -0.3, 3: 0.0}
+
+    advantages = nstep_td_advantages(
+        vs_by_idx, returns_by_idx, meta_by_idx, ep_from,
+        episode_lengths, advantage_horizon=2, size=4,
+    )
+
+    # Frame 0: (R_0 - V_0) - (R_2 - V_2) = (-0.9 - 0.1) - (-0.3 - 0.5) = -1.0 + 0.8
+    assert np.isclose(advantages[0], -0.2)
+    # Frame 1: (R_1 - V_1) - (R_3 - V_3) = (-0.6 - 0.3) - (0.0 - 0.2) = -0.9 + 0.2
+    assert np.isclose(advantages[1], -0.7)
+    # Frame 2: future frame 4 >= episode end -> MC: R_2 - V_2 = -0.3 - 0.5
+    assert np.isclose(advantages[2], -0.8)
+    # Frame 3: terminal -> MC: R_3 - V_3 = 0.0 - 0.2
+    assert np.isclose(advantages[3], -0.2)

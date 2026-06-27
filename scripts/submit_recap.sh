@@ -1,16 +1,22 @@
 #!/bin/bash
-# Wrapper script to train the RECAP policy on Slurm
-# Usage: ./scripts/submit_recap.sh <dataset_repo_id> <critic_checkpoint> [--partition <partition>] [--num-gpus <n>] [additional_args...]
+# Wrapper script to train the RECAP policy on Slurm.
+#
+# train_recap.py consumes PRE-COMPUTED advantages — it does not run the critic.
+# Generate them first with scripts/compute_advantages.sh (writes
+# task_advantages_<repo>.npy / task_thresholds_<repo>.json into the save dir),
+# or pass --expert_mode to skip advantage conditioning entirely.
+#
+# Usage: ./scripts/submit_recap.sh <dataset_repo_id> [--partition <partition>] [--num-gpus <n>] [additional_args...]
 
 DATASET=$1
-CRITIC_CHECKPOINT=$2
 
-if [ -z "$DATASET" ] || [ -z "$CRITIC_CHECKPOINT" ]; then
-    echo "Usage: ./scripts/submit_recap.sh <dataset_repo_id> <critic_checkpoint> [--partition <partition>] [--num-gpus <n>] [additional_args...]"
+if [ -z "$DATASET" ]; then
+    echo "Usage: ./scripts/submit_recap.sh <dataset_repo_id> [--partition <partition>] [--num-gpus <n>] [additional_args...]"
+    echo "Note: run scripts/compute_advantages.sh first (unless using --expert_mode)."
     exit 1
 fi
 
-shift 2
+shift 1
 
 # Defaults
 PARTITION=""
@@ -50,6 +56,5 @@ SBATCH_ARGS=("--gres=gpu:${NUM_GPUS}")
 sbatch "${SBATCH_ARGS[@]}" scripts/train_slurm.sh \
     src/lerobot_policy_smolvla_rl/train_recap.py \
     --dataset_repo_id "$DATASET" \
-    --critic_checkpoint "$CRITIC_CHECKPOINT" \
     --job_name "$JOB_NAME" \
     "$EXTRA_ARGS"

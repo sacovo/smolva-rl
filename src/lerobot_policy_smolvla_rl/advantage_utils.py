@@ -1,228 +1,274 @@
-import torch
+"""Advantage computation for RECAP (single source of truth).
+
+Implements the N-step TD advantage from the RECAP paper (arXiv:2511.14759,
+Appendix A-F):
+
+    A(o_t) = sum_{t'=t}^{t+N-1} r_{t'} + V(o_{t+N}) - V(o_t)
+
+Rewritten with the normalized per-task returns R_t = sum_{t'=t}^{T} r_{t'}
+(see ``ds_utils.calculate_returns``):
+
+    A(o_t) = (R_t - V(o_t)) - (R_{t+N} - V(o_{t+N}))
+
+When t+N reaches the end of the episode the future terms vanish and the
+expression degenerates to the Monte-Carlo advantage R_t - V(o_t).  Setting the
+horizon N >= the longest episode therefore reproduces the pre-training
+(full Monte-Carlo) regime of the paper, while N = 50 reproduces the
+task-specific post-training regime.
+
+This module exposes two pure, easily testable helpers
+(``nstep_td_advantages`` and ``task_thresholds_from_advantages``) plus a single
+orchestrator (``precompute_advantages_and_thresholds``) that runs the critic and
+ties them together.  All advantage computation in the project flows through
+here so the formula can never drift between the offline script and the trainer.
+"""
+
 import json
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
 import os
+import time
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from lerobot_policy_smolvla_rl.dataloader_utils import RobustDataset
 from lerobot_policy_smolvla_rl.ds_utils import (
+    calculate_returns,
     get_episode_lengths,
     get_max_task_lengths,
-    calculate_returns as calculate_returns_fn,
+    load_success_flags,
 )
 
 
-class FutureFrameWrapper(Dataset):
-    def __init__(self, dataset, chunk_size):
-        self.dataset = dataset
-        self.chunk_size = chunk_size
-        self.episode_lengths = get_episode_lengths(dataset)
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        frame_idx = item["frame_index"].item()
-        ep_idx = item["episode_index"].item()
-        ep_len = self.episode_lengths[ep_idx].item()
-
-        future_frame = frame_idx + self.chunk_size
-        has_future = future_frame < ep_len
-
-        # We store has_future
-        item["has_future"] = torch.tensor(has_future, dtype=torch.bool)
-
-        if has_future:
-            future_item = self.dataset[idx + self.chunk_size]
-        else:
-            future_item = self.dataset[idx]
-
-        # Prefix future item keys
-        for k, v in list(future_item.items()):
-            if k != "has_future":
-                item[f"future_{k}"] = v
-
-        return item
-
-
-def extract_future_batch(batch):
-    """
-    Extracts the future items prefixed with 'future_' into a separate batch dictionary.
-    """
-    future_batch = {}
-    for k in list(batch.keys()):
-        if k.startswith("future_"):
-            future_batch[k[len("future_") :]] = batch[k]
-    return future_batch
+def _to_numpy(val):
+    if hasattr(val, "cpu"):
+        val = val.cpu()
+    if hasattr(val, "numpy"):
+        return val.numpy()
+    return np.array(val)
 
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments
-def compute_temporal_advantage(
-    critic, pre_critic, batch, future_batch, support, has_future,
-    actual_returns=None, future_returns=None,
+def nstep_td_advantages(
+    vs_by_idx,
+    returns_by_idx,
+    meta_by_idx,
+    ep_from,
+    episode_lengths,
+    advantage_horizon,
+    size=None,
 ):
+    """Vectorized-per-frame N-step TD advantage A_t = (R_t - V_t) - (R_{t+N} - V_{t+N}).
+
+    Everything is keyed by the dataset's absolute frame index so that skipped
+    (corrupt) samples simply have no entry and end up as NaN.
+
+    Parameters
+    ----------
+    vs_by_idx, returns_by_idx:
+        dict[abs_index -> float] of V(o_t) and normalized return R_t.
+    meta_by_idx:
+        dict[abs_index -> (episode_index, frame_index, task_index)].
+    ep_from:
+        array where ``ep_from[ep]`` is the absolute index of the first frame of
+        episode ``ep`` (``dataset.meta.episodes["dataset_from_index"]``).
+    episode_lengths:
+        array indexed by episode index.
+    advantage_horizon:
+        N, the lookahead.  Use a value >= the longest episode for the
+        Monte-Carlo (pre-training) regime.
+    size:
+        Length of the returned dense array.  Defaults to ``max(index) + 1``.
+
+    Returns
+    -------
+    np.ndarray[size] float32, NaN where the frame or its future frame is
+    corrupt/unreachable.
     """
-    Computes the N-step TD advantage per the pi0.6 paper:
-    A(s_t) = sum(r_{t:t+N-1}) + V(s_{t+N}) - V(s_t)
+    if size is None:
+        size = (max(meta_by_idx) + 1) if meta_by_idx else 0
+    advantages = np.full(size, np.nan, dtype=np.float32)
 
-    Rewritten using actual returns:
-    A(s_t) = (R_t - V(s_t)) - (R_{t+N} - V(s_{t+N}))
+    for idx, v_t in vs_by_idx.items():
+        ep_idx, frame_idx, _ = meta_by_idx[idx]
+        mc_error_current = returns_by_idx[idx] - v_t
 
-    When actual_returns / future_returns are None, falls back to the
-    pure temporal difference V(s_{t+N}) - V(s_t) (no reward sum).
+        future_frame = frame_idx + advantage_horizon
+        if future_frame >= episode_lengths[ep_idx]:
+            # Past episode end: future terms are zero -> Monte-Carlo advantage.
+            advantages[idx] = mc_error_current
+        else:
+            future_idx = int(ep_from[ep_idx]) + future_frame
+            if future_idx in vs_by_idx:
+                mc_error_future = returns_by_idx[future_idx] - vs_by_idx[future_idx]
+                advantages[idx] = mc_error_current - mc_error_future
+            # else: future frame corrupt/unreachable -> leave NaN.
 
-    If not has_future (end of episode), both R_{t+N} and V(s_{t+N})
-    are 0, so A(s_t) = R_t - V(s_t)  (Monte Carlo advantage).
+    return advantages
+
+
+def task_thresholds_from_advantages(
+    advantages, meta_by_idx, success_flags=None, percentile=30
+):
+    """Per-task advantage threshold ε_ℓ as a percentile of positive-advantage data.
+
+    Failed episodes and NaN (corrupt) frames are excluded.  A task with no
+    valid frames defaults to a threshold of 0.0.
     """
-    # 1. Current V(s_t)
-    critic_batch = pre_critic(batch)
-    _, probs = critic(critic_batch)
-    v_s = (probs * support).sum(dim=-1)
+    valid_tasks = []
+    valid_advs = []
+    all_tasks = []
+    for idx in meta_by_idx:
+        ep_idx, _, task_idx = meta_by_idx[idx]
+        all_tasks.append(task_idx)
+        is_success = success_flags is None or bool(success_flags[ep_idx].item())
+        if is_success and not np.isnan(advantages[idx]):
+            valid_tasks.append(task_idx)
+            valid_advs.append(advantages[idx])
 
-    # 2. Future V(s_{t+chunk_size})
-    future_critic_batch = pre_critic(future_batch)
-    _, future_probs = critic(future_critic_batch)
-    v_s_future = (future_probs * support).sum(dim=-1)
+    valid_tasks = np.array(valid_tasks, dtype=np.int64)
+    valid_advs = np.array(valid_advs, dtype=np.float32)
 
-    # Where not has_future, v_s_future should be 0.0
-    v_s_future = torch.where(has_future, v_s_future, torch.zeros_like(v_s_future))
-
-    if actual_returns is not None and future_returns is not None:
-        # N-step TD advantage: (R_t - V_t) - (R_{t+N} - V_{t+N})
-        future_returns = torch.where(has_future, future_returns, torch.zeros_like(future_returns))
-        mc_error_current = actual_returns - v_s
-        mc_error_future = future_returns - v_s_future
-        advantage = mc_error_current - mc_error_future
-    else:
-        # Fallback: pure temporal difference (no reward sum)
-        advantage = v_s_future - v_s
-
-    return advantage, v_s, v_s_future
+    task_thresholds = {}
+    for t in np.unique(np.array(all_tasks, dtype=np.int64)):
+        task_advs = valid_advs[valid_tasks == t]
+        if len(task_advs) == 0:
+            task_thresholds[int(t)] = 0.0
+        else:
+            task_thresholds[int(t)] = float(np.percentile(task_advs, percentile))
+    return task_thresholds
 
 
 # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
-def get_task_thresholds(
-    critic_model,
+def precompute_advantages_and_thresholds(
+    critic,
     dataset,
-    support,
-    chunk_size,
-    save_path,
+    *,
+    advantage_horizon,
     device="cuda",
     batch_size=8,
-    num_workers=4,
+    num_workers=0,
+    skip_bad_samples=True,
+    percentile=30,
+    delay=0.0,
 ):
-    """
-    Computes or loads task-specific advantage thresholds (epsilon_l).
-    Uses the pi0.6 N-step TD advantage:
-    A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})
-    """
+    """Run the critic over the whole dataset and compute N-step TD advantages.
 
-    if os.path.exists(save_path):
-        print(f"Loading advantage thresholds from {save_path}")
-        with open(save_path, "r", encoding="utf-8") as f:
-            str_keys = json.load(f)
-            return {int(k): v for k, v in str_keys.items()}
+    Returns ``(advantages, task_thresholds)`` where ``advantages`` is a dense
+    float32 array indexed by absolute frame index (NaN for corrupt/unreachable
+    frames) and ``task_thresholds`` maps task_index -> ε_ℓ.
+    """
+    critic.eval()
+    critic.to(device)
 
-    print("Computing V(s_t) for all frames to determine thresholds...")
+    support = torch.linspace(
+        critic.config.vmin,
+        critic.config.vmax,
+        critic.config.num_bins,
+        device=device,
+    )
+    pre_critic = critic.get_pre_processor(dataset)
+
+    episode_lengths = get_episode_lengths(dataset)
+    max_lengths = get_max_task_lengths(dataset)
+    ep_from = np.array(dataset.meta.episodes["dataset_from_index"])
+    success_flags = load_success_flags(dataset)
+
+    loader_dataset = RobustDataset(dataset) if skip_bad_samples else dataset
     dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+        loader_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
     )
 
-    pre_critic = critic_model.get_pre_processor(dataset)
-    all_vs_list = []
-    all_tasks_list = []
-    all_episodes_list = []
-    all_frames_list = []
-
-    critic_model.eval()
-    # Move critic to correct device just in case
-    critic_model.to(device)
+    # abs_index -> V(o_t) and abs_index -> (episode, frame, task)
+    vs_by_idx: dict[int, float] = {}
+    meta_by_idx: dict[int, tuple[int, int, int]] = {}
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Predicting V(s)"):
-            # Move relevant parts to device if not already
             critic_batch = pre_critic(batch)
             for k, v in critic_batch.items():
                 if isinstance(v, torch.Tensor):
                     critic_batch[k] = v.to(device)
-                elif isinstance(v, list) and isinstance(v[0], torch.Tensor):
+                elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], torch.Tensor):
                     critic_batch[k] = [t.to(device) for t in v]
 
-            _, probs = critic_model(critic_batch)
+            _, probs = critic(critic_batch)
             v_s = (probs * support).sum(dim=-1).cpu().numpy()
 
-            def to_numpy(val):
-                if hasattr(val, "cpu"):
-                    val = val.cpu()
-                if hasattr(val, "numpy"):
-                    return val.numpy()
-                return np.array(val)
+            sample_indices = _to_numpy(batch["index"])
+            episode_indices = _to_numpy(batch["episode_index"])
+            frame_indices = _to_numpy(batch["frame_index"])
+            task_indices = _to_numpy(batch["task_index"])
 
-            all_vs_list.append(v_s)
-            all_tasks_list.append(to_numpy(batch["task_index"]))
-            all_episodes_list.append(to_numpy(batch["episode_index"]))
-            all_frames_list.append(to_numpy(batch["frame_index"]))
+            for idx, v, ep, fr, task in zip(
+                sample_indices, v_s, episode_indices, frame_indices, task_indices
+            ):
+                vs_by_idx[int(idx)] = float(v)
+                meta_by_idx[int(idx)] = (int(ep), int(fr), int(task))
 
-    all_vs = np.concatenate(all_vs_list)
-    all_tasks = np.concatenate(all_tasks_list)
-    all_episodes = np.concatenate(all_episodes_list)
-    all_frames = np.concatenate(all_frames_list)
+            if delay > 0:
+                time.sleep(delay)
 
-    ep_lengths = get_episode_lengths(dataset)
-    max_lengths = get_max_task_lengths(dataset)
+    n_seen = len(vs_by_idx)
+    n_skipped = len(dataset) - n_seen
+    if n_skipped > 0:
+        print(
+            f"  {n_skipped} / {len(dataset)} samples skipped (corrupt). "
+            "Their advantages stay NaN (treated as neutral 0 during training)."
+        )
 
-    # Load success flags for return calculation
-    if "success" in dataset.meta.episodes.column_names:
-        success_col = dataset.meta.episodes["success"]
-        success_list = success_col.to_pylist() if hasattr(success_col, "to_pylist") else list(success_col)
-        success_flags = torch.tensor(success_list, dtype=torch.bool)
-    else:
-        success_flags = None
-
-    # Precompute actual normalized returns for all frames (vectorized)
-    all_returns = calculate_returns_fn(
-        ep_lengths,
+    # Normalized returns R_t for every frame that has metadata.
+    sorted_indices = sorted(meta_by_idx.keys())
+    all_ep_idxs = torch.tensor([meta_by_idx[i][0] for i in sorted_indices], dtype=torch.long)
+    all_frame_idxs = torch.tensor([meta_by_idx[i][1] for i in sorted_indices], dtype=torch.long)
+    all_task_idxs = torch.tensor([meta_by_idx[i][2] for i in sorted_indices], dtype=torch.long)
+    all_returns = calculate_returns(
+        episode_lengths,
         max_lengths,
-        torch.tensor(all_tasks.astype(np.int64)),
-        torch.tensor(all_episodes.astype(np.int64)),
-        torch.tensor(all_frames.astype(np.int64)),
+        all_task_idxs,
+        all_ep_idxs,
+        all_frame_idxs,
         success_flags=success_flags,
-    ).numpy()
+    )
+    returns_by_idx = {idx: float(r) for idx, r in zip(sorted_indices, all_returns)}
 
-    # Compute N-step TD advantages: A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})
-    advantages = np.zeros(len(dataset), dtype=np.float32)
-    ep_lengths_np = ep_lengths.numpy()
-    for i in range(len(dataset)):
-        ep_idx = int(all_episodes[i])
-        frame_idx = int(all_frames[i])
-        ep_len = ep_lengths_np[ep_idx]
+    size = getattr(dataset.meta, "total_frames", None)
+    if size is None:
+        size = (max(meta_by_idx) + 1) if meta_by_idx else len(dataset)
 
-        v_current = all_vs[i]
-        r_current = all_returns[i]
-        mc_error_current = r_current - v_current
+    advantages = nstep_td_advantages(
+        vs_by_idx,
+        returns_by_idx,
+        meta_by_idx,
+        ep_from,
+        episode_lengths.numpy(),
+        advantage_horizon,
+        size=int(size),
+    )
 
-        future_frame = frame_idx + chunk_size
-        if future_frame >= ep_len:
-            # Past episode end: MC advantage
-            advantages[i] = mc_error_current
-        else:
-            # N-step TD advantage
-            future_idx = i + chunk_size
-            mc_error_future = all_returns[future_idx] - all_vs[future_idx]
-            advantages[i] = mc_error_current - mc_error_future
+    task_thresholds = task_thresholds_from_advantages(
+        advantages, meta_by_idx, success_flags=success_flags, percentile=percentile
+    )
 
-    # 3. Calculate 30th percentile per task
-    task_thresholds = {}
-    unique_tasks = np.unique(all_tasks)
-    for t in unique_tasks:
-        task_advs = advantages[all_tasks == t]
-        threshold = np.percentile(task_advs, 30)
-        task_thresholds[int(t)] = float(threshold)
+    return advantages, task_thresholds
 
-    # Save to JSON
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, "w", encoding="utf-8") as f:
+
+def save_advantages_and_thresholds(
+    advantages, task_thresholds, advantages_path, thresholds_path
+):
+    """Persist the advantage array (.npy) and per-task thresholds (.json)."""
+    os.makedirs(os.path.dirname(advantages_path), exist_ok=True)
+    np.save(advantages_path, advantages)
+    with open(thresholds_path, "w", encoding="utf-8") as f:
         json.dump(task_thresholds, f, indent=2)
 
-    print(f"Saved thresholds to {save_path}")
-    return task_thresholds
+
+def load_thresholds(thresholds_path):
+    """Load per-task thresholds from JSON with integer task keys."""
+    with open(thresholds_path, "r", encoding="utf-8") as f:
+        return {int(k): v for k, v in json.load(f).items()}

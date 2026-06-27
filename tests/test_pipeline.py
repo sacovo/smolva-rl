@@ -58,6 +58,39 @@ def test_critic_training(critic_checkpoint_path):
 
 def test_recap_training(critic_checkpoint_path):
     save_dir = "outputs/test_recap_pytest"
+
+    env = os.environ.copy()
+    env["WANDB_MODE"] = "offline"
+
+    # Step 1: pre-compute advantages + thresholds with the critic (train_recap
+    # itself no longer runs the critic — it only consumes the saved files).
+    precompute_cmd = [
+        sys.executable,
+        "src/lerobot_policy_smolvla_rl/compute_thresholds.py",
+        "--dataset_repo_id",
+        DATASET_REPO_ID,
+        "--critic_checkpoint",
+        critic_checkpoint_path,
+        "--episodes",
+        str(EPISODE_INDEX),
+        "--advantage_horizon",
+        "5",
+        "--num_vlm_layers",
+        "1",
+        "--batch_size",
+        "1",
+        "--num_workers",
+        "0",
+        "--save_dir",
+        save_dir,
+    ]
+    subprocess.run(precompute_cmd, check=True, env=env)
+
+    safe_repo = DATASET_REPO_ID.replace("/", "_")
+    assert os.path.exists(os.path.join(save_dir, f"task_advantages_{safe_repo}.npy"))
+    assert os.path.exists(os.path.join(save_dir, f"task_thresholds_{safe_repo}.json"))
+
+    # Step 2: train consuming the pre-computed files (no critic checkpoint).
     cmd = [
         sys.executable,
         "src/lerobot_policy_smolvla_rl/train_recap.py",
@@ -67,15 +100,11 @@ def test_recap_training(critic_checkpoint_path):
         str(EPISODE_INDEX),
         "--action_chunk_size",
         "20",
-        "--critic_checkpoint",
-        critic_checkpoint_path,
         "--steps",
         "1",
         "--batch_size",
         "1",
         "--num_vlm_layers",
-        "1",
-        "--critic_num_vlm_layers",
         "1",
         "--save_dir",
         save_dir,
@@ -84,9 +113,6 @@ def test_recap_training(critic_checkpoint_path):
         "--num_workers",
         "0",
     ]
-
-    env = os.environ.copy()
-    env["WANDB_MODE"] = "offline"
 
     subprocess.run(cmd, check=True, env=env)
     # The script saves state using accelerator.save_state which creates a directory

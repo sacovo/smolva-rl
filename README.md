@@ -47,5 +47,12 @@ The RECAP training pipeline consists of three phases:
 3. **Phase 3: Rollout and Policy Enhancement**:
    - Collects rollout data (e.g. using `scripts/record_eval.py`) with expert/human interventions. Success outcomes are saved in the episode-level metadata (`success` column in `meta/episodes.parquet`).
    - **Critic Finetuning**: Run `train_critic.py`. Failed episodes are penalized with a terminal penalty of `-C_FAIL` (normalized to push them to the lowest value bin `0`).
-   - **Policy Enhancement**: Run `train_recap.py` (without `--expert_mode`). Advantage is determined using the critic. Any frames with human/expert interventions (`batch["intervention"] == True`) automatically override the critic and receive a positive advantage signal (`advantage_bool = True`).
+   - **Advantage Pre-computation**: Run `compute_thresholds.py` with the trained critic to pre-compute the N-step TD advantages and per-task thresholds (paper Appendix A-F: `A_t = Σ r_{t..t+N-1} + V(o_{t+N}) − V(o_t)`, with `--advantage_horizon N` defaulting to 50). This writes `task_advantages_<repo>.npy` and `task_thresholds_<repo>.json` into `--save_dir`.
+     ```bash
+     python src/lerobot_policy_smolvla_rl/compute_thresholds.py \
+         --dataset_repo_id <dataset_id> \
+         --critic_checkpoint <critic.pt> \
+         --save_dir outputs/recap_phase1
+     ```
+   - **Policy Enhancement**: Run `train_recap.py` (without `--expert_mode`) pointing `--save_dir` (or `--precomputed_advantages`/`--thresholds_path`) at those files. The trainer only consumes the pre-computed advantages — it never runs the critic itself, and exits with an error if the files are missing. Any frames with human/expert interventions (`batch["intervention"] == True`) override the threshold and receive a positive advantage signal (`advantage_bool = True`).
 

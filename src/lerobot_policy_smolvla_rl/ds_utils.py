@@ -37,6 +37,26 @@ def get_episode_lengths(dataset: LeRobotDataset):
     return torch.tensor(dataset.meta.episodes["length"])
 
 
+def load_success_flags(dataset: LeRobotDataset, default_all_success: bool = False):
+    """Load per-episode success flags from dataset metadata.
+
+    Returns a bool tensor of shape [num_episodes], or ``None`` when the dataset
+    has no ``success`` column and ``default_all_success`` is False.  When
+    ``default_all_success`` is True, a missing column yields an all-True tensor.
+    """
+    if "success" in dataset.meta.episodes.column_names:
+        success_col = dataset.meta.episodes["success"]
+        success_list = (
+            success_col.to_pylist()
+            if hasattr(success_col, "to_pylist")
+            else list(success_col)
+        )
+        return torch.tensor(success_list, dtype=torch.bool)
+    if default_all_success:
+        return torch.ones(len(dataset.meta.episodes), dtype=torch.bool)
+    return None
+
+
 # pylint: disable=too-many-arguments,too-many-positional-arguments
 def calculate_returns(
     episode_lengths,

@@ -33,10 +33,12 @@ def parse_args():
         help="Path to the model checkpoint (.pt file)",
     )
     parser.add_argument(
-        "--action_chunk_size",
+        "--advantage_horizon",
         type=int,
-        default=1,
-        help="Number of frames to predict (chunk size) to compute temporal advantage",
+        default=50,
+        help="N-step TD lookahead (N) for the advantage (paper uses N=50, must "
+        "match compute_thresholds.py). Use a value >= the longest episode for "
+        "the Monte-Carlo (pre-training) regime.",
     )
     parser.add_argument(
         "--epsilon_l",
@@ -237,8 +239,17 @@ def main():
         )
         T = len(all_expected_values)
 
-        # Monte Carlo advantage: A_t = R_t - V(s_t)
-        advantages = all_gt_values - all_expected_values
+        # N-step TD advantage (paper Appendix A-F, same formula as
+        # advantage_utils.nstep_td_advantages):
+        #   A_t = (R_t - V_t) - (R_{t+N} - V_{t+N})
+        # Degenerates to the Monte-Carlo advantage R_t - V_t once t+N reaches
+        # the episode end (the future terms vanish).
+        mc_error = all_gt_values - all_expected_values  # R_t - V_t
+        advantages = mc_error.copy()
+        N = args.advantage_horizon
+        if N < T:
+            advantages[:-N] = mc_error[:-N] - mc_error[N:]
+            # advantages[-N:] stay Monte-Carlo (future frame past episode end)
         res["advantages"] = advantages
 
         task_idx = res["task_index"]
