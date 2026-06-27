@@ -189,6 +189,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
     # Test on a subset of frames in Episode 0 (e.g. step 0, 10, 20, 30, 40, 50, 60, 70)
     test_indices = list(range(from_idx, to_idx, 10))
     for idx in test_indices:
+        eval_policy.reset()
         sample = dataset[idx]
         
         # Simulating environment observation (raw coordinates)
