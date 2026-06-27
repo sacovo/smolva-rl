@@ -205,6 +205,8 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
         with torch.no_grad():
             batch_copy = {k: v for k, v in preprocessed.items()}
             pred = eval_policy.select_action(batch_copy, cfg_weight=1.0)
+            # Unnormalize prediction to match raw coordinate space of gt_action
+            pred = postprocessor(pred)
             if isinstance(pred, torch.Tensor):
                 pred = pred.cpu().numpy()
                 
