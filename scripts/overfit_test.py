@@ -18,7 +18,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 
-def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250):
+def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250, lr=1e-4):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running overfit test on: {device}")
     
@@ -83,7 +83,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
         model.load_state_dict(clean_sd, strict=False)
     
     model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     
     # 3. Training Loop (Overfitting)
     print("Starting training...")
@@ -241,6 +241,7 @@ if __name__ == '__main__':
     parser.add_argument("--pretrained_model", type=str, default="outputs/policies/recap_libero_pretrained")
     parser.add_argument("--output_dir", type=str, default="outputs/overfit_test")
     parser.add_argument("--steps", type=int, default=250)
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
     args = parser.parse_args()
     
-    run_overfit_test(args.dataset, args.pretrained_model, args.output_dir, args.steps)
+    run_overfit_test(args.dataset, args.pretrained_model, args.output_dir, args.steps, args.lr)
