@@ -109,13 +109,20 @@ def nstep_td_advantages(
 
 
 def task_thresholds_from_advantages(
-    advantages, meta_by_idx, success_flags=None, percentile=30
+    advantages, meta_by_idx, success_flags=None, positive_fraction=0.3
 ):
-    """Per-task advantage threshold ε_ℓ as a percentile of positive-advantage data.
+    """Per-task advantage threshold ε_ℓ.
+
+    The threshold is set so that approximately ``positive_fraction`` of valid
+    frames have a positive label (advantage > ε_ℓ), matching the paper
+    (~30% positive for pre-training data, ~40% for rollout iterations).  This
+    corresponds to the ``100 * (1 - positive_fraction)`` percentile of the
+    advantage distribution — e.g. positive_fraction=0.3 -> 70th percentile.
 
     Failed episodes and NaN (corrupt) frames are excluded.  A task with no
     valid frames defaults to a threshold of 0.0.
     """
+    pct = 100.0 * (1.0 - positive_fraction)
     valid_tasks = []
     valid_advs = []
     all_tasks = []
@@ -136,7 +143,7 @@ def task_thresholds_from_advantages(
         if len(task_advs) == 0:
             task_thresholds[int(t)] = 0.0
         else:
-            task_thresholds[int(t)] = float(np.percentile(task_advs, percentile))
+            task_thresholds[int(t)] = float(np.percentile(task_advs, pct))
     return task_thresholds
 
 
@@ -150,7 +157,7 @@ def precompute_advantages_and_thresholds(
     batch_size=8,
     num_workers=0,
     skip_bad_samples=True,
-    percentile=30,
+    positive_fraction=0.3,
     delay=0.0,
 ):
     """Run the critic over the whole dataset and compute N-step TD advantages.
@@ -252,7 +259,10 @@ def precompute_advantages_and_thresholds(
     )
 
     task_thresholds = task_thresholds_from_advantages(
-        advantages, meta_by_idx, success_flags=success_flags, percentile=percentile
+        advantages,
+        meta_by_idx,
+        success_flags=success_flags,
+        positive_fraction=positive_fraction,
     )
 
     return advantages, task_thresholds

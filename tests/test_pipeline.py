@@ -139,8 +139,13 @@ def test_visualization(critic_checkpoint_path):
     ]
 
     subprocess.run(cmd, check=True)
-    plot_path = os.path.join(output_dir, f"episode_{EPISODE_INDEX}_critic.png")
-    assert os.path.exists(plot_path)
+    # Filename now embeds the dataset + checkpoint tags, so match by prefix.
+    import glob
+
+    matches = glob.glob(
+        os.path.join(output_dir, f"episode_{EPISODE_INDEX}_critic_*.png")
+    )
+    assert matches, f"No critic plot for episode {EPISODE_INDEX} in {output_dir}"
 
 
 def test_ds_utils():

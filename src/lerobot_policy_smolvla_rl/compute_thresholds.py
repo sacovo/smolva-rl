@@ -53,6 +53,14 @@ def parse_args():
         "Monte-Carlo (pre-training) regime.",
     )
     parser.add_argument(
+        "--positive_fraction",
+        type=float,
+        default=0.3,
+        help="Target fraction of frames labeled positive (advantage > epsilon_l). "
+        "The per-task threshold is set to the 100*(1-positive_fraction) "
+        "percentile. Paper: ~0.3 for pre-training data, ~0.4 for rollouts.",
+    )
+    parser.add_argument(
         "--save_dir", type=str, default="outputs/recap_phase1", help="Output directory"
     )
     parser.add_argument(
@@ -142,6 +150,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         skip_bad_samples=args.skip_bad_samples,
+        positive_fraction=args.positive_fraction,
         delay=args.delay,
     )
 

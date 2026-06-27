@@ -323,12 +323,19 @@ def test_nstep_td_advantages_pure_td():
     assert np.isnan(advantages[8])         # Current frame (8) missing/corrupt -> NaN
     assert np.isclose(advantages[9], -0.8) # Terminal: 0.0 - V(9)
 
-    # Threshold = 30th percentile of valid (non-NaN, successful) advantages per task.
+    # Default positive_fraction=0.3 -> threshold is the 70th percentile of
+    # valid (non-NaN, successful) advantages per task, so ~30% land positive.
     task_thresholds = task_thresholds_from_advantages(advantages, meta_by_idx)
-    expected_t1 = float(np.percentile([-0.5, -0.4, 0.2, 0.2, 0.2], 30))
+    expected_t1 = float(np.percentile([-0.5, -0.4, 0.2, 0.2, 0.2], 70))
     assert np.isclose(task_thresholds[1], expected_t1)
-    expected_t2 = float(np.percentile([-0.8, 0.2, 0.4], 30))
+    expected_t2 = float(np.percentile([-0.8, 0.2, 0.4], 70))
     assert np.isclose(task_thresholds[2], expected_t2)
+
+    # And explicit positive_fraction is honored (0.6 positive -> 40th percentile).
+    t60 = task_thresholds_from_advantages(
+        advantages, meta_by_idx, positive_fraction=0.6
+    )
+    assert np.isclose(t60[1], float(np.percentile([-0.5, -0.4, 0.2, 0.2, 0.2], 40)))
 
 
 def test_nstep_td_advantages_includes_reward_term():
