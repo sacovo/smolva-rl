@@ -64,6 +64,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
         input_features=policy_cfg.input_features,
         device=device,
         use_advantage_conditioning=True,
+        adv_dropout_rate=0.0,
     )
     model_config.output_features = policy_cfg.output_features
     
@@ -103,14 +104,16 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
             advantage_bool = [True] * batch["observation.state"].shape[0]
             
             optimizer.zero_grad()
-            loss, fm_loss, consistency_loss = model.compute_loss(batch, advantage=advantage_bool)
+            loss, ar_loss, flow_loss = model.compute_loss(batch, advantage=advantage_bool)
             loss.backward()
             optimizer.step()
             
             loss_val = float(loss.item())
+            ar_val = float(ar_loss.item())
+            flow_val = float(flow_loss.item())
             results["losses"].append({"step": step, "loss": loss_val})
             if step % 25 == 0:
-                print(f"Step {step}/{steps} - Loss: {loss_val:.4f}")
+                print(f"Step {step}/{steps} - Loss: {loss_val:.4f} (AR: {ar_val:.4f}, FM: {flow_val:.4f})")
             step += 1
             
     # 4. Save Temporary Exported Model
@@ -130,6 +133,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
         chunk_size=policy_cfg.chunk_size,
         n_action_steps=1,
         device="cpu",
+        adv_dropout_rate=0.0,
     )
     export_config.output_features = policy_cfg.output_features
     
