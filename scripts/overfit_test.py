@@ -32,7 +32,18 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
     
     # 1. Load Dataset and slice Episode 0
     print("Loading dataset...")
-    dataset = LeRobotDataset(dataset_name)
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+    from lerobot.datasets.factory import resolve_delta_timestamps
+    from lerobot_policy_smolvla_rl import SmolVLARECAPConfig
+    
+    ds_meta = LeRobotDatasetMetadata(dataset_name)
+    policy_cfg = PreTrainedConfig.from_pretrained(pretrained_model_path)
+    policy_cfg.device = device
+    
+    dummy_config = SmolVLARECAPConfig(chunk_size=policy_cfg.chunk_size, n_action_steps=1)
+    delta_timestamps = resolve_delta_timestamps(dummy_config, ds_meta)
+    
+    dataset = LeRobotDataset(dataset_name, delta_timestamps=delta_timestamps)
     
     from_idx = int(dataset.meta.episodes[0]["dataset_from_index"])
     to_idx = int(dataset.meta.episodes[0]["dataset_to_index"])
@@ -43,9 +54,6 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250)
     
     # 2. Initialize Model
     print(f"Loading base config/model from: {pretrained_model_path}")
-    # Load config
-    policy_cfg = PreTrainedConfig.from_pretrained(pretrained_model_path)
-    policy_cfg.device = device
     
     # Instantiate the model directly for training
     from lerobot_policy_smolvla_rl import SmolVLARECAPConfig
