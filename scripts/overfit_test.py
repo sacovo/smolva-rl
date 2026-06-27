@@ -195,6 +195,7 @@ def run_overfit_test(dataset_name, pretrained_model_path, output_dir, steps=250,
         # Simulating environment observation (raw coordinates)
         batch = {
             "observation.images.image": sample["observation.images.image"].unsqueeze(0),
+            "observation.images.image2": sample["observation.images.image2"].unsqueeze(0),
             "observation.state": sample["observation.state"].unsqueeze(0),
             "task_index": sample["task_index"].unsqueeze(0),
             "task": [sample["task"]]
