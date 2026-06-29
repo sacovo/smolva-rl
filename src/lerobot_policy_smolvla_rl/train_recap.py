@@ -22,6 +22,7 @@ from lerobot_policy_smolvla_rl.checkpoint_utils import (
     parse_duration_to_seconds,
 )
 from lerobot_policy_smolvla_rl.advantage_utils import load_thresholds
+from lerobot_policy_smolvla_rl.ds_utils import load_success_flags
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +326,14 @@ def main():
             tolerance_s=args.tolerance_s,
             delta_timestamps=delta_timestamps,
         )
+
+    # Load per-episode success flags (written by the annotation server / bag converter).
+    # Defaults to all-True when the dataset has no success column so that datasets
+    # produced without success annotations still work unchanged.
+    success_flags = load_success_flags(dataset, default_all_success=True)
+    if success_flags is not None:
+        n_ok = success_flags.sum().item()
+        print(f"Loaded episode success flags: {n_ok}/{len(success_flags)} successful.")
 
     # 2. Resolve input/output features (with optional camera remapping)
     camera_map = {}
@@ -682,11 +691,16 @@ def main():
 
                         advantage_bool = (advantage > batch_thresholds).tolist()
 
-                        # Force positive advantage for expert/human interventions (Phase 3)
+                        # Force positive advantage for human intervention frames (Phase 3).
+                        # Only applied when the episode was successful — an intervention
+                        # in a failed episode should not be rewarded as advantageous.
                         if "intervention" in batch:
                             interventions = batch["intervention"].flatten().cpu().numpy()
-                            for idx, intervened in enumerate(interventions):
-                                if intervened:
+                            ep_indices = to_numpy(batch["episode_index"])
+                            for idx, (intervened, ep_idx) in enumerate(zip(interventions, ep_indices)):
+                                if intervened and (
+                                    success_flags is None or success_flags[int(ep_idx)]
+                                ):
                                     advantage_bool[idx] = True
 
                 # Prepare batch for RECAP (tokenization, normalization)
