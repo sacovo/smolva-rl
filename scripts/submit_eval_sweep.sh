@@ -15,9 +15,9 @@
 mkdir -p logs
 mkdir -p outputs/eval
 
-# Activate Conda environment
-export PATH="/home2/sandro.covo/conda/bin:$PATH"
-source activate lerobot-policy-smolvla-rl
+# Set up Conda environment paths
+export CONDA_PREFIX="/home2/sandro.covo/conda"
+export PATH="$CONDA_PREFIX/bin:$PATH"
 
 export PYTHONUNBUFFERED=1
 export LANG=C.UTF-8
