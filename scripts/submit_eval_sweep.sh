@@ -2,13 +2,13 @@
 #SBATCH --job-name=recap_eval_sweep
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=2
-#SBATCH --gres=gpu:1
-#SBATCH --time=04:00:00
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:h200:1
+#SBATCH --time=02:00:00
+#SBATCH --mem=64G
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-#SBATCH --partition=p4500
+#SBATCH --partition=h200
 #SBATCH --array=0-47
 
 # Create logs and outputs directories
@@ -26,6 +26,6 @@ echo "Array Task ID: $SLURM_ARRAY_TASK_ID"
 echo "Job ID: $SLURM_ARRAY_JOB_ID"
 
 # Run the single task from the array
-PYTHONPATH=src uv run python scratch/run_array_task.py
+PYTHONPATH=src uv run python scripts/run_array_task.py
 
 echo "Evaluation sweep array job finished at $(date)"
