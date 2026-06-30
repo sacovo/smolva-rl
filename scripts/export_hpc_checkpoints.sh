@@ -5,17 +5,17 @@ set -e
 # Make sure we are in the repo root
 cd "$(dirname "$0")/.."
 
-echo "Starting export for 150k checkpoint..."
+echo "Starting export for 150k checkpoint (checkpoint_tmp.pt)..."
 PYTHONPATH=src uv run scripts/export_recap_checkpoint.py \
-  --checkpoint_path outputs/libero_recap_150000.pt \
+  --checkpoint_path outputs/libero/recap_model/checkpoint_tmp.pt \
   --output_dir outputs/libero_recap_150000 \
   --dataset_repo_id HuggingFaceVLA/libero \
   --action_chunk_size 20 \
   --num_vlm_layers 16
 
-echo "Starting export for 250k checkpoint..."
+echo "Starting export for 250k checkpoint (checkpoint_tmp2.pt)..."
 PYTHONPATH=src uv run scripts/export_recap_checkpoint.py \
-  --checkpoint_path outputs/libero_recap_250000.pt \
+  --checkpoint_path outputs/libero/recap_model/checkpoint_tmp2.pt \
   --output_dir outputs/libero_recap_250000 \
   --dataset_repo_id HuggingFaceVLA/libero \
   --action_chunk_size 20 \
