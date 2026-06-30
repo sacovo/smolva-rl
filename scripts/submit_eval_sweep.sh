@@ -2,10 +2,10 @@
 #SBATCH --job-name=recap_eval_sweep
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=2
 #SBATCH --gres=gpu:1
 #SBATCH --time=04:00:00
-#SBATCH --mem=64G
+#SBATCH --mem=32G
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
 #SBATCH --partition=p4500
