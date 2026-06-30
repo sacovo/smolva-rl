@@ -15,8 +15,10 @@
 mkdir -p logs
 mkdir -p outputs/eval
 
-# Ensure uv is in PATH
-export PATH="$HOME/.local/bin:$PATH"
+# Activate Conda environment
+export PATH="/home2/sandro.covo/conda/bin:$PATH"
+source activate lerobot-policy-smolvla-rl
+
 export PYTHONUNBUFFERED=1
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
@@ -26,6 +28,6 @@ echo "Array Task ID: $SLURM_ARRAY_TASK_ID"
 echo "Job ID: $SLURM_ARRAY_JOB_ID"
 
 # Run the single task from the array
-PYTHONPATH=src uv run python scripts/run_array_task.py
+PYTHONPATH=src python scripts/run_array_task.py
 
 echo "Evaluation sweep array job finished at $(date)"

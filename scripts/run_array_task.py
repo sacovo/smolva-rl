@@ -108,7 +108,7 @@ def main():
         sys.exit(1)
 
     cmd = [
-        "PYTHONPATH=src", "uv", "run", "lerobot-eval",
+        "PYTHONPATH=src", "lerobot-eval",
         f"--policy.path={checkpoint_path}",
         "--env.type=libero",
         f"--env.task={suite}",
