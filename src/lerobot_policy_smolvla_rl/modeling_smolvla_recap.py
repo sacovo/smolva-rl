@@ -301,123 +301,138 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
             )
 
-        # 3. Embed prefix (images + language + state)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
+        # 3. Complete Knowledge Insulation for SnapFlow
+        # Freeze ALL VLM parameters during the FM/Consistency forward pass.
+        # This prevents the continuous action losses from leaking into the VLM backbone.
+        vlm_param_grad_states = {}
+        for name, param in self.vlm_with_expert.vlm.named_parameters():
+            vlm_param_grad_states[name] = param.requires_grad
+            param.requires_grad_(False)
 
-        # 4. Cache VLM prefix KV cache (once per batch)
-        prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
-            prefix_pad_masks, prefix_att_masks
-        )
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-            fill_kv_cache=True,
-        )
-
-        # Helper for expert forward
-        def expert_forward_fn(x_t, t, s):
-            suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-                x_t, t, target_time=s
+        try:
+            # Embed prefix (images + language + state)
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, state=state
             )
 
-            suffix_len = suffix_pad_masks.shape[1]
-            batch_size = prefix_pad_masks.shape[0]
-            prefix_len = prefix_pad_masks.shape[1]
-            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
-                batch_size, suffix_len, prefix_len
+            # 4. Cache VLM prefix KV cache (once per batch)
+            prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+                prefix_pad_masks, prefix_att_masks
             )
-
-            suffix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
-                suffix_pad_masks, suffix_att_masks
-            )
-
-            full_att_2d_masks = torch.cat(
-                [prefix_pad_2d_masks, suffix_att_2d_masks], dim=2
-            )
-            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-            outputs_embeds, _ = self.vlm_with_expert.forward(
-                attention_mask=full_att_2d_masks,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                inputs_embeds=[None, suffix_embs],
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            _, past_key_values = self.vlm_with_expert.forward(
+                attention_mask=prefix_att_2d_masks,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
                 use_cache=True,
-                fill_kv_cache=False,
+                fill_kv_cache=True,
             )
-            suffix_out = outputs_embeds[1]
-            suffix_out = suffix_out[:, -self.config.chunk_size :]
-            v_t = self.action_out_proj(
-                suffix_out.to(next(self.action_out_proj.parameters()).dtype)
+
+            # Helper for expert forward
+            def expert_forward_fn(x_t, t, s):
+                suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+                    x_t, t, target_time=s
+                )
+
+                suffix_len = suffix_pad_masks.shape[1]
+                batch_size = prefix_pad_masks.shape[0]
+                prefix_len = prefix_pad_masks.shape[1]
+                prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                    batch_size, suffix_len, prefix_len
+                )
+
+                suffix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+                    suffix_pad_masks, suffix_att_masks
+                )
+
+                full_att_2d_masks = torch.cat(
+                    [prefix_pad_2d_masks, suffix_att_2d_masks], dim=2
+                )
+                prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+                position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+                outputs_embeds, _ = self.vlm_with_expert.forward(
+                    attention_mask=full_att_2d_masks,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=[None, suffix_embs],
+                    use_cache=True,
+                    fill_kv_cache=False,
+                )
+                suffix_out = outputs_embeds[1]
+                suffix_out = suffix_out[:, -self.config.chunk_size :]
+                v_t = self.action_out_proj(
+                    suffix_out.to(next(self.action_out_proj.parameters()).dtype)
+                )
+                return v_t.to(torch.float32)
+
+            # 5. Extract actions
+            actions = batch[ACTION]
+            if actions.ndim == 2:
+                actions = actions.unsqueeze(1)
+
+            expert_dtype = self.vlm_with_expert.vlm.dtype
+            bsize = prefix_embs.shape[0]
+            device = prefix_embs.device
+            actions_fm = actions.to(device=device, dtype=expert_dtype)
+
+            # === Flow Matching Component ===
+            tau = torch.rand((bsize, 1), device=device, dtype=expert_dtype)
+            omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
+
+            tau_expanded = tau[:, :, None]
+            noised_actions = tau_expanded * omega + (1 - tau_expanded) * actions_fm
+            target_flow = omega - actions_fm
+
+            predicted_flow = expert_forward_fn(
+                noised_actions, tau.squeeze(1), tau.squeeze(1)
             )
-            return v_t.to(torch.float32)
 
-        # 5. Extract actions
-        actions = batch[ACTION]
-        if actions.ndim == 2:
-            actions = actions.unsqueeze(1)
+            pred_fm = predicted_flow
+            target_fm = target_flow
+            if self.config.loss_n_action_steps > 0:
+                n = self.config.loss_n_action_steps
+                pred_fm = pred_fm[:, :n]
+                target_fm = target_fm[:, :n]
+            fm_loss = F.mse_loss(pred_fm, target_fm)
 
-        expert_dtype = self.vlm_with_expert.vlm.dtype
-        bsize = prefix_embs.shape[0]
-        device = prefix_embs.device
-        actions_fm = actions.to(device=device, dtype=expert_dtype)
+            # === Consistency Component ===
+            x_1 = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
 
-        # === Flow Matching Component ===
-        tau = torch.rand((bsize, 1), device=device, dtype=expert_dtype)
-        omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
+            with torch.no_grad():
+                t1 = torch.ones(bsize, device=device)
+                s1 = t1.clone()
+                v_1 = expert_forward_fn(x_1, t1, s1)
+                v_1 = v_1.clamp(-clamp, clamp)
 
-        tau_expanded = tau[:, :, None]
-        noised_actions = tau_expanded * omega + (1 - tau_expanded) * actions_fm
-        target_flow = omega - actions_fm
+                x_half = x_1 + (-0.5) * v_1
 
-        predicted_flow = expert_forward_fn(
-            noised_actions, tau.squeeze(1), tau.squeeze(1)
-        )
+                t_half = torch.full_like(t1, 0.5)
+                s_half = t_half.clone()
+                v_half = expert_forward_fn(x_half, t_half, s_half)
+                v_half = v_half.clamp(-clamp, clamp)
 
-        pred_fm = predicted_flow
-        target_fm = target_flow
-        if self.config.loss_n_action_steps > 0:
-            n = self.config.loss_n_action_steps
-            pred_fm = pred_fm[:, :n]
-            target_fm = target_fm[:, :n]
-        fm_loss = F.mse_loss(pred_fm, target_fm)
+                v_shortcut = 0.5 * (v_1 + v_half)
 
-        # === Consistency Component ===
-        x_1 = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
+            s_zero = torch.zeros(bsize, device=device)
+            v_student = expert_forward_fn(x_1, t1, s_zero)
 
-        with torch.no_grad():
-            t1 = torch.ones(bsize, device=device)
-            s1 = t1.clone()
-            v_1 = expert_forward_fn(x_1, t1, s1)
-            v_1 = v_1.clamp(-clamp, clamp)
+            pred_student = v_student
+            target_shortcut = v_shortcut
+            if self.config.loss_n_action_steps > 0:
+                n = self.config.loss_n_action_steps
+                pred_student = pred_student[:, :n]
+                target_shortcut = target_shortcut[:, :n]
+            consistency_loss = F.mse_loss(pred_student, target_shortcut)
 
-            x_half = x_1 + (-0.5) * v_1
+            loss = alpha * fm_loss + (1.0 - alpha) * lambda_c * consistency_loss
+            
+        finally:
+            # Restore VLM parameter gradients
+            for name, param in self.vlm_with_expert.vlm.named_parameters():
+                param.requires_grad_(vlm_param_grad_states[name])
 
-            t_half = torch.full_like(t1, 0.5)
-            s_half = t_half.clone()
-            v_half = expert_forward_fn(x_half, t_half, s_half)
-            v_half = v_half.clamp(-clamp, clamp)
-
-            v_shortcut = 0.5 * (v_1 + v_half)
-
-        s_zero = torch.zeros(bsize, device=device)
-        v_student = expert_forward_fn(x_1, t1, s_zero)
-
-        pred_student = v_student
-        target_shortcut = v_shortcut
-        if self.config.loss_n_action_steps > 0:
-            n = self.config.loss_n_action_steps
-            pred_student = pred_student[:, :n]
-            target_shortcut = target_shortcut[:, :n]
-        consistency_loss = F.mse_loss(pred_student, target_shortcut)
-
-        loss = alpha * fm_loss + (1.0 - alpha) * lambda_c * consistency_loss
         return loss, fm_loss, consistency_loss
 
     # pylint: disable=too-many-locals,unused-argument
