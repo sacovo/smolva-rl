@@ -6,7 +6,7 @@ import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl.modeling_smolvla_recap import SmolVLARECAPPolicy
 
-def test_loss():
+def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -74,4 +74,4 @@ def test_loss():
     print(f"Average FM Loss: {total_fm_loss / num_frames:.4f}")
 
 if __name__ == "__main__":
-    test_loss()
+    main()

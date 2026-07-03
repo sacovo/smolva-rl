@@ -6,7 +6,7 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy
 
-def test_inference():
+def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -74,4 +74,4 @@ def test_inference():
     print(f"Average MSE (CFG=0.0): {mse_cfg_0 / num_frames:.4f}")
 
 if __name__ == "__main__":
-    test_inference()
+    main()
