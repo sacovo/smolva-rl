@@ -124,6 +124,14 @@ def parse_args():
         action="store_true",
         help="Enable Phase 2 Supervised/Imitation Finetuning. Bypasses the critic and treats all expert demonstration frames as advantageous.",
     )
+    parser.add_argument(
+        "--no_advantage_conditioning",
+        action="store_false",
+        dest="use_advantage_conditioning",
+        default=True,
+        help="Disable advantage conditioning tokens entirely (plain SmolVLA-style baseline; "
+        "typically combined with --expert_mode and --ar_loss_weight 0)",
+    )
     parser.add_argument("--dataset_repo_id", type=str, required=True)
     parser.add_argument(
         "--episodes",
@@ -432,6 +440,7 @@ def main():
         ar_loss_weight=args.ar_loss_weight,
         fm_loss_weight=args.fm_loss_weight,
         loss_n_action_steps=args.loss_n_action_steps,
+        use_advantage_conditioning=args.use_advantage_conditioning,
     )
     if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:
         raise ValueError("Pruning configuration must be disabled during co-training/distillation.")
@@ -793,6 +802,7 @@ def main():
                 action_stats=action_stats,
                 chunk_size=args.action_chunk_size,
                 n_action_steps=1, # Default to 1, can be overridden during evaluation
+                use_advantage_conditioning=args.use_advantage_conditioning,
                 device="cpu",
             )
             config.output_features = output_features

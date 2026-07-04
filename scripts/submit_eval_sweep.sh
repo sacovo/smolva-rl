@@ -18,10 +18,13 @@ mkdir -p outputs/eval
 # Set up Conda environment paths
 export CONDA_PREFIX="/home2/sandro.covo/conda12"
 export PATH="$CONDA_PREFIX/bin:$PATH"
+export LEROBOT_HOME="$HOME/.cache/huggingface/lerobot"
 
 export PYTHONUNBUFFERED=1
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 echo "Evaluation sweep array job started at $(date) on $(hostname)"
 echo "Array Task ID: $SLURM_ARRAY_TASK_ID"

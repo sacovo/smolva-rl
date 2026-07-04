@@ -60,6 +60,12 @@ def log_to_wandb(job_name, checkpoint_name, suite, cfg, success_rate, eval_info_
         print(f"Warning: Failed to log to WandB: {e}")
 
 def main():
+    # Programmatically set LEROBOT_HOME if not already configured
+    if "LEROBOT_HOME" not in os.environ:
+        os.environ["LEROBOT_HOME"] = str(Path.home() / ".cache" / "huggingface" / "lerobot")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     task_id_str = os.environ.get("SLURM_ARRAY_TASK_ID")
     if task_id_str is None:
         print("Error: SLURM_ARRAY_TASK_ID environment variable not found. Run with e.g. export SLURM_ARRAY_TASK_ID=0")
