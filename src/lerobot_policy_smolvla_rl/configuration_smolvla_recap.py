@@ -31,3 +31,11 @@ class SmolVLARECAPConfig(SmolVLAConfig):
     snapflow_alpha: float = 0.5            # FM/consistency mixing ratio
     snapflow_lambda: float = 0.1           # Consistency loss weight
     snapflow_clamp: float = 20.0           # Velocity prediction clamp range
+
+    # EfficientVLA settings
+    pruned_layers: list[int] | None = None          # Paired layers to skip (e.g. [5, 9, 12])
+    visual_tokens_keep: int | None = None          # K visual tokens to keep per camera (None = off)
+    token_prune_alpha: float = 0.5                 # Relevance/diversity mixing ratio
+    token_prune_k_key: int = 4                     # Key visual tokens count
+    token_prune_refresh: int = 1                   # Recalculate visual tokens every R steps
+

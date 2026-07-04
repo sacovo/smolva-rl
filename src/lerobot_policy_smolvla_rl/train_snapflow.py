@@ -305,6 +305,8 @@ def main():
         snapflow_clamp=args.clamp,
         **config_kwargs
     )
+    if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:
+        raise ValueError("Pruning configuration must be disabled during co-training/distillation.")
     with accelerator.local_main_process_first():
         model = SmolVLARECAP(recap_config).to(device)
 

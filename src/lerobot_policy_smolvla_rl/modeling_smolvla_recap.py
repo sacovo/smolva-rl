@@ -62,6 +62,11 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                     "snapflow_alpha",
                     "snapflow_lambda",
                     "snapflow_clamp",
+                    "pruned_layers",
+                    "visual_tokens_keep",
+                    "token_prune_alpha",
+                    "token_prune_k_key",
+                    "token_prune_refresh",
                 ]
             },
         )
@@ -120,6 +125,38 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         # Apply Knowledge Insulation (KI) Patch
         self._apply_ki_patch()
 
+        # EfficientVLA visual token pruning caches
+        self._pruned_indices_cache = None
+        self._steps_since_refresh = 0
+
+        # Eager attention hook for token pruning scoring pass
+        from .efficient_inference import make_eager_attention_hook
+        self.vlm_with_expert.eager_attention_forward = make_eager_attention_hook(
+            self.vlm_with_expert, self.vlm_with_expert.eager_attention_forward
+        )
+
+        # Layer skipping & reindexing setup
+        pruned = self.config.pruned_layers
+        if pruned is not None and len(pruned) > 0:
+            num_layers = self.vlm_with_expert.num_vlm_layers
+            kept_layers = [i for i in range(num_layers) if i not in pruned]
+            self.vlm_with_expert._layer_idx_to_cache_idx = {
+                kept_layers[cache_idx]: cache_idx for cache_idx in range(len(kept_layers))
+            }
+        else:
+            self.vlm_with_expert._layer_idx_to_cache_idx = None
+
+        from .efficient_inference import make_kv_reindex_wrapper, make_patched_forward
+        self.vlm_with_expert.forward_attn_layer = make_kv_reindex_wrapper(
+            self.vlm_with_expert, self.vlm_with_expert.forward_attn_layer
+        )
+        self.vlm_with_expert.forward_cross_attn_layer = make_kv_reindex_wrapper(
+            self.vlm_with_expert, self.vlm_with_expert.forward_cross_attn_layer
+        )
+        self.vlm_with_expert.forward = make_patched_forward(
+            self.vlm_with_expert, self.vlm_with_expert.forward
+        )
+
         # Ensure projection layers and expert are in the same dtype as the VLM
         vlm_dtype = self.vlm_with_expert.vlm.dtype
         self.vlm_with_expert.lm_expert.to(vlm_dtype)
@@ -135,6 +172,142 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         for name, param in self.vlm_with_expert.vlm.named_parameters():
             if "vision_model" not in name:
                 param.requires_grad = True
+
+    def embed_prefix(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor = None,
+        camera_kept_indices: dict[str, torch.Tensor] | None = None,
+        bypass_pruning: bool = False,
+    ):
+        """Embed images with SigLIP and language tokens with embedding layer to prepare
+        for SmolVLM transformer processing. Supports visual token pruning.
+        """
+        import math
+        from .analyze.attribution.policy_io import camera_keys
+        
+        # Check if visual token pruning is active
+        is_pruning_active = (
+            getattr(self.config, "visual_tokens_keep", None) is not None
+            and not self.training
+            and not bypass_pruning
+        )
+        
+        if is_pruning_active:
+            if camera_kept_indices is None:
+                # Check cache for temporal amortization
+                if (
+                    getattr(self.config, "token_prune_refresh", 1) > 1
+                    and getattr(self, "_pruned_indices_cache", None) is not None
+                    and getattr(self, "_steps_since_refresh", 0) < self.config.token_prune_refresh
+                    and self._pruned_indices_cache[next(iter(self._pruned_indices_cache))].shape[0] == images[0].shape[0]
+                ):
+                    camera_kept_indices = self._pruned_indices_cache
+                    self._steps_since_refresh += 1
+                else:
+                    from .efficient_inference import select_visual_tokens
+                    camera_kept_indices = select_visual_tokens(self, images, img_masks, lang_tokens, lang_masks, state)
+                    if getattr(self.config, "token_prune_refresh", 1) > 1:
+                        self._pruned_indices_cache = camera_kept_indices
+                        self._steps_since_refresh = 1
+
+        embs = []
+        pad_masks = []
+        att_masks = []
+        image_keys = camera_keys(self)
+        for _img_idx, (
+            img,
+            img_mask,
+        ) in enumerate(zip(images, img_masks, strict=False)):
+            cam_key = image_keys[_img_idx]
+            if self.add_image_special_tokens:
+                image_start_token = (
+                    self.vlm_with_expert.embed_language_tokens(
+                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
+                    )
+                    .unsqueeze(0)
+                    .expand(img.shape[0], -1, -1)
+                )
+                image_start_mask = torch.ones_like(
+                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
+                )
+                att_masks += [0] * (image_start_mask.shape[-1])
+                embs.append(image_start_token)
+                pad_masks.append(image_start_mask)
+
+            img_emb = self.vlm_with_expert.embed_image(img)
+
+            # Normalize image embeddings
+            img_emb_dim = img_emb.shape[-1]
+            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+
+            # Apply token pruning if active
+            if camera_kept_indices is not None and cam_key in camera_kept_indices:
+                indices = camera_kept_indices[cam_key] # (B, K)
+                img_emb = torch.gather(img_emb, 1, indices.unsqueeze(-1).expand(-1, -1, img_emb_dim))
+
+            bsize, num_img_embs = img_emb.shape[:2]
+            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+
+            embs.append(img_emb)
+            pad_masks.append(img_mask)
+
+            att_masks += [0] * (num_img_embs)
+            if self.add_image_special_tokens:
+                image_end_token = (
+                    self.vlm_with_expert.embed_language_tokens(
+                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
+                    )
+                    .unsqueeze(0)
+                    .expand(img.shape[0], -1, -1)
+                )
+                image_end_mask = torch.ones_like(
+                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
+                )
+                embs.append(image_end_token)
+                pad_masks.append(image_end_mask)
+                att_masks += [0] * (image_end_mask.shape[1])
+                
+        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
+        # Normalize language embeddings
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+
+        embs.append(lang_emb)
+        pad_masks.append(lang_masks)
+
+        num_lang_embs = lang_emb.shape[1]
+        att_masks += [0] * num_lang_embs
+
+        state_emb = self.state_proj(state)
+        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        embs.append(state_emb)
+        bsize = state_emb.shape[0]
+        device = state_emb.device
+
+        states_seq_len = state_emb.shape[1]
+        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        pad_masks.append(state_mask)
+
+        # Set attention masks so that image and language inputs do not attend to state or actions
+        att_masks += [1] * (states_seq_len)
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :]
+
+        seq_len = pad_masks.shape[1]
+        if seq_len < self.prefix_length:
+            embs = modeling_smolvla.pad_tensor(embs, self.prefix_length, pad_value=0)
+            pad_masks = modeling_smolvla.pad_tensor(pad_masks, self.prefix_length, pad_value=0)
+            att_masks = modeling_smolvla.pad_tensor(att_masks, self.prefix_length, pad_value=0)
+
+        att_masks = att_masks.expand(bsize, -1)
+
+        return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions, timestep, target_time=None):
         # Cast noisy_actions to projection weights dtype to prevent mat1/mat2 dtype mismatch (Float vs BFloat16)
@@ -927,6 +1100,10 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
     def get_pre_processor(self, dataset):
         return self.fast_wrapper.get_pre_processor(dataset)
 
+    def reset_token_cache(self):
+        self._pruned_indices_cache = None
+        self._steps_since_refresh = 0
+
 
 class SmolVLARECAPPolicy(PreTrainedPolicy):
     """Wrapper class around SmolVLARECAP model to train and run inference within LeRobot."""
@@ -943,6 +1120,21 @@ class SmolVLARECAPPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.model = SmolVLARECAP(config)
+
+        # Thread configurations onto the wrapper model
+        self.model.vlm_with_expert.pruned_layers = config.pruned_layers
+        self.model.vlm_with_expert.visual_tokens_keep = config.visual_tokens_keep
+
+        # Run pruning safety constraint check
+        from .efficient_inference import check_pruning_constraints
+        check_pruning_constraints(config.pruned_layers, self.model.vlm_with_expert.num_vlm_layers)
+
+        # Calculate and thread prefix_length if C2 is active
+        if config.visual_tokens_keep is not None:
+            from .analyze.attribution.policy_io import camera_keys
+            num_cameras = len(camera_keys(self))
+            self.model.prefix_length = config.prefix_length - (64 - config.visual_tokens_keep) * num_cameras
+
         self.reset()
 
     def reset(self):
@@ -950,6 +1142,7 @@ class SmolVLARECAPPolicy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self.model.reset_token_cache()
 
     @torch.no_grad()
     def select_action(

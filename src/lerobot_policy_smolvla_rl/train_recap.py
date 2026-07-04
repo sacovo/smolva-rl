@@ -433,6 +433,8 @@ def main():
         fm_loss_weight=args.fm_loss_weight,
         loss_n_action_steps=args.loss_n_action_steps,
     )
+    if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:
+        raise ValueError("Pruning configuration must be disabled during co-training/distillation.")
     with accelerator.local_main_process_first():
         model = SmolVLARECAP(recap_config).to(device)
 

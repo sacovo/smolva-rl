@@ -612,5 +612,46 @@ def cmd_gradients(
     click.echo(f"\nResults saved to: {(out_dir / 'table.csv').absolute()}")
 
 
+@main.command("layer-redundancy")
+@click.option(
+    "--checkpoint",
+    required=True,
+    type=click.Path(exists=True),
+    help="Path to policy checkpoint directory.",
+)
+@click.option(
+    "--dataset-repo-id", required=True, help="Hugging Face dataset repository ID."
+)
+@click.option("--episodes", default=None, help="Episodes to run on.")
+@click.option(
+    "--calibration-frames", type=int, default=256, help="Minimum number of frames for redundancy analysis."
+)
+@click.option(
+    "--device",
+    default="cuda" if torch.cuda.is_available() else "cpu",
+    help="Device to run on.",
+)
+def cmd_layer_redundancy(checkpoint, dataset_repo_id, episodes, calibration_frames, device):
+    """Runs layer activation similarity analysis to measure redundancy."""
+    from lerobot_policy_smolvla_rl.analyze.layer_redundancy import run_layer_redundancy_analysis
+    from lerobot_policy_smolvla_rl.analyze.attribution.policy_io import load_recap_policy
+
+    policy = load_recap_policy(Path(checkpoint), device)
+    ep_list = parse_episodes(episodes)
+
+    res_df = run_layer_redundancy_analysis(
+        policy, dataset_repo_id, episodes=ep_list, calibration_frames=calibration_frames, device=device
+    )
+
+    checkpoint_name = Path(checkpoint).name
+    out_dir = Path("outputs/analysis/redundancy") / checkpoint_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    res_df.to_csv(out_dir / "layer_redundancy.csv", index=False)
+    click.echo("\n=================== Layer Redundancy Rankings ===================")
+    click.echo(res_df.to_string(index=False))
+    click.echo(f"\nResults saved to: {(out_dir / 'layer_redundancy.csv').absolute()}")
+
+
 if __name__ == "__main__":
     main()
