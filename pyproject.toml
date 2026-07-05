@@ -1,14 +1,13 @@
 [project]
 name = "lerobot_policy_smolvla_rl"
 version = "0.1.0"
-description = "Add your description here"
+description = "SmolVLA reinforcement learning (RECAP + Knowledge Insulation, FAST tokens, SnapFlow distillation) for LIBERO."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "accelerate>=1.13.0",
   "click>=8.3.2",
   "lerobot[smolvla]>=0.5.1",
-  "marimo[lsp]>=0.23.2",
   "matplotlib>=3.10.8",
   "protobuf>=6.33.6",
   "scipy>=1.17.1",
@@ -18,12 +17,16 @@ dependencies = [
   "tokenizers>=0.22.2",
   "torch>=2.10.0",
   "transformers>=5.3.0",
-  "weasyprint>=68.1",
 ]
 
 [project.optional-dependencies]
 libero = [
     "lerobot[libero]>=0.5.1",
+]
+# Interactive notebooks (marimo) and PDF report rendering (weasyprint).
+docs = [
+    "marimo[lsp]>=0.23.2",
+    "weasyprint>=68.1",
 ]
 [build-system]
 requires = ["uv_build>=0.11.7,<0.12"]
@@ -35,6 +38,10 @@ dev = [
     "pylint>=4.0.5",
     "pytest>=9.0.3",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
 
 [tool.pylint.messages_control]
 disable = [
