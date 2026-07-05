@@ -14,11 +14,14 @@ add_dataloader_args  — registers the shared DataLoader CLI flags on an argpars
                        ArgumentParser.
 build_dataloader     — constructs a DataLoader from parsed args + dataset,
                        applying RobustDataset and CudaPrefetcher as configured.
+patch_lerobot_dataset_reader — monkeypatches LeRobot's DatasetReader to cache
+                       non-image/non-video columns in RAM for fast indexing.
 """
 
 import logging
 import random
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -230,3 +233,95 @@ def build_dataloader(
         return CudaPrefetcher(loader, device)
 
     return loader
+
+
+# ---------------------------------------------------------------------------
+# LeRobot DatasetReader caching patch
+# ---------------------------------------------------------------------------
+
+def patch_lerobot_dataset_reader():
+    """Patches LeRobot's DatasetReader to cache non-image/non-video columns in RAM.
+    This avoids extremely slow disk reads and PNG/JPEG decoding during delta-timestamp queries.
+    """
+    try:
+        import time
+        from lerobot.datasets.dataset_reader import DatasetReader
+
+        # Avoid double patching
+        if getattr(DatasetReader, "_is_patched_for_caching", False):
+            return
+
+        orig_try_load = DatasetReader.try_load
+        orig_load_and_activate = DatasetReader.load_and_activate
+
+        def patched_init_cache(self):
+            if self.hf_dataset is None:
+                return
+            if not hasattr(self, "_cached_columns"):
+                logger.info("Caching non-image/non-video columns in RAM for high-speed indexing...")
+                t_start = time.time()
+                self._cached_columns = {}
+                for key in self.hf_dataset.column_names:
+                    # Check if it's an image or video key
+                    is_video_or_image = False
+                    if key in self._meta.video_keys:
+                        is_video_or_image = True
+                    elif key in self._meta.features:
+                        ftype = self._meta.features[key].get("dtype")
+                        if ftype in ("image", "video"):
+                            is_video_or_image = True
+
+                    if not is_video_or_image:
+                        # Cache the column as a torch tensor
+                        with self.hf_dataset.formatted_as(type="numpy", columns=[key]):
+                            col_data_np = self.hf_dataset[:][key]
+
+                        if isinstance(col_data_np, np.ndarray):
+                            col_data = torch.from_numpy(col_data_np)
+                        else:
+                            col_data = torch.tensor(col_data_np)
+                        self._cached_columns[key] = col_data
+                logger.info(f"Cached {list(self._cached_columns.keys())} in {time.time() - t_start:.4f}s")
+
+        def patched_try_load(self):
+            res = orig_try_load(self)
+            if res:
+                patched_init_cache(self)
+            return res
+
+        def patched_load_and_activate(self):
+            orig_load_and_activate(self)
+            patched_init_cache(self)
+
+        def patched_query_hf_dataset(self, query_indices):
+            result = {}
+            for key, q_idx in query_indices.items():
+                if key in self._meta.video_keys:
+                    continue
+                relative_indices = (
+                    q_idx
+                    if self._absolute_to_relative_idx is None
+                    else [self._absolute_to_relative_idx[idx] for idx in q_idx]
+                )
+
+                if hasattr(self, "_cached_columns") and key in self._cached_columns:
+                    cache = self._cached_columns[key]
+                    if isinstance(cache, torch.Tensor):
+                        result[key] = cache[relative_indices]
+                    else:
+                        result[key] = torch.tensor([cache[i] for i in relative_indices])
+                else:
+                    # Fallback to original querying
+                    try:
+                        result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+                    except (KeyError, TypeError, IndexError):
+                        result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+            return result
+
+        DatasetReader.try_load = patched_try_load
+        DatasetReader.load_and_activate = patched_load_and_activate
+        DatasetReader._query_hf_dataset = patched_query_hf_dataset
+        DatasetReader._is_patched_for_caching = True
+        logger.info("Successfully patched LeRobot DatasetReader for fast column caching.")
+    except Exception as e:
+        logger.error(f"Failed to patch LeRobot DatasetReader: {e}")
