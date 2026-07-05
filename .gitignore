@@ -21,3 +21,6 @@ wandb/
 .gemini
 scratch/
 runs/
+
+# Stray local verification artifacts
+*_verification.json
