@@ -19,30 +19,39 @@ To allow a standard VLM to generate actions using its autoregressive next-token 
 
 ### Implementation
 
-**Tokenizer (`src/lerobot_policy_smolvla_rl/fast_tokenizer.py`)**
+**Tokenizer (Physical Intelligence FAST, loaded remotely)**
 
-The mathematical core of the tokenizer lies in applying a Type-II orthonormal DCT and a scaling factor $\gamma$ (referred to as `self.scale` in code).
+The project does **not** ship its own DCT/BPE implementation. Instead it uses
+the official FAST tokenizer published by Physical Intelligence on the Hub. In
+`SmolVLAFast.__init__` (`src/lerobot_policy_smolvla_rl/smolvla_fast.py:46-53`)
+the BPE tokenizer and the `UniversalActionProcessor` are loaded via
+`transformers` dynamic-module loading:
 
 ```python
-def encode_dct(self, actions: np.ndarray) -> np.ndarray:
-    # 1. Apply Type-II orthonormal DCT along the time axis (axis=1)
-    coeffs = dct(actions, type=2, norm='ortho', axis=1)
-    
-    # 2. Quantize: round(gamma * C)
-    quantized = np.round(self.scale * coeffs).astype(np.int32)
-    return quantized
-
-def decode_dct(self, quantized: np.ndarray) -> np.ndarray:
-    # Invert quantization and apply IDCT
-    coeffs = quantized.astype(np.float32) / self.scale
-    actions = idct(coeffs, type=2, norm='ortho', axis=1)
-    return actions
+bpe_tokenizer = AutoTokenizer.from_pretrained(
+    "physical-intelligence/fast", trust_remote_code=True
+)
+processor_class = get_class_from_dynamic_module(
+    "processing_action_tokenizer.UniversalActionProcessor",
+    "physical-intelligence/fast",
+)
+self.action_processor = processor_class(bpe_tokenizer=bpe_tokenizer)
+# A dummy encode fixes time_horizon and action_dim for later decoding.
+self.action_processor(np.zeros((1, config.chunk_size, config.max_action_dim)))
 ```
 
-These quantized coefficients are then flattened in a column-first manner. This interleaves the dimensions such that all low-frequency components are placed first, making it easier for the BPE tokenizer to learn frequent patterns.
+Internally the `UniversalActionProcessor` applies the same Type-II orthonormal
+DCT along the time axis, quantizes the coefficients, flattens them low-frequency
+first, and BPE-encodes the result — exactly the transform described in the
+Theory section above — but the maintained upstream implementation is the source
+of truth, so we do not duplicate it here.
 
 **Model Integration (`src/lerobot_policy_smolvla_rl/smolvla_fast.py`)**
-The `SmolVLAFast` model repurposes a set of tokens at the end of the VLM's vocabulary (e.g., indices `48000` to `48000 + num_fast_tokens`) as action tokens. The model is trained using a standard Cross-Entropy autoregressive loss.
+The `SmolVLAFast` model repurposes a contiguous block of tokens in the VLM's
+vocabulary — indices `48000` to `48000 + num_fast_tokens` (default 1024) — as
+action tokens, re-initializing their input embeddings and LM-head rows. The
+model is then trained using a standard Cross-Entropy autoregressive loss over
+those repurposed token ids.
 
 ---
 
