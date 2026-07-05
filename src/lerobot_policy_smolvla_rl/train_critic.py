@@ -6,7 +6,6 @@ import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from diffusers.optimization import get_scheduler
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -26,7 +25,8 @@ from lerobot_policy_smolvla_rl.ds_utils import (
     get_episode_lengths,
     get_max_task_lengths,
 )
-from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACritic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.train_common import build_warmup_cosine_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -314,7 +314,7 @@ def main():
 
     config.input_features = input_features
     with accelerator.local_main_process_first():
-        model = SmolVLACrictic(config).to(device)
+        model = SmolVLACritic(config).to(device)
 
     # Load pretrained critic weights if provided
     if args.pretrained_critic_path:
@@ -331,7 +331,7 @@ def main():
             else:
                 clean_state_dict[k] = v
 
-        # Load weights into SmolVLACrictic model
+        # Load weights into SmolVLACritic model
         missing_keys, unexpected_keys = model.load_state_dict(
             clean_state_dict, strict=False
         )
@@ -359,12 +359,15 @@ def main():
         betas=(args.beta1, args.beta2),
     )
 
-    # Use cosine scheduler with warmup
-    scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=args.steps,
+    # Cosine schedule with linear warmup and configurable min_lr floor.
+    # Previously used diffusers' get_scheduler("cosine"), which decays to 0 and
+    # silently ignored --min_lr; the shared helper honors the floor.
+    scheduler = build_warmup_cosine_scheduler(
+        optimizer,
+        warmup_steps=args.warmup_steps,
+        total_steps=args.steps,
+        base_lr=args.lr,
+        min_lr=args.min_lr,
     )
 
     # Identify camera keys in the dataset

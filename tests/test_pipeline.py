@@ -174,7 +174,7 @@ def test_modeling_recap_config():
 
 def test_critic_modeling():
     from lerobot_policy_smolvla_rl.smolvla_critic import (
-        SmolVLACrictic,
+        SmolVLACritic,
         SmolVLMCriticConfig,
     )
     from lerobot.configs.types import FeatureType, PolicyFeature
@@ -189,7 +189,7 @@ def test_critic_modeling():
         ),
     }
 
-    model = SmolVLACrictic(config)
+    model = SmolVLACritic(config)
     assert hasattr(model, "c51_head")
 
     # Mock batch

@@ -34,7 +34,7 @@ class SmolVLMCriticConfig(SmolVLAConfig):
     state_dropout: float = 0.0
 
 
-class SmolVLACrictic(modeling_smolvla.VLAFlowMatching):
+class SmolVLACritic(modeling_smolvla.VLAFlowMatching):
     def __init__(self, config: SmolVLMCriticConfig):
         config.compile_model = False  # maybe implement this actually
         super().__init__(config)

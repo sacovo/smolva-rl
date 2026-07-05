@@ -22,7 +22,7 @@ from matplotlib.colors import ListedColormap
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACritic, SmolVLMCriticConfig
 
 
 def parse_args():
@@ -147,7 +147,7 @@ def main():
     }
 
     config.input_features = input_features
-    model = SmolVLACrictic(config).to(args.device)
+    model = SmolVLACritic(config).to(args.device)
 
     model.load_state_dict(state_dict)
     model.eval()

@@ -25,7 +25,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACritic, SmolVLMCriticConfig
 
 
 def parse_args():
@@ -141,7 +141,7 @@ def main():
         input_features=input_features,
         device=device,
     )
-    model = SmolVLACrictic(config).to(device)
+    model = SmolVLACritic(config).to(device)
     model.eval()
 
     from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors

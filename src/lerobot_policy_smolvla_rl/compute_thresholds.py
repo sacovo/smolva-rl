@@ -19,7 +19,7 @@ from lerobot_policy_smolvla_rl.advantage_utils import (
     save_advantages_and_thresholds,
 )
 from lerobot_policy_smolvla_rl.dataloader_utils import add_dataloader_args
-from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACrictic, SmolVLMCriticConfig
+from lerobot_policy_smolvla_rl.smolvla_critic import SmolVLACritic, SmolVLMCriticConfig
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def main():
         num_vlm_layers=args.num_vlm_layers,
         input_features=input_features,
     )
-    critic = SmolVLACrictic(critic_config).to(device)
+    critic = SmolVLACritic(critic_config).to(device)
     critic.load_state_dict(torch.load(args.critic_checkpoint, map_location=device))
 
     print(f"Computing N-step TD advantages (N={args.advantage_horizon})...")
