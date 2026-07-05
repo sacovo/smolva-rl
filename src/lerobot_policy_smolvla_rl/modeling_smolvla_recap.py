@@ -64,6 +64,7 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                     "cfg_weight",
                     "ar_loss_weight",
                     "fm_loss_weight",
+                    "knowledge_insulation",
                     "loss_n_action_steps",
                     "snapflow_enabled",
                     "snapflow_alpha",
@@ -129,8 +130,10 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 "<advantage_negative>"
             )
 
-        # Apply Knowledge Insulation (KI) Patch
-        self._apply_ki_patch()
+        # Apply Knowledge Insulation (KI) Patch (self-attention no_grad on the
+        # VLM stream). Skipped when KI is disabled so FM gradients reach the VLM.
+        if self.config.knowledge_insulation:
+            self._apply_ki_patch()
 
         # EfficientVLA visual token pruning caches
         self._pruned_indices_cache = None
@@ -649,72 +652,85 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             images, img_masks, lang_tokens, lang_masks, state=state
         )
 
-        # 4. VLM Backbone (AR loss on FAST tokens)
-        actions_np = batch[ACTION].cpu().numpy()
-        action_token_ids, action_mask = self.fast_wrapper.encode_actions(
-            actions_np, return_mask=True
-        )
-        action_embs = self.vlm_with_expert.embed_language_tokens(action_token_ids)
+        # 4. VLM Backbone (AR loss on FAST tokens).
+        # Skipped entirely when ar_loss_weight == 0 — this avoids a full VLM
+        # forward pass over the FAST-token sequence every step (SmolVLA
+        # paper-style pure flow matching has no AR/FAST co-training).
+        if self.config.ar_loss_weight > 0:
+            actions_np = batch[ACTION].cpu().numpy()
+            action_token_ids, action_mask = self.fast_wrapper.encode_actions(
+                actions_np, return_mask=True
+            )
+            action_embs = self.vlm_with_expert.embed_language_tokens(action_token_ids)
 
-        full_embs = torch.cat([prefix_embs, action_embs], dim=1)
-        full_pad_masks = torch.cat([prefix_pad_masks, action_mask], dim=1)
-        action_att_masks = torch.ones(
-            (prefix_att_masks.shape[0], action_token_ids.shape[1]),
-            dtype=prefix_att_masks.dtype,
-            device=prefix_att_masks.device,
-        )
-        full_att_masks = torch.cat([prefix_att_masks, action_att_masks], dim=1)
+            full_embs = torch.cat([prefix_embs, action_embs], dim=1)
+            full_pad_masks = torch.cat([prefix_pad_masks, action_mask], dim=1)
+            action_att_masks = torch.ones(
+                (prefix_att_masks.shape[0], action_token_ids.shape[1]),
+                dtype=prefix_att_masks.dtype,
+                device=prefix_att_masks.device,
+            )
+            full_att_masks = torch.cat([prefix_att_masks, action_att_masks], dim=1)
 
-        full_att_2d_masks = modeling_smolvla.make_att_2d_masks(
-            full_pad_masks, full_att_masks
-        )
-        full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+            full_att_2d_masks = modeling_smolvla.make_att_2d_masks(
+                full_pad_masks, full_att_masks
+            )
+            full_position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
-            attention_mask=full_att_2d_masks,
-            position_ids=full_position_ids,
-            past_key_values=None,
-            inputs_embeds=[full_embs, None],
-            use_cache=False,
-            fill_kv_cache=True,
-        )
+            outputs_embeds, _ = self.vlm_with_expert.forward(
+                attention_mask=full_att_2d_masks,
+                position_ids=full_position_ids,
+                past_key_values=None,
+                inputs_embeds=[full_embs, None],
+                use_cache=False,
+                fill_kv_cache=True,
+            )
 
-        vlm_hidden = outputs_embeds[0]
-        head = self.vlm_with_expert.vlm.get_output_embeddings()
-        logits = head(vlm_hidden.to(head.weight.dtype))
+            vlm_hidden = outputs_embeds[0]
+            head = self.vlm_with_expert.vlm.get_output_embeddings()
+            logits = head(vlm_hidden.to(head.weight.dtype))
 
-        labels = torch.full_like(full_pad_masks.long(), -100)
-        prefix_len = prefix_embs.shape[1]
-        action_labels = torch.where(
-            action_mask,
-            action_token_ids,
-            torch.tensor(-100, device=action_token_ids.device),
-        )
-        labels[:, prefix_len:] = action_labels
+            labels = torch.full_like(full_pad_masks.long(), -100)
+            prefix_len = prefix_embs.shape[1]
+            action_labels = torch.where(
+                action_mask,
+                action_token_ids,
+                torch.tensor(-100, device=action_token_ids.device),
+            )
+            labels[:, prefix_len:] = action_labels
 
-        shift_logits = logits[:, prefix_len - 1 : -1, :].contiguous()
-        shift_labels = labels[:, prefix_len:].contiguous()
-        ar_loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
+            shift_logits = logits[:, prefix_len - 1 : -1, :].contiguous()
+            shift_labels = labels[:, prefix_len:].contiguous()
+            ar_loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+        else:
+            ar_loss = torch.zeros((), device=prefix_embs.device)
 
         # 5. Action Expert (Flow Matching loss)
-        # Complete Knowledge Insulation: freeze ALL VLM parameters during the
-        # FM forward pass.  This prevents FM gradients from leaking into the
-        # VLM backbone through ANY layer — including cross-attention layers
-        # and residual/MLP processing — not just the self-attention layers
-        # covered by the KI patch on forward_attn_layer.
-        prefix_embs_fm = prefix_embs.detach()
-        prefix_pad_masks_fm = prefix_pad_masks.detach()
+        # Knowledge Insulation (when enabled): detach the VLM prefix and freeze
+        # ALL VLM parameters during the FM forward pass, so FM gradients cannot
+        # leak into the VLM backbone through ANY layer — cross-attention,
+        # residual, or MLP — complementing the self-attention KI patch.
+        # When KI is disabled the prefix stays attached and params stay
+        # trainable, so the FM loss trains the VLM backbone (SmolVLA-style).
+        ki = self.config.knowledge_insulation
+        if ki:
+            prefix_embs_fm = prefix_embs.detach()
+            prefix_pad_masks_fm = prefix_pad_masks.detach()
+        else:
+            prefix_embs_fm = prefix_embs
+            prefix_pad_masks_fm = prefix_pad_masks
 
         # Temporarily freeze VLM parameters so PyTorch does not track
         # gradient contributions from VLM weights during FM forward.
         # The AR loss backward (computed earlier in the graph) is unaffected
         # because those operations were recorded when params had grad=True.
         vlm_param_grad_states = {}
-        for name, param in self.vlm_with_expert.vlm.named_parameters():
-            vlm_param_grad_states[name] = param.requires_grad
-            param.requires_grad_(False)
+        if ki:
+            for name, param in self.vlm_with_expert.vlm.named_parameters():
+                vlm_param_grad_states[name] = param.requires_grad
+                param.requires_grad_(False)
 
         expert_dtype = self.vlm_with_expert.vlm.dtype
 
@@ -761,8 +777,9 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         )
 
         # Restore VLM parameter grad states (needed for AR loss backward)
-        for name, param in self.vlm_with_expert.vlm.named_parameters():
-            param.requires_grad_(vlm_param_grad_states[name])
+        if ki:
+            for name, param in self.vlm_with_expert.vlm.named_parameters():
+                param.requires_grad_(vlm_param_grad_states[name])
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)

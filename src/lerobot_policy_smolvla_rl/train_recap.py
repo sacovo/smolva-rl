@@ -93,6 +93,15 @@ def parse_args():
     parser.add_argument("--ar_loss_weight", type=float, default=1.0, help="Weight for autoregressive loss")
     parser.add_argument("--fm_loss_weight", type=float, default=1.0, help="Weight for flow matching loss")
     parser.add_argument(
+        "--disable_ki",
+        action="store_false",
+        dest="knowledge_insulation",
+        default=True,
+        help="Disable Knowledge Insulation so the flow-matching loss trains the "
+        "VLM backbone directly (SmolVLA paper-style; combine with "
+        "--ar_loss_weight 0). Vision encoder stays frozen either way.",
+    )
+    parser.add_argument(
         "--loss_n_action_steps",
         type=int,
         default=0,
@@ -355,6 +364,7 @@ def main():
         fm_loss_weight=args.fm_loss_weight,
         loss_n_action_steps=args.loss_n_action_steps,
         use_advantage_conditioning=args.use_advantage_conditioning,
+        knowledge_insulation=args.knowledge_insulation,
     )
     if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:
         raise ValueError("Pruning configuration must be disabled during co-training/distillation.")
@@ -708,6 +718,7 @@ def main():
                 chunk_size=args.action_chunk_size,
                 n_action_steps=1, # Default to 1, can be overridden during evaluation
                 use_advantage_conditioning=args.use_advantage_conditioning,
+                knowledge_insulation=args.knowledge_insulation,
                 device="cpu",
             )
             config.output_features = output_features

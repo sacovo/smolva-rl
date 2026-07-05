@@ -19,6 +19,12 @@ class SmolVLARECAPConfig(SmolVLAConfig):
     # Loss weights for the combined objective.
     ar_loss_weight: float = 1.0
     fm_loss_weight: float = 1.0
+    # Knowledge Insulation. When True (default, RECAP+KI) the Flow-Matching loss
+    # is blocked from updating the VLM backbone (VLM trained only by the AR/FAST
+    # loss). Set False to let FM gradients train the VLM backbone directly
+    # (SmolVLA paper-style; typically combined with ar_loss_weight=0). The
+    # vision encoder stays frozen either way (freeze_vision_encoder).
+    knowledge_insulation: bool = True
     # Number of action steps to include in the flow matching loss.
     # 0 = use full chunk_size (default behavior).
     # When set to a positive value, only the first N steps of the predicted
