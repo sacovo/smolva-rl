@@ -6,6 +6,8 @@ This project supports parallel training on a Slurm cluster with automatic checkp
 
 - `scripts/submit_critic.py`: Python submission script for training the critic.
 - `scripts/submit_recap.py`: Python submission script for training the RECAP policy.
+- `scripts/submit_snapflow.py`: Python submission script for SnapFlow one-step distillation of a trained RECAP+KI checkpoint (requires `--recap_checkpoint`). Mirrors the `submit_recap.py` CLI/config layout.
+- `scripts/submit_snapflow.sh`: Thin `sbatch` wrapper for SnapFlow distillation. Usage: `./scripts/submit_snapflow.sh <dataset_repo_id> <recap_checkpoint> [--partition <p>] [--num-gpus <n>] [extra args...]`.
 - `scripts/submit_utils.py`: Shared helper module containing Slurm logic, configuration merging, and script submission.
 - `scripts/compute_advantages.sh`: A Slurm submission script to pre-compute advantages and thresholds on a single GPU.
 
