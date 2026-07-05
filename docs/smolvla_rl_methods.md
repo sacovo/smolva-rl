@@ -147,7 +147,7 @@ advantage = actual_returns - v_s
 
 This advantage is then compared against a task-specific threshold $\epsilon_l$ to determine if the action was "good" (`<advantage_positive>`) or "bad" (`<advantage_negative>`). 
 
-To prevent the thresholds from being contaminated by failed episodes, the threshold $\epsilon_l$ is computed as the 30th percentile of advantages from **successful episodes only** (matching the paper's formulation of using successful demonstration data to select the threshold).
+To prevent the thresholds from being contaminated by failed episodes, the threshold $\epsilon_l$ is computed as the 70th percentile of advantages from **successful episodes only** — i.e. `positive_fraction=0.3`, so the top 30% of frames are labeled positive (matching the paper's formulation of using successful demonstration data to select the threshold).
 
 ```python
 # Compare advantage against task-specific epsilon_l
