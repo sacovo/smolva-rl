@@ -62,34 +62,36 @@ While FAST tokens allow the VLM to co-train on action data, they can lack the pr
 
 ### Implementation
 
-**Flow Matching (`src/lerobot_policy_smolvla_rl/smolvla_recap_bap.py`)**
+**Flow Matching (`src/lerobot_policy_smolvla_rl/modeling_smolvla_recap.py`)**
 
-In `compute_loss`, a noise variable $\omega \sim \mathcal{N}(0, I)$ is sampled, and a noised action sequence is interpolated linearly using a random timestep $\tau \sim \mathcal{U}(0, 1)$. The Action Expert predicts the vector field (flow), and is optimized using Mean Squared Error.
+In `compute_loss`, a noise variable $\omega \sim \mathcal{N}(0, I)$ is sampled, and a noised action sequence is interpolated linearly using a random timestep $\tau \sim \mathcal{U}(0, 1)$. The convention matches the base `VLAFlowMatching` used by `sample_actions()` at inference: $\tau = 0$ is the clean action and $\tau = 1$ is pure noise, with target velocity $u_\tau = \omega - a$. The Action Expert predicts the vector field (flow), and is optimized using Mean Squared Error.
 
 ```python
 # 1. Sample timestep tau and noise omega
-tau = torch.rand((bsize, 1, 1), device=device)
-omega = torch.randn_like(batch[ACTION]).to(device)
+tau = torch.rand((bsize, 1), device=device, dtype=expert_dtype)
+omega = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
 
-# 2. Interpolate to create noised actions
-noised_actions = tau * batch[ACTION].to(device) + (1 - tau) * omega
+# 2. Interpolate to create noised actions (tau=0 -> clean, tau=1 -> noise)
+tau_expanded = tau[:, :, None]
+noised_actions = tau_expanded * omega + (1 - tau_expanded) * actions
+target_flow = omega - actions
 
-# 3. Predict the flow via the expert
-expert_input = self.action_in_proj(noised_actions.to(self.vlm_with_expert.vlm.dtype))
-expert_outputs = self.vlm_with_expert.lm_expert(
-    inputs_embeds=expert_input,
-    encoder_hidden_states=vlm_prefix_hidden.detach(), # <-- Knowledge Insulation
-    return_dict=True
+# 3. Run the unified VLM+expert forward on the prefix (detached) and the
+#    noised-action suffix, then project the expert's suffix outputs to the flow
+suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+    noised_actions, tau.squeeze(1)
 )
-predicted_flow = self.action_out_proj(expert_outputs.last_hidden_state)
+(_, suffix_out), _ = self.vlm_with_expert.forward(
+    inputs_embeds=[prefix_embs.detach(), suffix_embs], ...  # <-- Knowledge Insulation
+)
+predicted_flow = self.action_out_proj(suffix_out[:, -self.config.chunk_size:])
 
 # 4. MSE Loss against the target flow
-target_flow = omega - batch[ACTION].to(device)
 flow_loss = F.mse_loss(predicted_flow, target_flow)
 ```
 
 **Knowledge Insulation**
-Note the `.detach()` in the code above. The model mathematically severs the computational graph by patching the attention layer (`_apply_ki_patch`). The expert utilizes cross-attention against the VLM hidden states without passing gradients back, ensuring the VLM is updated *only* by the AR loss.
+KI is enforced on both sides of the graph. The VLM prefix hidden states are detached (`prefix_embs.detach()`), and *all* VLM parameters are temporarily set to `requires_grad_(False)` for the duration of the FM forward pass (their grad states are restored immediately afterward, before the AR-loss backward). The self-attention KI patch (`_apply_ki_patch`) additionally wraps the VLM self-attention in `torch.no_grad` for efficiency. Together these ensure no Flow-Matching gradient reaches the VLM through any layer — cross-attention, residual, or MLP — so the VLM is updated *only* by the AR loss.
 
 ---
 
