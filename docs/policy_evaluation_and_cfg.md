@@ -68,15 +68,15 @@ for cfg in "${CFG_WEIGHTS[@]}"; do
 done
 
 # Compile results
-PYTHONPATH=src uv run python3 scratch/compare_eval_runs.py
+PYTHONPATH=src uv run python3 scripts/compare_eval_runs.py
 ```
 
-### Aggregating Results (`scratch/compare_eval_runs.py`)
+### Aggregating Results (`scripts/compare_eval_runs.py`)
 
 This script parses all `eval_info.json` outputs in `outputs/eval` and prints a sorted pandas table comparing overall and per-task success rates:
 
 ```bash
-PYTHONPATH=src uv run python3 scratch/compare_eval_runs.py
+PYTHONPATH=src uv run python3 scripts/compare_eval_runs.py
 ```
 
 ---

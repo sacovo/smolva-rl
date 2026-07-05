@@ -24,4 +24,4 @@ done
 echo "-------------------------------------------------------"
 echo "All evaluations finished. Comparing results:"
 echo "-------------------------------------------------------"
-python3 /home/sandro/.gemini/antigravity/brain/03a98a22-f3ba-4f6a-a42e-f1aebca2eb93/scratch/compare_eval_runs.py
+PYTHONPATH=src uv run python3 scripts/compare_eval_runs.py
