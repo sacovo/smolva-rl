@@ -2,30 +2,20 @@
 import argparse
 import os
 import sys
-import json
 import torch
 import numpy as np
 from pathlib import Path
-from tqdm import tqdm
-import einops
 import cv2
 
 # Add src to python path to enable loading local modules
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
-# Explicitly import the custom policy to ensure it is registered with Draccus/LeRobot choice registries
-try:
-    from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy, SmolVLARECAPConfig
-except ImportError:
-    pass
-
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.envs.utils import preprocess_observation, add_envs_task
-from lerobot.utils.constants import ACTION, REWARD, DONE
+from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.device_utils import get_safe_torch_device
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Record simulation evaluation runs to a new LeRobot dataset with gamepad/keyboard intervention")
@@ -223,7 +213,6 @@ def run_sandbox(args):
     if gamepad.is_available():
         gamepad.manual_mode = True
         
-    headless = False
     window_name = "LIBERO Practice Sandbox - Press R to reset, ESC to quit"
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)

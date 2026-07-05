@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from lerobot.policies.smolvla import modeling_smolvla
 from lerobot_policy_smolvla_rl.analyze.attribution.policy_io import prefix_layout, camera_keys

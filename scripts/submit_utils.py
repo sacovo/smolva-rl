@@ -1,5 +1,4 @@
 import os
-import argparse
 import json
 import datetime
 import subprocess

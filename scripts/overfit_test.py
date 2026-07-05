@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Subset
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
 try:
-    from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy, SmolVLARECAPConfig, SmolVLARECAP
+    from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy, SmolVLARECAP
 except ImportError:
     pass
 

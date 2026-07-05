@@ -1,4 +1,3 @@
-import os
 import torch
 import json
 import numpy as np

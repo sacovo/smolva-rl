@@ -165,7 +165,6 @@ def main():
     # Alternatively: one big .pt per shard — here we use shards of 10k samples.
 
     SHARD_SIZE = 10_000
-    cache = {}   # index -> dict of tensors
     total_cached = 0
 
     print(f"Caching vision embeddings to: {args.output_dir}")

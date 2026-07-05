@@ -3,15 +3,14 @@ import os
 import sys
 import json
 import torch
-import numpy as np
-
 # Add src to python path to enable loading local modules
 sys.path.append(os.path.join(os.getcwd(), "src"))
 
-try:
-    from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy, SmolVLARECAPConfig
-except ImportError:
-    pass
+# Side-effect import: registers the custom `smolvla_recap` policy/config with
+# the LeRobot / Draccus choice registries so make_policy() below can resolve a
+# smolvla_recap checkpoint. (pyflakes reports this as unused — it is not; the
+# import is kept for its registration side effect.)
+import lerobot_policy_smolvla_rl  # noqa: F401
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.configs.policies import PreTrainedConfig
