@@ -153,3 +153,67 @@ To prevent the thresholds from being contaminated by failed episodes, the thresh
 # Compare advantage against task-specific epsilon_l
 advantage_bool = (advantage > batch_thresholds).tolist()
 ```
+
+---
+
+## 4. Critic Pipeline: Usage
+
+The RECAP critic and its downstream advantage/threshold artifacts are produced
+by four modules. This section is the operational companion to the theory above.
+
+### The C51 value head
+
+`SmolVLACritic` (`smolvla_critic.py`) attaches a small **C51 categorical head**
+on top of the (last) VLM prefix hidden state. Its config
+(`SmolVLMCriticConfig`) fixes:
+
+- `num_bins = 201` — the categorical distribution has 201 atoms.
+- `vmin = -1.0`, `vmax = 0.0` — the support spans the normalized return range
+  $[-1, 0]$ (0 = task complete). The bin supports are
+  $z_i = v_{\min} + i \cdot (v_{\max} - v_{\min})/(\text{num\_bins}-1)$.
+
+The head is trained with cross-entropy against the return bin index (see §3),
+and the scalar value is read back as the distribution's mean
+$V(s) = \sum_i p_i z_i$. `state_dropout` is intentionally applied to the
+observation state during critic training (kept high on purpose — do not lower
+it — see the critic-state-dropout note) so the critic cannot shortcut on the
+gripper state.
+
+`C_FAIL = 10000` (`ds_utils.py:10`) is the failure penalty added to the
+remaining-steps count of **failed** episodes in `calculate_returns`; it drives
+their normalized returns (and hence advantages) strongly negative so failed
+frames are never labeled positive.
+
+### Modules
+
+- **`train_critic.py`** — trains `SmolVLACritic` on a LeRobot dataset and saves
+  a `state_dict` checkpoint (`torch.save(model.state_dict(), ...)`). LR uses the
+  shared warmup+cosine+`min_lr` schedule
+  (`train_common.build_warmup_cosine_scheduler`).
+- **`compute_thresholds.py`** — offline CLI that runs the frozen critic over the
+  dataset and writes, into `--save_dir`:
+  `task_thresholds_<repo>.json` (per-task $\epsilon_\ell$) and
+  `task_advantages_<repo>.npy` (per-frame advantages). It is a thin wrapper
+  around `advantage_utils.precompute_advantages_and_thresholds`, so the
+  advantage formula lives in exactly one place.
+- **`advantage_utils.py`** — the single source of truth for the N-step TD
+  advantage and the per-task threshold (the `100 * (1 - positive_fraction)`
+  percentile of successful-episode advantages, default `positive_fraction=0.3`
+  → 70th percentile). Pinned by `tests/test_advantage_utils.py`.
+- **`visualize_critic.py`** — diagnostic that plots the critic's predicted
+  value / return alignment per episode (matplotlib) for sanity-checking a
+  trained critic.
+
+### Phase-3 order of operations
+
+1. **Train the critic** (`train_critic.py`) → critic `state_dict` checkpoint.
+2. **Pre-compute advantages + thresholds** (`compute_thresholds.py`, or the
+   Slurm wrapper `scripts/compute_advantages.sh`) → `task_thresholds_<repo>.json`
+   and `task_advantages_<repo>.npy`.
+3. **Train the RECAP policy** (`train_recap.py`) — it detects the pre-computed
+   files, **skips loading the critic entirely**, and conditions each frame on
+   `<advantage_positive>` / `<advantage_negative>` by comparing the frame's
+   advantage against its task threshold.
+
+See `README_SLURM.md` for the cluster commands (the "High-Speed Offline
+Advantage Mode").
