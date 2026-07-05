@@ -14,6 +14,13 @@ from .smolvla_fast import SmolVLAFast, SmolVLAFastConfig
 from .configuration_smolvla_recap import SmolVLARECAPConfig
 
 
+# Number of visual tokens SmolVLA produces per camera image. SmolVLM2's SigLIP
+# vision encoder yields an 8x8 grid (= 64 tokens) per frame after pixel-shuffle
+# downsampling. C2 visual-token pruning (``visual_tokens_keep``) drops
+# ``SIGLIP_TOKENS_PER_CAMERA - visual_tokens_keep`` tokens from each camera.
+SIGLIP_TOKENS_PER_CAMERA = 64
+
+
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
@@ -1133,7 +1140,9 @@ class SmolVLARECAPPolicy(PreTrainedPolicy):
         if config.visual_tokens_keep is not None:
             from .analyze.attribution.policy_io import camera_keys
             num_cameras = len(camera_keys(self))
-            self.model.prefix_length = config.prefix_length - (64 - config.visual_tokens_keep) * num_cameras
+            self.model.prefix_length = config.prefix_length - (
+                SIGLIP_TOKENS_PER_CAMERA - config.visual_tokens_keep
+            ) * num_cameras
 
         self.reset()
 
