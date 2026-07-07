@@ -1,6 +1,5 @@
 import pytest
 import torch
-import torch.nn as nn
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot_policy_smolvla_rl import SmolVLARECAPConfig, SmolVLARECAP
 

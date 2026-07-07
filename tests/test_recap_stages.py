@@ -38,9 +38,9 @@ def test_calculate_returns_success_vs_fail():
     # returns[0] = -(49 / 100) = -0.49
     assert torch.allclose(returns[0], torch.tensor(-0.49))
     
-    # Episode 1: rem_steps = 49 + C_FAIL = 10049
-    # returns[1] = -(10049 / 100) = -100.49
-    assert torch.allclose(returns[1], torch.tensor(-100.49))
+    # Episode 1: rem_steps = 49 + C_FAIL
+    # returns[1] = -(rem_steps / 100)
+    assert torch.allclose(returns[1], torch.tensor(-(49 + C_FAIL) / 100))
     
     # Ensure failed returns clamp to the lowest bin index (0) when normalized to vmin=-1.0, vmax=0.0
     vmin = -1.0

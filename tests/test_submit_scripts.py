@@ -1,6 +1,5 @@
 import os
 import json
-import shutil
 import sys
 
 # Add root directory to path to find scripts folder

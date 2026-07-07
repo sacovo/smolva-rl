@@ -1,6 +1,5 @@
 import os
 import sys
-import random
 import logging
 from unittest.mock import MagicMock, patch
 from contextlib import contextmanager
@@ -8,8 +7,6 @@ from contextlib import contextmanager
 import pytest
 import torch
 import numpy as np
-from PIL import Image
-from torch.utils.data import DataLoader
 
 # Add src to sys.path
 sys.path.append(os.path.join(os.getcwd(), "src"))
@@ -17,7 +14,6 @@ sys.path.append(os.path.join(os.getcwd(), "src"))
 from lerobot_policy_smolvla_rl.dataloader_utils import (
     RobustDataset,
     CudaPrefetcher,
-    add_dataloader_args,
     build_dataloader,
 )
 

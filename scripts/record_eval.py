@@ -274,7 +274,7 @@ def run_sandbox(args):
                 
                 cv2.putText(display_img, "PRACTICE SANDBOX", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
                 cv2.putText(display_img, f"Step: {step}/{max_steps}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                cv2.putText(display_img, f"Press R to Reset, ESC to Quit", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                cv2.putText(display_img, "Press R to Reset, ESC to Quit", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                 cv2.imshow(window_name, display_img)
                 
                 key = cv2.waitKey(100) & 0xFF
@@ -686,11 +686,11 @@ def main():
             pq.write_table(table, ep_file)
         print("Successfully injected success metadata!")
         
-    print(f"\n=======================================================")
-    print(f"Successfully recorded and finalized dataset!")
+    print("\n=======================================================")
+    print("Successfully recorded and finalized dataset!")
     print(f"Total episodes saved: {episode_idx}")
     print(f"Recorded dataset saved to: {root_dir}")
-    print(f"=======================================================")
+    print("=======================================================")
     
 if __name__ == "__main__":
     main()
