@@ -1,33 +1,24 @@
 #!/bin/bash
 set -e
 
-echo "-------------------------------------------------------"
-echo "Running SnapFlow evaluation with CFG weight = 0.0 (No CFG)..."
-echo "-------------------------------------------------------"
-PYTHONPATH=src uv run lerobot-eval \
-  --policy.path=outputs/snapflow_migrated \
-  --env.type=libero \
-  --env.task=libero_spatial \
-  --eval.batch_size=1 \
-  --eval.n_episodes=10 \
-  --env.max_parallel_tasks=1 \
-  --policy.device=cuda \
-  --policy.cfg_weight=0.0 \
-  --job_name=snapflow_spatial_cfg_0.0
+# CFG weights to evaluate: 0.0 (no CFG) vs 1.5 (with CFG)
+CFG_WEIGHTS=(0.0 1.5)
 
-echo "-------------------------------------------------------"
-echo "Running SnapFlow evaluation with CFG weight = 1.5 (With CFG)..."
-echo "-------------------------------------------------------"
-PYTHONPATH=src uv run lerobot-eval \
-  --policy.path=outputs/snapflow_migrated \
-  --env.type=libero \
-  --env.task=libero_spatial \
-  --eval.batch_size=1 \
-  --eval.n_episodes=10 \
-  --env.max_parallel_tasks=1 \
-  --policy.device=cuda \
-  --policy.cfg_weight=1.5 \
-  --job_name=snapflow_spatial_cfg_1.5
+for cfg in "${CFG_WEIGHTS[@]}"; do
+  echo "-------------------------------------------------------"
+  echo "Running SnapFlow evaluation with CFG weight = ${cfg}..."
+  echo "-------------------------------------------------------"
+  PYTHONPATH=src uv run lerobot-eval \
+    --policy.path=outputs/snapflow_migrated \
+    --env.type=libero \
+    --env.task=libero_spatial \
+    --eval.batch_size=1 \
+    --eval.n_episodes=10 \
+    --env.max_parallel_tasks=1 \
+    --policy.device=cuda \
+    --policy.cfg_weight=${cfg} \
+    --job_name=snapflow_spatial_cfg_${cfg}
+done
 
 echo "-------------------------------------------------------"
 echo "All evaluations finished. Comparing results:"
