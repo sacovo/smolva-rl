@@ -16,19 +16,8 @@ shift 2
 PARTITION="h200"
 NUM_GPUS=1
 
-# Parse optional flags before collecting remaining args
-REMAINING_ARGS=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --partition)
-            PARTITION="$2"; shift 2 ;;
-        --num-gpus)
-            NUM_GPUS="$2"; shift 2 ;;
-        *)
-            REMAINING_ARGS+=("$1"); shift ;;
-    esac
-done
-EXTRA_ARGS="${REMAINING_ARGS[@]}"
+source "$(dirname "${BASH_SOURCE[0]}")/submit_common.sh"
+parse_submit_args "$@"
 
 # Extract clean dataset name (e.g. lerobot/pusht -> pusht)
 DATASET_NAME=$(basename "$DATASET")
