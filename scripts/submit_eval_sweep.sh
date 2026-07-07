@@ -15,9 +15,7 @@
 mkdir -p logs
 mkdir -p outputs/eval
 
-# Set up Conda environment paths
-export CONDA_PREFIX="/home2/sandro.covo/conda12"
-export PATH="$CONDA_PREFIX/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 export LEROBOT_HOME="$HOME/.cache/huggingface/lerobot"
 
 export PYTHONUNBUFFERED=1

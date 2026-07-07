@@ -36,7 +36,12 @@ class SmolVLMCriticConfig(SmolVLAConfig):
 
 class SmolVLACritic(modeling_smolvla.VLAFlowMatching):
     def __init__(self, config: SmolVLMCriticConfig):
-        config.compile_model = False  # maybe implement this actually
+        # Force-disabled: VLAFlowMatching.__init__ wraps self.forward/sample_actions
+        # with torch.compile() when compile_model is set, but that happens here in
+        # super().__init__() -- before this subclass deletes action_in_proj/
+        # action_out_proj and adds c51_head below. Compiling against the
+        # pre-restructuring graph would trace the wrong model shape.
+        config.compile_model = False
         super().__init__(config)
         self.config = config
 
@@ -44,7 +49,6 @@ class SmolVLACritic(modeling_smolvla.VLAFlowMatching):
         del self.action_out_proj
 
         hidden_size = self.vlm_with_expert.vlm.config.text_config.hidden_size
-        # hidden_size = 960
 
         self.c51_head = nn.Sequential(
             nn.Linear(hidden_size, config.num_bins).to(
