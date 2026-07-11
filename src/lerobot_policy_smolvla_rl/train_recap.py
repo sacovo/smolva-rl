@@ -74,6 +74,22 @@ def parse_args():
         help="Path to pre-computed advantages (.npy). Defaults to "
         "<save_dir>/task_advantages_<repo>.npy. Generate with compute_thresholds.py.",
     )
+    parser.add_argument(
+        "--demo_dataset_repo_id",
+        type=str,
+        default=None,
+        help="Optional expert-demo dataset for RECAP co-training. Frames drawn from "
+        "it are ALWAYS labeled positive/high-advantage (guaranteed-good anchor for "
+        "the positive conditional branch).",
+    )
+    parser.add_argument(
+        "--demo_mix_ratio",
+        type=float,
+        default=0.5,
+        help="Probability that a training step draws its batch from the demo dataset "
+        "(labeled positive) instead of the main dataset. Only used with "
+        "--demo_dataset_repo_id.",
+    )
     parser.add_argument("--steps", type=int, default=100000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -351,6 +367,22 @@ def main():
         device=None,  # Disable CudaPrefetcher; Accelerate manages devices
     )
 
+    # 4b. Optional expert-demo co-training loader (frames always labeled positive).
+    demo_dataloader = None
+    if args.demo_dataset_repo_id:
+        print(f"Loading demo co-training dataset (labeled positive): {args.demo_dataset_repo_id}")
+        demo_meta = LeRobotDatasetMetadata(args.demo_dataset_repo_id)
+        demo_delta = resolve_delta_timestamps(dummy_config, demo_meta)
+        with accelerator.local_main_process_first():
+            demo_dataset = LeRobotDataset(
+                args.demo_dataset_repo_id,
+                tolerance_s=args.tolerance_s,
+                delta_timestamps=demo_delta,
+            )
+        demo_dataloader = build_dataloader(
+            demo_dataset, args, shuffle=True, device=None
+        )
+
     # 3. Initialize RECAP Model
     action_dim = features["action"].shape[0]
     recap_config = SmolVLARECAPConfig(
@@ -539,6 +571,15 @@ def main():
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
+    if demo_dataloader is not None:
+        demo_dataloader = accelerator.prepare(demo_dataloader)
+
+    def _cycle_loader(dl):
+        while True:
+            for _b in dl:
+                yield _b
+
+    demo_iter = _cycle_loader(demo_dataloader) if demo_dataloader is not None else None
 
     step = 0
     if checkpoint_to_try:
@@ -562,6 +603,12 @@ def main():
 
     while step < args.steps:
         for batch in dataloader:
+            # Co-training: with prob demo_mix_ratio, swap in an expert-demo batch
+            # (labeled positive). The main-loader batch is skipped this step.
+            is_demo = False
+            if demo_iter is not None and torch.rand(1).item() < args.demo_mix_ratio:
+                batch = next(demo_iter)
+                is_demo = True
             if max_duration_seconds is not None:
                 elapsed = time.time() - start_time
                 if elapsed >= max_duration_seconds - args.duration_buffer:
@@ -585,7 +632,8 @@ def main():
             with accelerator.accumulate(model):
                 # Label advantage
                 with torch.no_grad():
-                    if args.expert_mode:
+                    if is_demo or args.expert_mode:
+                        # Expert-demo (or expert_mode) frames are guaranteed positive.
                         batch_size = batch["task_index"].shape[0]
                         advantage_bool = [True] * batch_size
                         advantage = torch.ones(batch_size, device=device)  # dummy for logging

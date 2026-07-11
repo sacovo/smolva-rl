@@ -1,5 +1,11 @@
+import os
 from collections import deque
-from typing import TypedDict, Unpack
+from typing import TypedDict
+
+try:
+    from typing import Unpack
+except ImportError:  # python < 3.11 (e.g. Jetson JetPack 6 system python)
+    from typing_extensions import Unpack
 
 import torch
 import torch.nn.functional as F
@@ -983,9 +989,17 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         device = lang_tokens.device
         bsize = lang_tokens.shape[0]
 
+        # Diagnostic override: force the conditioning token to negative via env var
+        # (RECAP_FORCE_ADV=neg) to measure whether the model distinguishes the
+        # advantage classes at all. Defaults to the positive token.
+        _adv_id = (
+            self.adv_neg_id
+            if os.environ.get("RECAP_FORCE_ADV", "").lower() == "neg"
+            else self.adv_pos_id
+        )
         adv_tokens = torch.full(
             (bsize, 1),
-            self.adv_pos_id,
+            _adv_id,
             dtype=torch.long,
             device=device,
         )

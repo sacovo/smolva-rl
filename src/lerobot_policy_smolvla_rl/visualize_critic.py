@@ -135,6 +135,7 @@ def main():
     config = SmolVLMCriticConfig(
         num_bins=201,
         num_vlm_layers=args.num_vlm_layers,
+        device=args.device,
     )
 
     features = dataset_to_policy_features(dataset.meta.features)
@@ -237,6 +238,17 @@ def main():
                     returns[i].cpu().item()
                 )
                 results_by_episode[ep_idx]["task_index"] = int(batch_tasks[i])
+
+    # Raw per-episode values, so downstream consumers (e.g. paper figures) can
+    # restyle the curves without re-running the critic.
+    np.savez(
+        os.path.join(args.output_dir, f"critic_values_{dataset_tag}_{ckpt_tag}.npz"),
+        **{
+            f"ep{ep_idx}_{key}": results_by_episode[ep_idx][key]
+            for ep_idx in args.episodes
+            for key in ("expected_values", "gt_values")
+        },
+    )
 
     # Calculate temporal advantages for all episodes to compute task-specific thresholds
     task_advantages = {}
