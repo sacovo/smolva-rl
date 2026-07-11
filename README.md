@@ -1,58 +1,63 @@
-# SmolVLA with RL and FAST Tokenizer
+# SmolVLA-RL: Critic-Guided Rollout Post-Training for a Compact VLA
 
-Modifies SmolVLA to work with RL (RECAP), also uses the FAST Tokenizer to Co-Train the VLM Backbone on large scale robotics data.
+RECAP-style reinforcement post-training for [SmolVLA](https://arxiv.org/abs/2506.01844) (450M), evaluated on the LIBERO benchmark: a distributional critic scores the policy's own rollouts, per-frame advantages are thresholded into positive/negative tokens, and the policy is retrained with advantage conditioning so classifier-free guidance can steer it at inference. Pre-training uses knowledge insulation (KI) with FAST-token co-training of the VLM backbone; SnapFlow one-step distillation removes the iterative flow-matching solve for real-time inference on edge hardware (Jetson Orin Nano).
 
+Best configuration (critic-labeled rollouts co-trained with expert demonstrations): **67.8%** average success across three LIBERO suites, vs. 62.9% for the base policy and 52.4% for plain SmolVLA — with rollouts collected fully autonomously, no human interventions.
 
-## Implementation
+**Project page:** https://sacovo.github.io/smolva-rl/ · **Paper:** [`paper/`](paper/) (PDF built by CI, [download](https://sacovo.github.io/smolva-rl/paper.pdf)) · **Findings:** [`docs/recap_findings_overview.md`](docs/recap_findings_overview.md)
 
-Dataset collection:
+## Repository layout
 
-- Use LeRobot dataset from here: https://huggingface.co/collections/IPEC-COMMUNITY/openx-lerobot
-- There are differing inputs/outputs (joint position/velocity, ee position in cartesian space, ...). According to this [discussion](https://github.com/Physical-Intelligence/openpi/discussions/302) it does not really matter
-- Maybe add names of the input and output values to the text prompt to condition it to generate the correct actions?
-- 8 dimensions for out/input seems to be fine
+| Path | Contents |
+| --- | --- |
+| `src/lerobot_policy_smolvla_rl/` | Policy (`modeling_smolvla_recap.py`), critic (`smolvla_critic.py`), FAST co-training (`smolvla_fast.py`), training entry points (`train_recap.py`, `train_critic.py`, `train_snapflow.py`), advantage tooling (`compute_thresholds.py`) |
+| `scripts/` | Rollout recording (`record_eval.py`), CFG evaluation sweeps (`eval_cfg.sh`), result compilation, Jetson latency benchmark (`bench_jetson.py`), SLURM submission scripts |
+| `paper/` | IEEE draft, figure scripts, and figure data — see [`paper/README.md`](paper/README.md) |
+| `page/` | Project page deployed to GitHub Pages by CI |
+| `analysis_videos/` | Evaluation episodes used in the paper figures and on the project page |
+| `docs/` | Method notes, experiment plans, and findings write-ups |
+| `tests/` | Pytest suite |
 
-Used datasets:
+## Setup
 
-https://huggingface.co/datasets/IPEC-COMMUNITY/droid_lerobot
-https://huggingface.co/datasets/IPEC-COMMUNITY/bridge_orig_lerobot
-https://huggingface.co/datasets/IPEC-COMMUNITY/bc_z_lerobot
-https://huggingface.co/datasets/IPEC-COMMUNITY/dobbe_lerobot
-https://huggingface.co/datasets/IPEC-COMMUNITY/stanford_hydra_dataset_lerobot
-https://huggingface.co/datasets/IPEC-COMMUNITY/berkeley_autolab_ur5_lerobot
+Python ≥ 3.12, managed with [uv](https://docs.astral.sh/uv/):
 
-Consider:
-https://huggingface.co/datasets/IPEC-COMMUNITY/utaustin_mutex_lerobot
+```bash
+uv sync --extra libero   # lerobot[smolvla] + LIBERO simulation
+```
 
+A CUDA Docker image is built from `docker/Dockerfile` and published to `ghcr.io/sacovo/smolva-rl` on every push to main. For cluster training (multi-GPU, checkpoint/resume, config-file submission), see [`README_SLURM.md`](README_SLURM.md).
 
+## Training pipeline
 
-Critic network:
-- Bins normalized returns between \([-1.0, 0.0]\) to classify time-to-completion.
+The RECAP recipe runs in three stages:
 
-## RECAP Training Stages
+1. **Pre-training.** Train the critic on expert demonstrations (`train_critic.py`) — it bins normalized time-to-completion returns in `[-1, 0]` as a C51 distribution. Train the policy with KI, FAST co-training, and advantage conditioning (`train_recap.py`). With `--expert_mode`, the critic is bypassed and every demonstration frame is labeled positive:
 
-The RECAP training pipeline consists of three phases:
+   ```bash
+   python src/lerobot_policy_smolvla_rl/train_recap.py \
+       --dataset_repo_id <dataset_id> \
+       --expert_mode \
+       --steps 100000
+   ```
 
-1. **Phase 1: Pretraining** (Pretrained VLA using large datasets and critic advantage values).
-2. **Phase 2: Supervised Finetuning (Imitation Finetuning)**:
-   - Finetunes the VLA on task-specific demonstration data.
-   - Run the script with the `--expert_mode` flag to bypass the critic and treat all demonstration frames as having a positive advantage (`advantage_bool = True`).
-   - Example command:
-     ```bash
-     python src/lerobot_policy_smolvla_rl/train_recap.py \
-         --dataset_repo_id <dataset_id> \
-         --expert_mode \
-         --steps 100000
-     ```
-3. **Phase 3: Rollout and Policy Enhancement**:
-   - Collects rollout data (e.g. using `scripts/record_eval.py`) with expert/human interventions. Success outcomes are saved in the episode-level metadata (`success` column in `meta/episodes.parquet`).
-   - **Critic Finetuning**: Run `train_critic.py`. Failed episodes are penalized with a terminal penalty of `-C_FAIL` (normalized to push them to the lowest value bin `0`).
-   - **Advantage Pre-computation**: Run `compute_thresholds.py` with the trained critic to pre-compute the N-step TD advantages and per-task thresholds (paper Appendix A-F: `A_t = Σ r_{t..t+N-1} + V(o_{t+N}) − V(o_t)`, with `--advantage_horizon N` defaulting to 50). This writes `task_advantages_<repo>.npy` and `task_thresholds_<repo>.json` into `--save_dir`.
-     ```bash
-     python src/lerobot_policy_smolvla_rl/compute_thresholds.py \
-         --dataset_repo_id <dataset_id> \
-         --critic_checkpoint <critic.pt> \
-         --save_dir outputs/recap_phase1
-     ```
-   - **Policy Enhancement**: Run `train_recap.py` (without `--expert_mode`) pointing `--save_dir` (or `--precomputed_advantages`/`--thresholds_path`) at those files. The trainer only consumes the pre-computed advantages — it never runs the critic itself, and exits with an error if the files are missing. Any frames with human/expert interventions (`batch["intervention"] == True`) override the threshold and receive a positive advantage signal (`advantage_bool = True`).
+2. **Rollout collection and critic fine-tuning.** Collect policy rollouts with `scripts/record_eval.py` (episode success is stored in `meta/episodes.parquet`). Fine-tune the critic on the rollout data with `train_critic.py`; failed episodes receive a terminal penalty that pushes them into the lowest value bin. Then pre-compute N-step TD advantages and per-task labeling thresholds:
 
+   ```bash
+   python src/lerobot_policy_smolvla_rl/compute_thresholds.py \
+       --dataset_repo_id <dataset_id> \
+       --critic_checkpoint <critic.pt> \
+       --save_dir outputs/recap_phase1
+   ```
+
+   This writes `task_advantages_<repo>.npy` and `task_thresholds_<repo>.json` into `--save_dir`. The threshold's target positive fraction matters: aggressive settings label necessary actions negative and degrade the policy (see the paper's ablation).
+
+3. **Advantage-conditioned fine-tuning.** Run `train_recap.py` without `--expert_mode`, pointing `--save_dir` (or `--precomputed_advantages` / `--thresholds_path`) at the stage-2 outputs. The trainer only consumes pre-computed advantages — it never runs the critic itself. Mixing expert demonstration batches into this fine-tune (co-training) gives the best results and is required to fix long-horizon regressions. Optionally distill the result into a one-step policy with `train_snapflow.py`.
+
+## Evaluation
+
+`scripts/eval_cfg.sh` sweeps the classifier-free guidance weight on LIBERO suites; `scripts/compile_results.py` and `scripts/compare_eval_runs.py` aggregate results. `scripts/bench_jetson.py` measures action-chunk latency on a Jetson Orin Nano (the paper's 922 ms → 255 ms SnapFlow numbers).
+
+## Paper
+
+`paper/` contains the full LaTeX source; every figure regenerates from data committed in this repo (`paper/make_figures.py`, `paper/make_filmstrips.py`). CI builds the PDF and deploys the project page on every push to main (`.github/workflows/paper.yml`).
