@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Critic-Guided Rollout Post-Training of a Compact VLA for Edge Robotics</title>
+<meta name="description" content="RECAP-style critic-guided rollout post-training transfers to SmolVLA: +5 points average success on LIBERO with autonomous rollouts only, and 3.6× lower latency on a Jetson Orin Nano via one-step distillation.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap" rel="stylesheet">
+<style>
+:root {
+  --ground: #f2f4f2;
+  --surface: #ffffff;
+  --ink: #17211b;
+  --muted: #5c6862;
+  --pos: #157a46;
+  --pos-soft: #e3f0e8;
+  --neg: #b3402e;
+  --neg-soft: #f6e8e5;
+  --rule: #dbe1dc;
+  --sans: "IBM Plex Sans", system-ui, sans-serif;
+  --serif: "Source Serif 4", Georgia, serif;
+  --mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.06rem;
+  line-height: 1.65;
+}
+a { color: var(--pos); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { color: var(--ink); }
+:focus-visible { outline: 2px solid var(--pos); outline-offset: 2px; }
+
+.draftbar {
+  font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.04em;
+  background: var(--ink); color: #e9eee9;
+  padding: 0.45rem 1rem; text-align: center;
+}
+.draftbar strong { color: #f2b8ac; font-weight: 500; }
+
+.wrap { max-width: 960px; margin: 0 auto; padding: 0 1.25rem; }
+
+header.masthead { padding: 3.2rem 0 0; }
+.eyebrow {
+  font-family: var(--mono); font-size: 0.8rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted); margin: 0 0 1rem;
+}
+.eyebrow .sep { color: var(--rule); padding: 0 0.4rem; }
+h1 {
+  font-family: var(--sans); font-weight: 700;
+  font-size: clamp(1.7rem, 4.2vw, 2.7rem);
+  line-height: 1.12; letter-spacing: -0.015em;
+  margin: 0 0 1.1rem; max-width: 21ch;
+}
+.byline { font-size: 1rem; color: var(--muted); margin: 0 0 1.4rem; }
+.byline .who { color: var(--ink); font-weight: 600; font-style: normal; }
+.linkrow { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 2.6rem; }
+.btn {
+  font-family: var(--mono); font-size: 0.85rem; text-decoration: none;
+  border: 1px solid var(--ink); color: var(--ink);
+  padding: 0.45rem 0.95rem; border-radius: 999px; background: var(--surface);
+}
+.btn.primary { background: var(--ink); color: #fff; }
+.btn:hover { background: var(--pos); border-color: var(--pos); color: #fff; }
+
+/* hero: labeled success/fail pair */
+.hero { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.rollout { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; }
+.rollout video { display: block; width: 100%; aspect-ratio: 1/1; object-fit: cover; background: #222; }
+.rollout figcaption {
+  display: flex; align-items: baseline; gap: 0.55rem;
+  padding: 0.6rem 0.75rem 0.65rem;
+  font-family: var(--mono); font-size: 0.78rem; line-height: 1.4; color: var(--muted);
+}
+.chip {
+  flex: none; display: inline-grid; place-items: center;
+  width: 1.5rem; height: 1.5rem; border-radius: 50%;
+  font-family: var(--mono); font-size: 0.95rem; font-weight: 500;
+  transform: translateY(0.28em);
+}
+.chip.pos { background: var(--pos-soft); color: var(--pos); border: 1px solid var(--pos); }
+.chip.neg { background: var(--neg-soft); color: var(--neg); border: 1px solid var(--neg); }
+.rollout .pol { color: var(--ink); font-weight: 500; }
+.hero-note {
+  font-size: 0.95rem; color: var(--muted); max-width: 62ch;
+  margin: 1rem 0 0;
+}
+
+section { padding: 2.6rem 0 0; }
+.kicker {
+  font-family: var(--mono); font-size: 0.8rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--pos); margin: 0 0 0.7rem;
+}
+h2 {
+  font-family: var(--sans); font-weight: 600; font-size: 1.45rem;
+  letter-spacing: -0.01em; margin: 0 0 0.9rem;
+}
+p { max-width: 68ch; margin: 0 0 1rem; }
+.lede { font-size: 1.14rem; }
+
+/* findings */
+.findings { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.65rem; }
+.findings li {
+  background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 0.85rem 1rem; display: flex; gap: 0.8rem; align-items: baseline;
+}
+.findings .tag {
+  flex: none; font-family: var(--mono); font-size: 0.78rem; color: var(--muted);
+  border-bottom: 2px solid var(--pos); padding-bottom: 2px;
+}
+.findings li.caveat .tag { border-bottom-color: var(--neg); }
+.findings b { font-family: var(--sans); font-weight: 600; }
+
+/* results table */
+.tablecard { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 0.4rem 0.9rem; overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+caption { caption-side: bottom; font-size: 0.82rem; color: var(--muted); text-align: left; padding: 0.6rem 0.2rem 0.5rem; font-family: var(--mono); }
+th, td { text-align: left; padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--rule); }
+tr:last-child td { border-bottom: none; }
+th { font-family: var(--sans); font-weight: 600; font-size: 0.88rem; }
+td.n, th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+td.best { color: var(--pos); font-weight: 500; }
+td.worst { color: var(--neg); }
+tr.hl td { background: var(--pos-soft); }
+tr.hl td:first-child { border-radius: 6px 0 0 6px; }
+tr.hl td:last-child { border-radius: 0 6px 6px 0; }
+
+/* figures */
+figure.plot { margin: 1.2rem 0 0; background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 1rem; }
+figure.plot img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+figure.plot figcaption { font-size: 0.88rem; color: var(--muted); padding-top: 0.7rem; max-width: 68ch; }
+figure.strip { margin: 1.2rem 0 0; }
+figure.strip img { display: block; width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--rule); }
+figure.strip figcaption { font-size: 0.88rem; color: var(--muted); padding-top: 0.55rem; }
+
+/* video grid */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-top: 1.3rem; }
+
+/* latency */
+.latency { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1.3rem; }
+.lat {
+  background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 1.1rem 1.2rem;
+}
+.lat .label { font-family: var(--mono); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+.lat .value { font-family: var(--sans); font-weight: 700; font-size: 2.1rem; letter-spacing: -0.02em; margin: 0.15rem 0; }
+.lat .value small { font-size: 1.1rem; font-weight: 600; color: var(--muted); }
+.lat.fast { border-color: var(--pos); }
+.lat.fast .value { color: var(--pos); }
+.lat .sub { font-size: 0.88rem; color: var(--muted); }
+
+/* bibtex */
+pre.bib {
+  background: var(--ink); color: #dfe7e1; border-radius: 10px;
+  font-family: var(--mono); font-size: 0.82rem; line-height: 1.55;
+  padding: 1.1rem 1.3rem; overflow-x: auto; margin: 1.2rem 0 0;
+}
+
+footer {
+  margin-top: 3.5rem; padding: 1.6rem 0 2.4rem; border-top: 1px solid var(--rule);
+  font-family: var(--mono); font-size: 0.8rem; color: var(--muted);
+}
+footer a { color: var(--muted); }
+
+@media (max-width: 640px) {
+  .hero, .latency { grid-template-columns: 1fr; }
+  body { font-size: 1rem; }
+}
+</style>
+</head>
+<body>
+
+<div class="draftbar" role="note">
+  <strong>Preprint draft</strong> — work in progress; some evaluations are still running and numbers may change.
+</div>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Preprint · 2026 <span class="sep">/</span> FHNW <span class="sep">/</span> LIBERO benchmark</p>
+  <h1>Critic-Guided Rollout Post-Training of a Compact Vision-Language-Action Policy for Edge Robotics</h1>
+  <p class="byline"><span class="who">Sandro Covo</span> · FHNW, Switzerland</p>
+  <nav class="linkrow" aria-label="Paper links">
+    <a class="btn primary" href="paper.pdf">Paper (PDF)</a>
+    <a class="btn" href="https://github.com/sacovo/smolva-rl">Code &amp; data</a>
+    <a class="btn" href="#cite">BibTeX</a>
+  </nav>
+
+  <div class="hero">
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_goalT0_drawer_SUCCESS_ep0.mp4" autoplay muted loop playsinline aria-label="Rollout video: co-trained policy opens the drawer"></video>
+      <figcaption><span class="chip pos" aria-label="success">+</span>
+        <span><span class="pol">co-trained policy</span> — opens the middle drawer and completes the task</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/250k_goalT0_drawer_FAIL_ep0.mp4" autoplay muted loop playsinline aria-label="Rollout video: base policy fails to open the drawer"></video>
+      <figcaption><span class="chip neg" aria-label="failure">−</span>
+        <span><span class="pol">base policy</span> — hovers at the cabinet until timeout, never engages the handle</span></figcaption>
+    </figure>
+  </div>
+  <p class="hero-note">Same task, same model size. The difference is post-training: rollouts scored by a
+  learned critic, labeled <span style="color:var(--pos);font-family:var(--mono)">+</span>/<span style="color:var(--neg);font-family:var(--mono)">−</span>,
+  and fed back — the labeling scheme this page borrows for every video on it.</p>
+</header>
+
+<section id="tldr">
+  <p class="kicker">TL;DR</p>
+  <p class="lede">RECAP-style critic-guided rollout post-training — introduced with the 4.9B-parameter
+  π*<sub>0.6</sub> — <b>transfers to SmolVLA</b>, a 450M flow-matching VLA small enough for
+  battery-powered robots. Unlike RECAP, rollouts are collected fully autonomously and labeled by the
+  learned critic alone, with no human corrections. Fine-tuning on critic-labeled rollouts mixed with
+  expert demonstrations reaches <b>67.8% average success</b> on three LIBERO suites, vs. 62.9% for the
+  base policy and 52.4% for plain SmolVLA. One-step SnapFlow distillation then cuts action-chunk
+  latency <b>3.6×</b> on a Jetson Orin Nano.</p>
+</section>
+
+<section id="findings">
+  <p class="kicker">Findings</p>
+  <h2>What we learned</h2>
+  <ul class="findings">
+    <li><span class="tag">F1</span><span><b>The knowledge-insulation recipe is the largest single effect.</b>
+      Pre-training with KI, FAST co-training, and advantage conditioning gains ≈10 points per suite
+      over the plain SmolVLA recipe (+10.2, +9.8, +11.4).</span></li>
+    <li class="caveat"><span class="tag">F2</span><span><b>Rollout-only fine-tuning is not uniformly safe.</b>
+      It lifts the short-horizon suites (+6.6 spatial, +4.2 goal) but degrades long-horizon
+      LIBERO-10 (35.8 vs. 41.6) — a compact policy seems to need explicit replay to retain behavior.</span></li>
+    <li><span class="tag">F3</span><span><b>Co-training with expert demonstrations fixes the regression.</b>
+      Mixing demonstration batches (ratio 0.5) into the fine-tune lifts all three suites and gives the
+      best policy: 67.8% average. It matters most for skills absent from the policy's own rollouts —
+      rollout data can only sharpen what the policy already does.</span></li>
+    <li class="caveat"><span class="tag">F4</span><span><b>The advantage-labeling threshold must be permissive.</b>
+      Aggressive thresholds (f⁺ = 0.3–0.4) label necessary approach and transport motions negative;
+      the policy partially unlearns them and guidance amplifies the damage. f⁺ = 0.8 avoids this.</span></li>
+    <li><span class="tag">F5</span><span><b>The gains come from training, not inference-time guidance.</b>
+      Classifier-free guidance adds only ~1 point at its best setting; nearly the whole improvement is
+      already present at w = 0.</span></li>
+    <li><span class="tag">F6</span><span><b>One-step distillation makes it real-time on edge hardware.</b>
+      SnapFlow replaces the ten-step flow-matching solve with a single step: 922 → 255 ms per
+      20-action chunk on a Jetson Orin Nano (8 GB).</span></li>
+  </ul>
+</section>
+
+<section id="results">
+  <p class="kicker">Results</p>
+  <h2>Main comparison</h2>
+  <div class="tablecard">
+    <table>
+      <caption>Percent success, n = 500 episodes per suite; conditioned methods at their best guidance weight.</caption>
+      <thead>
+        <tr><th>Method</th><th class="n">spatial</th><th class="n">goal</th><th class="n">long</th><th class="n">avg</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>SmolVLA, no KI</td><td class="n">61.0</td><td class="n">66.0</td><td class="n worst">30.2</td><td class="n">52.4</td></tr>
+        <tr><td>SmolVLA + KI (base)</td><td class="n">71.2</td><td class="n">75.8</td><td class="n">41.6</td><td class="n">62.9</td></tr>
+        <tr><td>+ rollout data (f⁺ = 0.8)</td><td class="n best">77.8</td><td class="n">80.0</td><td class="n worst">35.8</td><td class="n">64.5</td></tr>
+        <tr class="hl"><td>+ co-training (f⁺ = 0.4)</td><td class="n">75.4</td><td class="n best">84.2</td><td class="n best">43.8</td><td class="n best">67.8</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="plot">
+    <img src="figs/fig_dose.png" alt="Line chart: success rate versus guidance weight for three labeling thresholds on LIBERO-spatial. The permissive threshold curve sits highest and peaks at w=0.5; aggressive-threshold curves sit lower and decline as w grows." width="680">
+    <figcaption>The threshold ablation (LIBERO-spatial). With aggressive labeling (f⁺ = 0.3, 0.4) the whole
+    curve sits below the base policy and degrades as guidance strengthens; at f⁺ = 0.8 the policy improves
+    and moderate guidance helps — by about one point.</figcaption>
+  </figure>
+
+  <figure class="plot">
+    <img src="figs/fig_critic.png" alt="Line chart of the critic's value over one expert episode: it rises from minus one toward zero, dips back mid-episode where progress stalls, then recovers." width="560">
+    <figcaption>Why per-frame labels are possible at all: the demonstration-trained critic's value rises with
+    task progress and drops back where progress stalls (here, a missed grasp), giving advantages a
+    within-trajectory signal.</figcaption>
+  </figure>
+</section>
+
+<section id="failures">
+  <p class="kicker">Failure modes</p>
+  <h2>Where every policy still fails</h2>
+  <p>The dominant remaining failure is long-horizon tasks chaining <em>two</em> pick-and-place subgoals:
+  every method stays below ~40% on that subset, and below 16% on the hardest task. The policy typically
+  places the first object and runs out of time sequencing the second.</p>
+  <figure class="strip">
+    <img src="figs/lib10_dualobj_fail.png" alt="Filmstrip of ten frames: the robot places the alphabet soup in the basket but fails to also place the cream cheese box before timeout." width="1138">
+    <figcaption><span style="font-family:var(--mono);color:var(--neg)">−</span> “Put both the alphabet soup and
+    the cream cheese box in the basket” — first subgoal completed, second unfinished at timeout.</figcaption>
+  </figure>
+</section>
+
+<section id="videos">
+  <p class="kicker">Rollout videos</p>
+  <h2>Evaluation episodes</h2>
+  <p>Uncut evaluation episodes of the policies compared in the paper, labeled with their outcome the same
+  way the critic labels training frames.</p>
+  <div class="grid">
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_goalT0_drawer_SUCCESS_ep1.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip pos">+</span><span><span class="pol">co-trained</span> · goal · open the middle drawer</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/250k_goalT0_drawer_FAIL_ep1.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip neg">−</span><span><span class="pol">base</span> · goal · open the middle drawer</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_lib10T5_book_SUCCESS_ep0.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip pos">+</span><span><span class="pol">co-trained</span> · long · book into caddy</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_lib10T5_book_SUCCESS_ep1.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip pos">+</span><span><span class="pol">co-trained</span> · long · book into caddy</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_lib10T7_putBOTH_FAIL_ep0.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip neg">−</span><span><span class="pol">co-trained</span> · long · put both items in basket</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_lib10T7_putBOTH_FAIL_ep1.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip neg">−</span><span><span class="pol">co-trained</span> · long · put both items in basket</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/rollout_spatialT5_ramekin_SUCCESS_ep0.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip pos">+</span><span><span class="pol">rollout-only</span> · spatial · ramekin scene</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/rollout_spatialT5_ramekin_SUCCESS_ep1.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip pos">+</span><span><span class="pol">rollout-only</span> · spatial · ramekin scene</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_spatialT5_ramekin_FAIL_ep1.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip neg">−</span><span><span class="pol">co-trained</span> · spatial · ramekin scene</span></figcaption>
+    </figure>
+    <figure class="rollout" style="margin:0">
+      <video src="videos/cotrain_spatialT5_ramekin_FAIL_ep2.mp4" controls muted playsinline preload="metadata"></video>
+      <figcaption><span class="chip neg">−</span><span><span class="pol">co-trained</span> · spatial · ramekin scene</span></figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="latency">
+  <p class="kicker">Edge latency</p>
+  <h2>SnapFlow one-step inference on Jetson Orin Nano</h2>
+  <p>The target hardware is a 7–25 W board with 8 GB of unified memory — too small for the bfloat16
+  weights of π*<sub>0.6</sub>, comfortable for SmolVLA. Distilling the ten-step flow-matching solve into
+  a single step raises the re-planning rate from 1.1 to 3.9 action chunks per second.</p>
+  <div class="latency">
+    <div class="lat">
+      <div class="label">Flow matching · 10-step ODE</div>
+      <div class="value">922 <small>ms / chunk</small></div>
+      <div class="sub">20-action chunk, bfloat16, batch 1</div>
+    </div>
+    <div class="lat fast">
+      <div class="label">SnapFlow · 1 step</div>
+      <div class="value">255 <small>ms / chunk</small></div>
+      <div class="sub">3.6× faster — 12.7 ms per action, amortized</div>
+    </div>
+  </div>
+</section>
+
+<section id="cite">
+  <p class="kicker">Cite</p>
+  <h2>BibTeX</h2>
+  <pre class="bib">@unpublished{covo2026smolvla_recap,
+  title  = {Critic-Guided Rollout Post-Training of a Compact
+            Vision-Language-Action Policy for Edge Robotics},
+  author = {Covo, Sandro},
+  year   = {2026},
+  note   = {Preprint draft. Code: https://github.com/sacovo/smolva-rl},
+}</pre>
+</section>
+
+<footer>
+  FHNW · <a href="https://github.com/sacovo/smolva-rl">github.com/sacovo/smolva-rl</a> ·
+  paper built from source by CI · figures and videos reproducible from the repository
+</footer>
+
+</div>
+
+<script>
+if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+  document.querySelectorAll('video[autoplay]').forEach(v => { v.removeAttribute('autoplay'); v.pause(); v.controls = true; });
+}
+</script>
+</body>
+</html>

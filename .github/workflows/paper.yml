@@ -1,0 +1,72 @@
+name: Build Paper and Deploy Project Page
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'paper/**'
+      - 'page/**'
+      - 'analysis_videos/**'
+      - '.github/workflows/paper.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-paper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build LaTeX PDF
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: main.tex
+          working_directory: paper
+          latexmk_use_lualatex: false
+
+      - name: Upload PDF Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-pdf
+          path: paper/main.pdf
+
+  deploy-page:
+    needs: build-paper
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download PDF Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: paper-pdf
+          path: _pdf
+
+      - name: Assemble Site
+        run: |
+          mkdir -p _site/figs _site/videos
+          cp page/index.html _site/
+          cp _pdf/main.pdf _site/paper.pdf
+          cp paper/figs/*.png _site/figs/
+          cp analysis_videos/*.mp4 _site/videos/
+
+      - name: Upload Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
