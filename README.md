@@ -32,7 +32,20 @@ A CUDA Docker image is built from `docker/Dockerfile` and published to `ghcr.io/
 
 The RECAP recipe runs in three stages:
 
-1. **Pre-training.** Train the critic on expert demonstrations (`train_critic.py`) — it bins normalized time-to-completion returns in `[-1, 0]` as a C51 distribution. Train the policy with KI, FAST co-training, and advantage conditioning (`train_recap.py`). With `--expert_mode`, the critic is bypassed and every demonstration frame is labeled positive:
+1. **Pre-training.** Train the critic on expert demonstrations (`train_critic.py`) — it bins normalized time-to-completion returns in `[-1, 0]` as a C51 distribution:
+
+   ```bash
+   python src/lerobot_policy_smolvla_rl/train_critic.py \
+       --dataset_repo_id HuggingFaceVLA/libero \
+       --steps 5000 \
+       --state_dropout 0.2 \
+       --end_weight 3.0 --end_threshold -0.1 \
+       --save_dir outputs/checkpoints_critic
+   ```
+
+   `--state_dropout` randomly zeroes the proprioceptive state so the critic must judge progress from the images instead of shortcutting on the gripper state (keep it high); `--end_weight`/`--end_threshold` upweight the loss on end-of-episode frames.
+
+   Then train the policy with KI, FAST co-training, and advantage conditioning (`train_recap.py`). With `--expert_mode`, the critic is bypassed and every demonstration frame is labeled positive:
 
    ```bash
    python src/lerobot_policy_smolvla_rl/train_recap.py \
@@ -41,7 +54,7 @@ The RECAP recipe runs in three stages:
        --steps 100000
    ```
 
-2. **Rollout collection and critic fine-tuning.** Collect policy rollouts with `scripts/record_eval.py` (episode success is stored in `meta/episodes.parquet`). Fine-tune the critic on the rollout data with `train_critic.py`; failed episodes receive a terminal penalty that pushes them into the lowest value bin. Then pre-compute N-step TD advantages and per-task labeling thresholds:
+2. **Rollout collection and critic fine-tuning.** Collect policy rollouts with `scripts/record_eval.py` (episode success is stored in `meta/episodes.parquet`). Fine-tune the critic on the rollout data with the same `train_critic.py` command, starting from the pre-trained checkpoint via `--pretrained_critic_path`; failed episodes receive a terminal penalty that pushes them into the lowest value bin. Then pre-compute N-step TD advantages and per-task labeling thresholds:
 
    ```bash
    python src/lerobot_policy_smolvla_rl/compute_thresholds.py \
