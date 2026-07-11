@@ -30,9 +30,11 @@ A CUDA Docker image is built from `docker/Dockerfile` and published to `ghcr.io/
 
 ## Training pipeline
 
-The RECAP recipe runs in three stages:
+The pipeline is one critic → advantages → policy cycle, run twice: first on the expert demonstrations (pre-training), then on the policy's own rollouts (fine-tuning). Advantage conditioning is in place from the very first policy training step — the pre-trained policy already interprets the ± tokens before it ever sees rollout data.
 
-1. **Pre-training.** Train the critic on expert demonstrations (`train_critic.py`) — it bins normalized time-to-completion returns in `[-1, 0]` as a C51 distribution:
+**Round 1 — pre-training on expert demonstrations**
+
+1. **Train the critic** (`train_critic.py`) — it bins normalized time-to-completion returns in `[-1, 0]` as a C51 distribution:
 
    ```bash
    python src/lerobot_policy_smolvla_rl/train_critic.py \
@@ -45,27 +47,45 @@ The RECAP recipe runs in three stages:
 
    `--state_dropout` randomly zeroes the proprioceptive state so the critic must judge progress from the images instead of shortcutting on the gripper state (keep it high); `--end_weight`/`--end_threshold` upweight the loss on end-of-episode frames.
 
-   Then train the policy with KI, FAST co-training, and advantage conditioning (`train_recap.py`). With `--expert_mode`, the critic is bypassed and every demonstration frame is labeled positive:
-
-   ```bash
-   python src/lerobot_policy_smolvla_rl/train_recap.py \
-       --dataset_repo_id <dataset_id> \
-       --expert_mode \
-       --steps 100000
-   ```
-
-2. **Rollout collection and critic fine-tuning.** Collect policy rollouts with `scripts/record_eval.py` (episode success is stored in `meta/episodes.parquet`). Fine-tune the critic on the rollout data with the same `train_critic.py` command, starting from the pre-trained checkpoint via `--pretrained_critic_path`; failed episodes receive a terminal penalty that pushes them into the lowest value bin. Then pre-compute N-step TD advantages and per-task labeling thresholds:
+2. **Compute advantages and thresholds** (`compute_thresholds.py`) — N-step TD advantages from the critic, plus the per-task labeling thresholds:
 
    ```bash
    python src/lerobot_policy_smolvla_rl/compute_thresholds.py \
-       --dataset_repo_id <dataset_id> \
+       --dataset_repo_id HuggingFaceVLA/libero \
        --critic_checkpoint <critic.pt> \
        --save_dir outputs/recap_phase1
    ```
 
    This writes `task_advantages_<repo>.npy` and `task_thresholds_<repo>.json` into `--save_dir`. The threshold's target positive fraction matters: aggressive settings label necessary actions negative and degrade the policy (see the paper's ablation).
 
-3. **Advantage-conditioned fine-tuning.** Run `train_recap.py` without `--expert_mode`, pointing `--save_dir` (or `--precomputed_advantages` / `--thresholds_path`) at the stage-2 outputs. The trainer only consumes pre-computed advantages — it never runs the critic itself. Mixing expert demonstration batches into this fine-tune (co-training) gives the best results and is required to fix long-horizon regressions. Optionally distill the result into a one-step policy with `train_snapflow.py`.
+3. **Pre-train the policy** (`train_recap.py`) with KI, FAST co-training, and advantage conditioning, pointing `--save_dir` (or `--precomputed_advantages` / `--thresholds_path`) at the step-2 outputs — the trainer only consumes pre-computed advantages, it never runs the critic itself:
+
+   ```bash
+   python src/lerobot_policy_smolvla_rl/train_recap.py \
+       --dataset_repo_id HuggingFaceVLA/libero \
+       --save_dir outputs/recap_phase1 \
+       --steps 250000
+   ```
+
+   (`--expert_mode` instead bypasses the critic entirely and labels every frame positive — plain advantage-free imitation, used for ablations.)
+
+**Round 2 — fine-tuning on the policy's own rollouts**
+
+4. **Collect rollouts** with `scripts/record_eval.py`; episode success is stored in `meta/episodes.parquet`.
+5. **Fine-tune the critic** on the rollout data — same `train_critic.py` command, starting from the round-1 checkpoint via `--pretrained_critic_path`. This step is necessary: trained on successes only, the critic is over-optimistic on failed rollouts. Failed episodes receive a terminal penalty that pushes them into the lowest value bin.
+6. **Recompute advantages and thresholds** on the rollout dataset with the fine-tuned critic (same `compute_thresholds.py` command, new `--save_dir`).
+7. **Fine-tune the policy** from the round-1 checkpoint on the labeled rollouts; mixing expert demonstration batches back in (co-training) gives the best results and is required to fix long-horizon regressions:
+
+   ```bash
+   python src/lerobot_policy_smolvla_rl/train_recap.py \
+       --dataset_repo_id <rollout_dataset> \
+       --pretrained_policy_path <round1_checkpoint> \
+       --save_dir outputs/recap_phase2 \
+       --demo_dataset_repo_id HuggingFaceVLA/libero --demo_mix_ratio 0.5 \
+       --steps 20000
+   ```
+
+   Optionally distill the result into a one-step policy with `train_snapflow.py`.
 
 ## Evaluation
 
