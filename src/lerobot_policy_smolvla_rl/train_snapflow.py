@@ -1,28 +1,30 @@
 import argparse
+import json
 import logging
 import os
-import json
-import numpy as np
 import sys
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
 from lerobot_policy_smolvla_rl import SmolVLARECAP, SmolVLARECAPConfig
-from lerobot_policy_smolvla_rl.dataloader_utils import (
-    add_dataloader_args,
-    build_dataloader,
-    patch_lerobot_dataset_reader,
-)
 from lerobot_policy_smolvla_rl.checkpoint_utils import (
-    resolve_checkpoints,
     load_checkpoint,
     parse_duration_to_seconds,
+    resolve_checkpoints,
+)
+from lerobot_policy_smolvla_rl.dataloader_utils import (
+    add_augmentation_args,
+    add_dataloader_args,
+    build_dataloader,
+    build_image_transforms,
+    patch_lerobot_dataset_reader,
 )
 from lerobot_policy_smolvla_rl.train_common import build_warmup_cosine_scheduler
 
@@ -30,82 +32,145 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train SmolVLA SnapFlow Distillation (Phase 2)")
-    parser.add_argument("--recap_checkpoint", type=str, required=True,
-                        help="Path to converged RECAP checkpoint (.pt file or exported directory)")
-    parser.add_argument("--dataset_repo_id", type=str, required=True,
-                        help="Same dataset repo id used for RECAP training")
-    parser.add_argument("--precomputed_advantages", type=str, default=None,
-                        help="Per-frame advantages .npy (from compute_thresholds.py). Required "
-                        "when distilling on rollout data so each frame carries its true +/- "
-                        "token; without it every frame is treated as positive, which is only "
-                        "correct for expert demonstrations.")
-    parser.add_argument("--thresholds_path", type=str, default=None,
-                        help="Per-task thresholds .json matching --precomputed_advantages.")
-    parser.add_argument("--demo_dataset_repo_id", type=str, default=None,
-                        help="Optional expert-demo dataset mixed into distillation (frames "
-                        "always labeled positive), mirroring RECAP co-training so the student "
-                        "sees the same state distribution the teacher was fine-tuned on.")
-    parser.add_argument("--demo_mix_ratio", type=float, default=0.5,
-                        help="Probability that a step draws its batch from the demo dataset. "
-                        "Only used with --demo_dataset_repo_id.")
-    parser.add_argument("--distill_cfg_weight", type=float, default=None,
-                        help="Guidance distillation: distill the teacher's CFG-blended field "
-                        "v_u + w (v_c - v_u) at this weight. The student is always "
-                        "positive-conditioned and reproduces guided behavior in a single "
-                        "unguided pass at inference.")
-    parser.add_argument("--frozen_teacher", action="store_true",
-                        help="Keep a frozen copy of the teacher checkpoint and take all "
-                        "distillation targets from it instead of the training model. With "
-                        "--distill_cfg_weight this also replaces the dataset-action FM "
-                        "target with the teacher's guided field, so both loss terms agree "
-                        "(self-teacher guidance collapses toward the unconditional field "
-                        "and its uncond branch drifts untrained).")
+    parser = argparse.ArgumentParser(
+        description="Train SmolVLA SnapFlow Distillation (Phase 2)"
+    )
+    parser.add_argument(
+        "--recap_checkpoint",
+        type=str,
+        required=True,
+        help="Path to converged RECAP checkpoint (.pt file or exported directory)",
+    )
+    parser.add_argument(
+        "--dataset_repo_id",
+        type=str,
+        required=True,
+        help="Same dataset repo id used for RECAP training",
+    )
+    parser.add_argument(
+        "--precomputed_advantages",
+        type=str,
+        default=None,
+        help="Per-frame advantages .npy (from compute_thresholds.py). Required "
+        "when distilling on rollout data so each frame carries its true +/- "
+        "token; without it every frame is treated as positive, which is only "
+        "correct for expert demonstrations.",
+    )
+    parser.add_argument(
+        "--thresholds_path",
+        type=str,
+        default=None,
+        help="Per-task thresholds .json matching --precomputed_advantages.",
+    )
+    parser.add_argument(
+        "--demo_dataset_repo_id",
+        type=str,
+        default=None,
+        help="Optional expert-demo dataset mixed into distillation (frames "
+        "always labeled positive), mirroring RECAP co-training so the student "
+        "sees the same state distribution the teacher was fine-tuned on.",
+    )
+    parser.add_argument(
+        "--demo_mix_ratio",
+        type=float,
+        default=0.5,
+        help="Probability that a step draws its batch from the demo dataset. "
+        "Only used with --demo_dataset_repo_id.",
+    )
+    parser.add_argument(
+        "--distill_cfg_weight",
+        type=float,
+        default=None,
+        help="Guidance distillation: distill the teacher's CFG-blended field "
+        "v_u + w (v_c - v_u) at this weight. The student is always "
+        "positive-conditioned and reproduces guided behavior in a single "
+        "unguided pass at inference.",
+    )
+    parser.add_argument(
+        "--frozen_teacher",
+        action="store_true",
+        help="Keep a frozen copy of the teacher checkpoint and take all "
+        "distillation targets from it instead of the training model. With "
+        "--distill_cfg_weight this also replaces the dataset-action FM "
+        "target with the teacher's guided field, so both loss terms agree "
+        "(self-teacher guidance collapses toward the unconditional field "
+        "and its uncond branch drifts untrained).",
+    )
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2.5e-5)
-    parser.add_argument("--min_lr", type=float, default=2.5e-7,
-                        help="Minimum learning rate for cosine decay")
-    parser.add_argument("--warmup_steps", type=int, default=500,
-                        help="Number of warmup steps")
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=2.5e-7,
+        help="Minimum learning rate for cosine decay",
+    )
+    parser.add_argument(
+        "--warmup_steps", type=int, default=500, help="Number of warmup steps"
+    )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
-    parser.add_argument("--alpha", type=float, default=0.5,
-                        help="FM/consistency mixing ratio")
-    parser.add_argument("--lambda_consistency", type=float, default=0.1,
-                        help="Consistency loss weight")
-    parser.add_argument("--clamp", type=float, default=20.0,
-                        help="Velocity prediction clamp range")
+    parser.add_argument(
+        "--alpha", type=float, default=0.5, help="FM/consistency mixing ratio"
+    )
+    parser.add_argument(
+        "--lambda_consistency", type=float, default=0.1, help="Consistency loss weight"
+    )
+    parser.add_argument(
+        "--clamp", type=float, default=20.0, help="Velocity prediction clamp range"
+    )
     parser.add_argument("--save_dir", type=str, default="outputs/snapflow")
     parser.add_argument("--model_save_name", type=str, default="snapflow_model")
     parser.add_argument("--job_name", type=str, default="train_snapflow")
     parser.add_argument("--wandb_project", type=str, default="smolvla-snapflow")
     parser.add_argument("--wandb_entity", type=str, default=None)
     add_dataloader_args(parser)
+    add_augmentation_args(parser)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
-    parser.add_argument("--accumulation_steps", type=int, default=4,
-                        help="Accumulate over multiple steps")
-    parser.add_argument("--max_grad_norm", type=float, default=1.0,
-                        help="Maximum gradient norm for clipping (0 to disable)")
-    parser.add_argument("--resume_from", type=str, default=None,
-                        help="Path to state to resume from, or 'auto' to find the latest in save_dir")
-    parser.add_argument("--limit_episodes", type=int, default=None,
-                        help="Limit the dataset to load only the first N episodes")
+    parser.add_argument(
+        "--accumulation_steps",
+        type=int,
+        default=4,
+        help="Accumulate over multiple steps",
+    )
+    parser.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Maximum gradient norm for clipping (0 to disable)",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to state to resume from, or 'auto' to find the latest in save_dir",
+    )
+    parser.add_argument(
+        "--limit_episodes",
+        type=int,
+        default=None,
+        help="Limit the dataset to load only the first N episodes",
+    )
     parser.add_argument("--episodes", type=int, nargs="+", default=None)
     parser.add_argument("--keep_last_n_checkpoints", type=int, default=5)
     parser.add_argument("--cameras", type=str, nargs="+", default=None)
     parser.add_argument("--tolerance_s", type=float, default=0.0001)
     parser.add_argument("--duration", type=str, default=None)
     parser.add_argument("--duration_buffer", type=int, default=600)
-    parser.add_argument("--action_chunk_size", type=int, default=None,
-                        help="Action chunk size (None to auto-detect from recap checkpoint)")
+    parser.add_argument(
+        "--action_chunk_size",
+        type=int,
+        default=None,
+        help="Action chunk size (None to auto-detect from recap checkpoint)",
+    )
     return parser.parse_args()
 
 
 def main():
     import time
+
     start_time = time.time()
     patch_lerobot_dataset_reader()
     args = parse_args()
@@ -117,6 +182,7 @@ def main():
 
     try:
         import torch.multiprocessing as mp
+
         mp.set_sharing_strategy("file_system")
     except Exception as e:
         print(f"Warning: could not set sharing strategy: {e}")
@@ -141,18 +207,21 @@ def main():
     if episodes_to_load is None and args.limit_episodes is not None:
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
             meta = LeRobotDatasetMetadata(args.dataset_repo_id)
             total = meta.total_episodes
             episodes_to_load = list(range(min(args.limit_episodes, total)))
-            print(f"Limiting dataset load to first {len(episodes_to_load)} episodes (out of {total} total episodes)")
+            print(
+                f"Limiting dataset load to first {len(episodes_to_load)} episodes (out of {total} total episodes)"
+            )
         except Exception as e:
             print(f"Warning: could not load dataset metadata to limit episodes: {e}")
 
     # Load Dataset
     print(f"Loading dataset: {args.dataset_repo_id}")
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
     from lerobot.datasets.factory import resolve_delta_timestamps
-    
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
     ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
 
     # Load config fields and chunk_size from config.json if available
@@ -160,7 +229,9 @@ def main():
     if os.path.isdir(args.recap_checkpoint):
         config_json_path = os.path.join(args.recap_checkpoint, "config.json")
     elif os.path.isfile(args.recap_checkpoint):
-        config_json_path = os.path.join(os.path.dirname(args.recap_checkpoint), "config.json")
+        config_json_path = os.path.join(
+            os.path.dirname(args.recap_checkpoint), "config.json"
+        )
 
     chunk_size = args.action_chunk_size
     config_kwargs = {}
@@ -170,8 +241,16 @@ def main():
                 cfg_data = json.load(f)
                 if chunk_size is None:
                     chunk_size = cfg_data.get("chunk_size", 20)
-                    print(f"Auto-detected chunk_size = {chunk_size} from {config_json_path}")
-                for field in ["num_vlm_layers", "num_fast_tokens", "model_id", "use_advantage_conditioning", "adv_dropout_rate"]:
+                    print(
+                        f"Auto-detected chunk_size = {chunk_size} from {config_json_path}"
+                    )
+                for field in [
+                    "num_vlm_layers",
+                    "num_fast_tokens",
+                    "model_id",
+                    "use_advantage_conditioning",
+                    "adv_dropout_rate",
+                ]:
                     if field in cfg_data:
                         config_kwargs[field] = cfg_data[field]
                         print(f"Loaded config field: {field} = {cfg_data[field]}")
@@ -186,19 +265,24 @@ def main():
     dummy_config = SmolVLARECAPConfig(chunk_size=chunk_size, n_action_steps=1)
     delta_timestamps = resolve_delta_timestamps(dummy_config, ds_meta)
 
+    image_transforms = build_image_transforms(args.augmentation, args.augmentation_geom)
+
     with accelerator.local_main_process_first():
         dataset = LeRobotDataset(
             args.dataset_repo_id,
             episodes=episodes_to_load,
             tolerance_s=args.tolerance_s,
             delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
         )
 
     # Map cameras
     camera_map = {}
     features = dataset_to_policy_features(dataset.meta.features)
     if args.cameras:
-        dataset_cameras = sorted([k for k in features if k.startswith("observation.images.")])
+        dataset_cameras = sorted(
+            [k for k in features if k.startswith("observation.images.")]
+        )
         if any(cam not in features for cam in args.cameras):
             if len(dataset_cameras) == len(args.cameras):
                 for src, dst in zip(dataset_cameras, args.cameras):
@@ -219,8 +303,12 @@ def main():
                 mapped_features[k] = v
         features = mapped_features
 
-    output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    input_features = {key: ft for key, ft in features.items() if key not in output_features}
+    output_features = {
+        key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
+    }
+    input_features = {
+        key: ft for key, ft in features.items() if key not in output_features
+    }
 
     if args.cameras:
         all_cameras = [k for k in input_features if k.startswith("observation.images.")]
@@ -237,7 +325,10 @@ def main():
     demo_dataloader = None
     if args.demo_dataset_repo_id:
         from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-        print(f"Loading demo co-training dataset (labeled positive): {args.demo_dataset_repo_id}")
+
+        print(
+            f"Loading demo co-training dataset (labeled positive): {args.demo_dataset_repo_id}"
+        )
         demo_meta = LeRobotDatasetMetadata(args.demo_dataset_repo_id)
         demo_delta = resolve_delta_timestamps(dummy_config, demo_meta)
         with accelerator.local_main_process_first():
@@ -246,7 +337,9 @@ def main():
                 tolerance_s=args.tolerance_s,
                 delta_timestamps=demo_delta,
             )
-        demo_dataloader = build_dataloader(demo_dataset, args, shuffle=True, device=None)
+        demo_dataloader = build_dataloader(
+            demo_dataset, args, shuffle=True, device=None
+        )
 
     # Initialize SmolVLARECAP Model
     action_dim = features["action"].shape[0]
@@ -260,10 +353,15 @@ def main():
         snapflow_alpha=args.alpha,
         snapflow_lambda=args.lambda_consistency,
         snapflow_clamp=args.clamp,
-        **config_kwargs
+        **config_kwargs,
     )
-    if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:
-        raise ValueError("Pruning configuration must be disabled during co-training/distillation.")
+    if (
+        recap_config.pruned_layers is not None
+        or recap_config.visual_tokens_keep is not None
+    ):
+        raise ValueError(
+            "Pruning configuration must be disabled during co-training/distillation."
+        )
     with accelerator.local_main_process_first():
         model = SmolVLARECAP(recap_config).to(device)
 
@@ -271,6 +369,7 @@ def main():
     print(f"Loading weights from {args.recap_checkpoint}")
     if os.path.isdir(args.recap_checkpoint):
         from safetensors.torch import load_file
+
         safetensors_path = os.path.join(args.recap_checkpoint, "model.safetensors")
         if os.path.exists(safetensors_path):
             state_dict = load_file(safetensors_path)
@@ -279,7 +378,9 @@ def main():
             if os.path.exists(pt_path):
                 state_dict = torch.load(pt_path, map_location="cpu")
             else:
-                raise FileNotFoundError(f"Could not find model.safetensors or checkpoint_final.pt in {args.recap_checkpoint}")
+                raise FileNotFoundError(
+                    f"Could not find model.safetensors or checkpoint_final.pt in {args.recap_checkpoint}"
+                )
     else:
         state_dict = torch.load(args.recap_checkpoint, map_location="cpu")
 
@@ -290,8 +391,12 @@ def main():
         else:
             clean_state_dict[k] = v
 
-    missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
-    print(f"Loaded weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+    missing_keys, unexpected_keys = model.load_state_dict(
+        clean_state_dict, strict=False
+    )
+    print(
+        f"Loaded weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}"
+    )
 
     # Optional frozen teacher: a second copy of the checkpoint that supplies
     # all distillation targets while the student trains away from it.
@@ -317,11 +422,14 @@ def main():
         from lerobot_policy_smolvla_rl.advantage_utils import load_thresholds
 
         missing = [
-            p for p in (args.precomputed_advantages, args.thresholds_path)
+            p
+            for p in (args.precomputed_advantages, args.thresholds_path)
             if not p or not os.path.exists(p)
         ]
         if missing:
-            print(f"Error: --precomputed_advantages and --thresholds_path must both exist, missing: {missing}")
+            print(
+                f"Error: --precomputed_advantages and --thresholds_path must both exist, missing: {missing}"
+            )
             sys.exit(1)
         print(f"Loading pre-computed advantages from {args.precomputed_advantages}")
         precomputed_advantages = np.load(args.precomputed_advantages)
@@ -371,7 +479,9 @@ def main():
     output_dir = os.path.join(args.save_dir, args.model_save_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    checkpoint_to_try, fallback_checkpoint = resolve_checkpoints(args.resume_from, output_dir)
+    checkpoint_to_try, fallback_checkpoint = resolve_checkpoints(
+        args.resume_from, output_dir
+    )
 
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
@@ -388,7 +498,9 @@ def main():
 
     step = 0
     if checkpoint_to_try:
-        args.resume_from, step = load_checkpoint(accelerator, checkpoint_to_try, fallback_checkpoint)
+        args.resume_from, step = load_checkpoint(
+            accelerator, checkpoint_to_try, fallback_checkpoint
+        )
 
     max_duration_seconds = parse_duration_to_seconds(args.duration)
     progress_bar = tqdm(total=args.steps, initial=step, desc="SnapFlow Distillation")
@@ -404,7 +516,9 @@ def main():
             if max_duration_seconds is not None:
                 elapsed = time.time() - start_time
                 if elapsed >= max_duration_seconds - args.duration_buffer:
-                    print(f"Approaching duration limit. Saving state at step {step} and exiting...")
+                    print(
+                        f"Approaching duration limit. Saving state at step {step} and exiting..."
+                    )
                     save_path = os.path.join(output_dir, f"state_{step}.pt")
                     accelerator.wait_for_everyone()
                     accelerator.save_state(save_path)
@@ -425,6 +539,7 @@ def main():
                     advantage_bool = [True] * batch["task_index"].shape[0]
                 elif precomputed_advantages is not None:
                     with torch.no_grad():
+
                         def to_numpy(val):
                             if hasattr(val, "cpu"):
                                 val = val.cpu()
@@ -481,7 +596,11 @@ def main():
                         }
                     )
                     progress_bar.set_postfix(
-                        {"loss": f"{loss.item():.4f}", "fm": f"{fm_loss.item():.4f}", "consistency": f"{consistency_loss.item():.4f}"}
+                        {
+                            "loss": f"{loss.item():.4f}",
+                            "fm": f"{fm_loss.item():.4f}",
+                            "consistency": f"{consistency_loss.item():.4f}",
+                        }
                     )
 
                 if (step + 1) % args.save_freq == 0:
@@ -491,13 +610,19 @@ def main():
 
                     if args.keep_last_n_checkpoints > 0 and accelerator.is_main_process:
                         existing = [
-                            d for d in os.listdir(output_dir)
-                            if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
+                            d
+                            for d in os.listdir(output_dir)
+                            if d.startswith("state_")
+                            and os.path.isdir(os.path.join(output_dir, d))
                         ]
-                        existing.sort(key=lambda x: int(x.split("_")[1].split(".")[0]), reverse=True)
-                        for old_ckpt in existing[args.keep_last_n_checkpoints:]:
+                        existing.sort(
+                            key=lambda x: int(x.split("_")[1].split(".")[0]),
+                            reverse=True,
+                        )
+                        for old_ckpt in existing[args.keep_last_n_checkpoints :]:
                             old_path = os.path.join(output_dir, old_ckpt)
                             import shutil
+
                             shutil.rmtree(old_path, ignore_errors=True)
 
                 step += 1
@@ -514,13 +639,15 @@ def main():
 
     # Export to LeRobot format
     if accelerator.is_main_process:
-        print("Converting and migrating policy to LeRobot format with SnapFlow active...")
+        print(
+            "Converting and migrating policy to LeRobot format with SnapFlow active..."
+        )
         try:
             exported_dir = os.path.join(output_dir, "exported")
             os.makedirs(exported_dir, exist_ok=True)
-            
+
             from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy
-            
+
             action_stats = dataset.meta.stats.get("action")
             if action_stats is not None:
                 action_stats = {
@@ -539,12 +666,12 @@ def main():
                 snapflow_alpha=args.alpha,
                 snapflow_lambda=args.lambda_consistency,
                 snapflow_clamp=args.clamp,
-                **config_kwargs
+                **config_kwargs,
             )
             config.output_features = output_features
-            
+
             policy = SmolVLARECAPPolicy(config)
-            
+
             # Map weights to policy format
             clean_state_dict = {}
             for k, v in unwrapped_model.state_dict().items():
@@ -555,20 +682,23 @@ def main():
                 if not k.startswith("model."):
                     k = "model." + k
                 clean_state_dict[k] = v
-                
+
             policy.load_state_dict(clean_state_dict, strict=False)
             policy.save_pretrained(exported_dir)
             print(f"Base policy exported to {exported_dir}")
-            
+
             # Run migration script
             import subprocess
+
             migrated_dir = os.path.join(output_dir, "migrated")
             cmd = [
                 sys.executable,
                 "-c",
                 "import lerobot_policy_smolvla_rl; from lerobot.processor.migrate_policy_normalization import main; main()",
-                "--pretrained-path", exported_dir,
-                "--output-dir", migrated_dir
+                "--pretrained-path",
+                exported_dir,
+                "--output-dir",
+                migrated_dir,
             ]
             print(f"Running: {' '.join(cmd)}")
             subprocess.run(cmd, check=True)
@@ -582,19 +712,25 @@ def main():
                     stats_tensors[feature_name] = {}
                     for stat_name, val in stat_dict.items():
                         stats_tensors[feature_name][stat_name] = torch.tensor(val)
-            
+
             from lerobot.policies.factory import make_pre_post_processors
+
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=config,
                 dataset_stats=stats_tensors,
             )
             preprocessor.save_pretrained(migrated_dir)
             postprocessor.save_pretrained(migrated_dir)
-            print(f"Successfully populated migrated processors with statistics in: {migrated_dir}")
-            
+            print(
+                f"Successfully populated migrated processors with statistics in: {migrated_dir}"
+            )
+
         except Exception as export_err:
-            print(f"Warning: Failed to automatically export and migrate policy: {export_err}")
+            print(
+                f"Warning: Failed to automatically export and migrate policy: {export_err}"
+            )
             import traceback
+
             traceback.print_exc()
 
     accelerator.end_training()

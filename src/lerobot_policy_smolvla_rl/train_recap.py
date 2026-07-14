@@ -1,28 +1,30 @@
 import argparse
 import logging
 import os
-import numpy as np
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.configs.types import FeatureType
 from lerobot.datasets.feature_utils import dataset_to_policy_features
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tqdm import tqdm
 
 from lerobot_policy_smolvla_rl import SmolVLARECAP, SmolVLARECAPConfig
-from lerobot_policy_smolvla_rl.dataloader_utils import (
-    add_dataloader_args,
-    build_dataloader,
-    patch_lerobot_dataset_reader,
-)
+from lerobot_policy_smolvla_rl.advantage_utils import load_thresholds
 from lerobot_policy_smolvla_rl.checkpoint_utils import (
-    resolve_checkpoints,
     load_checkpoint,
     parse_duration_to_seconds,
+    resolve_checkpoints,
 )
-from lerobot_policy_smolvla_rl.advantage_utils import load_thresholds
+from lerobot_policy_smolvla_rl.dataloader_utils import (
+    add_augmentation_args,
+    add_dataloader_args,
+    build_dataloader,
+    build_image_transforms,
+    patch_lerobot_dataset_reader,
+)
 from lerobot_policy_smolvla_rl.ds_utils import load_success_flags
 from lerobot_policy_smolvla_rl.train_common import build_warmup_cosine_scheduler
 
@@ -114,8 +116,18 @@ def parse_args():
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--num_vlm_layers", type=int, default=-1)
-    parser.add_argument("--ar_loss_weight", type=float, default=1.0, help="Weight for autoregressive loss")
-    parser.add_argument("--fm_loss_weight", type=float, default=1.0, help="Weight for flow matching loss")
+    parser.add_argument(
+        "--ar_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for autoregressive loss",
+    )
+    parser.add_argument(
+        "--fm_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for flow matching loss",
+    )
     parser.add_argument(
         "--disable_ki",
         action="store_false",
@@ -193,6 +205,7 @@ def parse_args():
             "If None, all cameras in the dataset are used."
         ),
     )
+    add_augmentation_args(parser)
     parser.add_argument(
         "--tolerance_s",
         type=float,
@@ -208,7 +221,7 @@ def parse_args():
     parser.add_argument(
         "--duration_buffer",
         type=int,
-        default=10 * 60, # 10 minutes
+        default=10 * 60,  # 10 minutes
         help="Buffer time in seconds to subtract from duration to ensure clean state saving before timeout",
     )
     return parser.parse_args()
@@ -217,6 +230,7 @@ def parse_args():
 # pylint: disable=too-many-branches,too-many-statements,too-many-locals,too-many-nested-blocks
 def main():
     import time
+
     start_time = time.time()
     patch_lerobot_dataset_reader()
     args = parse_args()
@@ -253,7 +267,9 @@ def main():
     episodes_to_load = args.episodes
     if episodes_to_load is None and args.limit_episodes is not None:
         try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata  # pylint: disable=import-outside-toplevel
+            from lerobot.datasets.lerobot_dataset import (
+                LeRobotDatasetMetadata,
+            )  # pylint: disable=import-outside-toplevel
 
             meta = LeRobotDatasetMetadata(args.dataset_repo_id)
             total = meta.total_episodes
@@ -266,13 +282,17 @@ def main():
 
     # 1. Load Dataset
     print(f"Loading dataset: {args.dataset_repo_id}")
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
     from lerobot.datasets.factory import resolve_delta_timestamps
-    
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
     ds_meta = LeRobotDatasetMetadata(args.dataset_repo_id)
     # Instantiate dummy config to resolve delta_timestamps
-    dummy_config = SmolVLARECAPConfig(chunk_size=args.action_chunk_size, n_action_steps=1)
+    dummy_config = SmolVLARECAPConfig(
+        chunk_size=args.action_chunk_size, n_action_steps=1
+    )
     delta_timestamps = resolve_delta_timestamps(dummy_config, ds_meta)
+
+    image_transforms = build_image_transforms(args.augmentation, args.augmentation_geom)
 
     with accelerator.local_main_process_first():
         dataset = LeRobotDataset(
@@ -280,6 +300,7 @@ def main():
             episodes=episodes_to_load,
             tolerance_s=args.tolerance_s,
             delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
         )
 
     # Load per-episode success flags (written by the annotation server / bag converter).
@@ -378,7 +399,9 @@ def main():
     # 4b. Optional expert-demo co-training loader (frames always labeled positive).
     demo_dataloader = None
     if args.demo_dataset_repo_id:
-        print(f"Loading demo co-training dataset (labeled positive): {args.demo_dataset_repo_id}")
+        print(
+            f"Loading demo co-training dataset (labeled positive): {args.demo_dataset_repo_id}"
+        )
         demo_meta = LeRobotDatasetMetadata(args.demo_dataset_repo_id)
         demo_delta = resolve_delta_timestamps(dummy_config, demo_meta)
         with accelerator.local_main_process_first():
@@ -407,8 +430,13 @@ def main():
         adv_dropout_rate=args.adv_dropout_rate,
         knowledge_insulation=args.knowledge_insulation,
     )
-    if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:
-        raise ValueError("Pruning configuration must be disabled during co-training/distillation.")
+    if (
+        recap_config.pruned_layers is not None
+        or recap_config.visual_tokens_keep is not None
+    ):
+        raise ValueError(
+            "Pruning configuration must be disabled during co-training/distillation."
+        )
     with accelerator.local_main_process_first():
         model = SmolVLARECAP(recap_config).to(device)
 
@@ -416,7 +444,9 @@ def main():
     if args.pretrained_policy_path:
         print(f"Loading pretrained policy weights from {args.pretrained_policy_path}")
         if os.path.isdir(args.pretrained_policy_path):
-            from safetensors.torch import load_file  # pylint: disable=import-outside-toplevel
+            from safetensors.torch import (
+                load_file,
+            )  # pylint: disable=import-outside-toplevel
 
             safetensors_path = os.path.join(
                 args.pretrained_policy_path, "model.safetensors"
@@ -645,8 +675,11 @@ def main():
                         # Expert-demo (or expert_mode) frames are guaranteed positive.
                         batch_size = batch["task_index"].shape[0]
                         advantage_bool = [True] * batch_size
-                        advantage = torch.ones(batch_size, device=device)  # dummy for logging
+                        advantage = torch.ones(
+                            batch_size, device=device
+                        )  # dummy for logging
                     else:
+
                         def to_numpy(val):
                             if hasattr(val, "cpu"):
                                 val = val.cpu()
@@ -678,9 +711,13 @@ def main():
                         # Only applied when the episode was successful — an intervention
                         # in a failed episode should not be rewarded as advantageous.
                         if "intervention" in batch:
-                            interventions = batch["intervention"].flatten().cpu().numpy()
+                            interventions = (
+                                batch["intervention"].flatten().cpu().numpy()
+                            )
                             ep_indices = to_numpy(batch["episode_index"])
-                            for idx, (intervened, ep_idx) in enumerate(zip(interventions, ep_indices)):
+                            for idx, (intervened, ep_idx) in enumerate(
+                                zip(interventions, ep_indices)
+                            ):
                                 if intervened and (
                                     success_flags is None or success_flags[int(ep_idx)]
                                 ):
@@ -715,7 +752,11 @@ def main():
                         }
                     )
                     progress_bar.set_postfix(
-                        {"loss": f"{total_loss.item():.4f}", "lr": f"{lr:.2e}", "adv+": f"{adv_frac:.0%}"}
+                        {
+                            "loss": f"{total_loss.item():.4f}",
+                            "lr": f"{lr:.2e}",
+                            "adv+": f"{adv_frac:.0%}",
+                        }
                     )
 
                 if (step + 1) % args.save_freq == 0:
@@ -726,16 +767,19 @@ def main():
                     # Clean up old checkpoints to avoid filling disk
                     if args.keep_last_n_checkpoints > 0 and accelerator.is_main_process:
                         existing = [
-                            d for d in os.listdir(output_dir)
-                            if d.startswith("state_") and os.path.isdir(os.path.join(output_dir, d))
+                            d
+                            for d in os.listdir(output_dir)
+                            if d.startswith("state_")
+                            and os.path.isdir(os.path.join(output_dir, d))
                         ]
                         existing.sort(
                             key=lambda x: int(x.split("_")[1].split(".")[0]),
                             reverse=True,
                         )
-                        for old_ckpt in existing[args.keep_last_n_checkpoints:]:
+                        for old_ckpt in existing[args.keep_last_n_checkpoints :]:
                             old_path = os.path.join(output_dir, old_ckpt)
                             import shutil
+
                             shutil.rmtree(old_path, ignore_errors=True)
                             print(f"Removed old checkpoint: {old_path}")
 
@@ -757,9 +801,9 @@ def main():
         try:
             exported_dir = os.path.join(output_dir, "exported")
             os.makedirs(exported_dir, exist_ok=True)
-            
+
             from lerobot_policy_smolvla_rl import SmolVLARECAPPolicy
-            
+
             action_stats = dataset.meta.stats.get("action")
             if action_stats is not None:
                 action_stats = {
@@ -773,15 +817,15 @@ def main():
                 input_features=input_features,
                 action_stats=action_stats,
                 chunk_size=args.action_chunk_size,
-                n_action_steps=1, # Default to 1, can be overridden during evaluation
+                n_action_steps=1,  # Default to 1, can be overridden during evaluation
                 use_advantage_conditioning=args.use_advantage_conditioning,
                 knowledge_insulation=args.knowledge_insulation,
                 device="cpu",
             )
             config.output_features = output_features
-            
+
             policy = SmolVLARECAPPolicy(config)
-            
+
             # Map weights to policy format
             clean_state_dict = {}
             for k, v in model.state_dict().items():
@@ -792,20 +836,23 @@ def main():
                 if not k.startswith("model."):
                     k = "model." + k
                 clean_state_dict[k] = v
-                
+
             policy.load_state_dict(clean_state_dict, strict=False)
             policy.save_pretrained(exported_dir)
             print(f"Base policy exported to {exported_dir}")
-            
+
             # Run migration script preloading our package to register 'smolvla_recap'
             import subprocess
+
             migrated_dir = os.path.join(output_dir, "migrated")
             cmd = [
                 ".venv/bin/python",
                 "-c",
                 "import lerobot_policy_smolvla_rl; from lerobot.processor.migrate_policy_normalization import main; main()",
-                "--pretrained-path", exported_dir,
-                "--output-dir", migrated_dir
+                "--pretrained-path",
+                exported_dir,
+                "--output-dir",
+                migrated_dir,
             ]
             print(f"Running: {' '.join(cmd)}")
             subprocess.run(cmd, check=True)
@@ -821,6 +868,7 @@ def main():
                         stats_tensors[feature_name][stat_name] = torch.tensor(val)
 
             from lerobot.policies.factory import make_pre_post_processors
+
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=config,
                 pretrained_path=migrated_dir,
@@ -832,18 +880,23 @@ def main():
                 for stat_name, val in stat_dict.items():
                     flat_stats[f"{feat_name}.{stat_name}"] = val
             for step in preprocessor.steps:
-                if hasattr(step, 'load_state_dict') and hasattr(step, 'norm_map'):
+                if hasattr(step, "load_state_dict") and hasattr(step, "norm_map"):
                     step.load_state_dict(flat_stats)
             for step in postprocessor.steps:
-                if hasattr(step, 'load_state_dict') and hasattr(step, 'norm_map'):
+                if hasattr(step, "load_state_dict") and hasattr(step, "norm_map"):
                     step.load_state_dict(flat_stats)
             preprocessor.save_pretrained(migrated_dir)
             postprocessor.save_pretrained(migrated_dir)
-            print(f"Successfully populated migrated processors with statistics in: {migrated_dir}")
-            
+            print(
+                f"Successfully populated migrated processors with statistics in: {migrated_dir}"
+            )
+
         except Exception as export_err:
-            print(f"Warning: Failed to automatically export and migrate policy: {export_err}")
+            print(
+                f"Warning: Failed to automatically export and migrate policy: {export_err}"
+            )
             import traceback
+
             traceback.print_exc()
 
     accelerator.end_training()
