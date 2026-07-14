@@ -46,6 +46,14 @@ def parse_args():
         help="Disable advantage conditioning tokens entirely (plain SmolVLA-style baseline; "
         "typically combined with --expert_mode and --ar_loss_weight 0)",
     )
+    parser.add_argument(
+        "--adv_dropout_rate",
+        type=float,
+        default=0.3,
+        help="Probability of dropping the advantage token per batch so the unconditional "
+        "predictor is learned (required for CFG). Set 0 with --expert_mode for a constant "
+        "always-positive token, i.e. a SmolVLA-style baseline without CFG machinery.",
+    )
     parser.add_argument("--dataset_repo_id", type=str, required=True)
     parser.add_argument(
         "--episodes",
@@ -396,6 +404,7 @@ def main():
         fm_loss_weight=args.fm_loss_weight,
         loss_n_action_steps=args.loss_n_action_steps,
         use_advantage_conditioning=args.use_advantage_conditioning,
+        adv_dropout_rate=args.adv_dropout_rate,
         knowledge_insulation=args.knowledge_insulation,
     )
     if recap_config.pruned_layers is not None or recap_config.visual_tokens_keep is not None:

@@ -460,35 +460,75 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
         alpha=0.5,
         lambda_c=0.1,
         clamp=20.0,
+        distill_cfg_weight=None,
+        teacher_model=None,
     ):
         if mode == "snapflow":
             return self.compute_loss_snapflow(
-                batch, alpha=alpha, lambda_c=lambda_c, clamp=clamp
+                batch, alpha=alpha, lambda_c=lambda_c, clamp=clamp, advantage=advantage,
+                distill_cfg_weight=distill_cfg_weight, teacher_model=teacher_model,
             )
         return self.compute_loss(batch, camera_keys=camera_keys, advantage=advantage)
 
-    def compute_loss_snapflow(self, batch, alpha=0.5, lambda_c=0.1, clamp=20.0):
+    def compute_loss_snapflow(
+        self, batch, alpha=0.5, lambda_c=0.1, clamp=20.0, advantage=None,
+        distill_cfg_weight=None, teacher_model=None,
+    ):
         """
         Compute combined loss for SnapFlow distillation:
         FM loss component (s=t) + Consistency loss component (Shortcut t=1->0.5->s=0 vs student s=0).
+
+        With `distill_cfg_weight` set, the consistency target is the teacher's
+        CFG-blended field v_u + w (v_c - v_u) (guidance distillation): the
+        student is always positive-conditioned and learns the guided dynamics
+        directly, so deployment needs neither CFG nor the doubled batch.
+
+        With `teacher_model` set (a frozen copy of the teacher checkpoint),
+        all teacher targets come from that copy instead of the training model
+        itself, and in guided mode the FM term regresses onto the teacher's
+        guided field rather than dataset actions, so both loss terms agree on
+        the same target field.
         """
         # 1. Prepare batch components (includes observation state)
         # pylint: disable=protected-access
-        images, img_masks, state, lang_tokens, lang_masks = (
+        images, img_masks, state, lang_tokens_base, lang_masks_base = (
             self.fast_wrapper._prepare_batch(batch)
         )
 
-        # 2. Add Advantage conditioning to lang_tokens if active (always use positive advantage tokens during SnapFlow)
+        guided = (
+            distill_cfg_weight is not None and self.config.use_advantage_conditioning
+        )
+
+        # 2. Add Advantage conditioning to lang_tokens, mirroring compute_loss.
+        # `advantage=None` falls back to all-positive tokens, which is only
+        # valid when every dataset action is worth imitating (expert demos) —
+        # on rollout data the FM component would otherwise imitate
+        # advantage-negative actions under the positive token. Token dropout
+        # matches fine-tuning so the unconditional predictor (required for
+        # CFG and w=0 inference) is distilled as well. In guided mode the
+        # student is always positive-conditioned (no dropout); the
+        # unconditional branch exists only inside the teacher blend.
+        lang_tokens, lang_masks = lang_tokens_base, lang_masks_base
         if self.config.use_advantage_conditioning:
-            device = lang_tokens.device
-            adv_tokens = torch.tensor(
-                [self.adv_pos_id] * lang_tokens.shape[0],
-                device=device,
-            ).unsqueeze(1)
-            lang_tokens = torch.cat([lang_tokens, adv_tokens], dim=1)
-            lang_masks = torch.cat(
-                [lang_masks, torch.ones_like(adv_tokens, dtype=torch.bool)], dim=1
-            )
+            device = lang_tokens_base.device
+            if advantage is None:
+                advantage = [True] * lang_tokens_base.shape[0]
+            if guided:
+                cond_advantage = [True] * lang_tokens_base.shape[0]
+            elif self.training and torch.rand(1).item() < self.config.adv_dropout_rate:
+                cond_advantage = None
+            else:
+                cond_advantage = advantage
+            if cond_advantage is not None:
+                adv_tokens = torch.tensor(
+                    [self.adv_pos_id if a else self.adv_neg_id for a in cond_advantage],
+                    device=device,
+                ).unsqueeze(1)
+                lang_tokens = torch.cat([lang_tokens_base, adv_tokens], dim=1)
+                lang_masks = torch.cat(
+                    [lang_masks_base, torch.ones_like(adv_tokens, dtype=torch.bool)],
+                    dim=1,
+                )
 
         # 3. Complete Knowledge Insulation for SnapFlow
         # Freeze ALL VLM parameters during the FM/Consistency forward pass.
@@ -499,35 +539,59 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             param.requires_grad_(False)
 
         try:
-            # Embed prefix (images + language + state)
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks, state=state
+            # Embed prefix (images + language + state) and cache the VLM KV
+            # once per batch. Guided mode builds a second, unconditional cache
+            # (no advantage token) used only inside the teacher blend.
+            def build_prefix_cache(mdl, lt, lm):
+                p_embs, p_pad, p_att = mdl.embed_prefix(
+                    images, img_masks, lt, lm, state=state
+                )
+                att2d = modeling_smolvla.make_att_2d_masks(p_pad, p_att)
+                pos_ids = torch.cumsum(p_pad, dim=1) - 1
+                _, pkv = mdl.vlm_with_expert.forward(
+                    attention_mask=att2d,
+                    position_ids=pos_ids,
+                    past_key_values=None,
+                    inputs_embeds=[p_embs, None],
+                    use_cache=True,
+                    fill_kv_cache=True,
+                )
+                return p_embs, p_pad, pkv
+
+            prefix_embs, prefix_pad_masks, past_key_values = build_prefix_cache(
+                self, lang_tokens, lang_masks
             )
 
-            # 4. Cache VLM prefix KV cache (once per batch)
-            prefix_att_2d_masks = modeling_smolvla.make_att_2d_masks(
-                prefix_pad_masks, prefix_att_masks
-            )
-            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-            _, past_key_values = self.vlm_with_expert.forward(
-                attention_mask=prefix_att_2d_masks,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=True,
-                fill_kv_cache=True,
-            )
+            # Teacher caches. Without `teacher_model` the model self-distills
+            # (progressive). With it, targets come from the frozen copy — under
+            # guided self-distillation the blend target v_u + w (v_c - v_u)
+            # tracks the student's own v_c, whose fixed point collapses onto
+            # v_u, and the unconditional branch drifts with no loss training
+            # it; a frozen teacher removes both failure modes.
+            teacher = teacher_model if teacher_model is not None else self
+            t_ppm_u = t_pkv_u = None
+            with torch.no_grad():
+                if teacher_model is not None:
+                    _, t_ppm_c, t_pkv_c = build_prefix_cache(
+                        teacher, lang_tokens, lang_masks
+                    )
+                else:
+                    t_ppm_c, t_pkv_c = prefix_pad_masks, past_key_values
+                if guided:
+                    _, t_ppm_u, t_pkv_u = build_prefix_cache(
+                        teacher, lang_tokens_base, lang_masks_base
+                    )
 
             # Helper for expert forward
-            def expert_forward_fn(x_t, t, s):
-                suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            def expert_forward(mdl, x_t, t, s, pkv, ppm):
+                suffix_embs, suffix_pad_masks, suffix_att_masks = mdl.embed_suffix(
                     x_t, t, target_time=s
                 )
 
                 suffix_len = suffix_pad_masks.shape[1]
-                batch_size = prefix_pad_masks.shape[0]
-                prefix_len = prefix_pad_masks.shape[1]
-                prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(
+                batch_size = ppm.shape[0]
+                prefix_len = ppm.shape[1]
+                prefix_pad_2d_masks = ppm[:, None, :].expand(
                     batch_size, suffix_len, prefix_len
                 )
 
@@ -538,23 +602,37 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 full_att_2d_masks = torch.cat(
                     [prefix_pad_2d_masks, suffix_att_2d_masks], dim=2
                 )
-                prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+                prefix_offsets = torch.sum(ppm, dim=-1)[:, None]
                 position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-                outputs_embeds, _ = self.vlm_with_expert.forward(
+                outputs_embeds, _ = mdl.vlm_with_expert.forward(
                     attention_mask=full_att_2d_masks,
                     position_ids=position_ids,
-                    past_key_values=past_key_values,
+                    past_key_values=pkv,
                     inputs_embeds=[None, suffix_embs],
                     use_cache=True,
                     fill_kv_cache=False,
                 )
                 suffix_out = outputs_embeds[1]
-                suffix_out = suffix_out[:, -self.config.chunk_size :]
-                v_t = self.action_out_proj(
-                    suffix_out.to(next(self.action_out_proj.parameters()).dtype)
+                suffix_out = suffix_out[:, -mdl.config.chunk_size :]
+                v_t = mdl.action_out_proj(
+                    suffix_out.to(next(mdl.action_out_proj.parameters()).dtype)
                 )
                 return v_t.to(torch.float32)
+
+            def expert_forward_fn(x_t, t, s):
+                return expert_forward(
+                    self, x_t, t, s, past_key_values, prefix_pad_masks
+                )
+
+            # Teacher field: plain conditional, or the CFG blend at
+            # distill_cfg_weight (guidance distillation).
+            def teacher_forward_fn(x_t, t, s):
+                v_c = expert_forward(teacher, x_t, t, s, t_pkv_c, t_ppm_c)
+                if not guided:
+                    return v_c
+                v_u = expert_forward(teacher, x_t, t, s, t_pkv_u, t_ppm_u)
+                return v_u + distill_cfg_weight * (v_c - v_u)
 
             # 5. Extract actions
             actions = batch[ACTION]
@@ -572,7 +650,19 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
 
             tau_expanded = tau[:, :, None]
             noised_actions = tau_expanded * omega + (1 - tau_expanded) * actions_fm
-            target_flow = omega - actions_fm
+            if guided and teacher_model is not None:
+                # Guidance distillation with a frozen teacher: the FM term
+                # regresses onto the same guided field as the consistency
+                # term. A dataset-action target here would pull the student
+                # back toward the unguided conditional flow and fight the
+                # consistency term; dataset actions only choose where the
+                # field is sampled.
+                with torch.no_grad():
+                    target_flow = teacher_forward_fn(
+                        noised_actions, tau.squeeze(1), tau.squeeze(1)
+                    ).clamp(-clamp, clamp)
+            else:
+                target_flow = omega - actions_fm
 
             predicted_flow = expert_forward_fn(
                 noised_actions, tau.squeeze(1), tau.squeeze(1)
@@ -584,7 +674,17 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
                 n = self.config.loss_n_action_steps
                 pred_fm = pred_fm[:, :n]
                 target_fm = target_fm[:, :n]
-            fm_loss = F.mse_loss(pred_fm, target_fm)
+            if guided and teacher_model is None and advantage is not None:
+                # Self-teacher guided mode has no valid teacher target for the
+                # FM term, so it imitates dataset actions and must restrict
+                # that imitation to advantage-positive frames.
+                adv_mask = torch.tensor(advantage, device=device, dtype=torch.bool)
+                if adv_mask.any():
+                    fm_loss = F.mse_loss(pred_fm[adv_mask], target_fm[adv_mask])
+                else:
+                    fm_loss = pred_fm.sum() * 0.0
+            else:
+                fm_loss = F.mse_loss(pred_fm, target_fm)
 
             # === Consistency Component ===
             x_1 = torch.randn_like(actions).to(device=device, dtype=expert_dtype)
@@ -592,14 +692,14 @@ class SmolVLARECAP(modeling_smolvla.VLAFlowMatching):
             with torch.no_grad():
                 t1 = torch.ones(bsize, device=device)
                 s1 = t1.clone()
-                v_1 = expert_forward_fn(x_1, t1, s1)
+                v_1 = teacher_forward_fn(x_1, t1, s1)
                 v_1 = v_1.clamp(-clamp, clamp)
 
                 x_half = x_1 + (-0.5) * v_1
 
                 t_half = torch.full_like(t1, 0.5)
                 s_half = t_half.clone()
-                v_half = expert_forward_fn(x_half, t_half, s_half)
+                v_half = teacher_forward_fn(x_half, t_half, s_half)
                 v_half = v_half.clamp(-clamp, clamp)
 
                 v_shortcut = 0.5 * (v_1 + v_half)

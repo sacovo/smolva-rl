@@ -35,6 +35,32 @@ def parse_args():
                         help="Path to converged RECAP checkpoint (.pt file or exported directory)")
     parser.add_argument("--dataset_repo_id", type=str, required=True,
                         help="Same dataset repo id used for RECAP training")
+    parser.add_argument("--precomputed_advantages", type=str, default=None,
+                        help="Per-frame advantages .npy (from compute_thresholds.py). Required "
+                        "when distilling on rollout data so each frame carries its true +/- "
+                        "token; without it every frame is treated as positive, which is only "
+                        "correct for expert demonstrations.")
+    parser.add_argument("--thresholds_path", type=str, default=None,
+                        help="Per-task thresholds .json matching --precomputed_advantages.")
+    parser.add_argument("--demo_dataset_repo_id", type=str, default=None,
+                        help="Optional expert-demo dataset mixed into distillation (frames "
+                        "always labeled positive), mirroring RECAP co-training so the student "
+                        "sees the same state distribution the teacher was fine-tuned on.")
+    parser.add_argument("--demo_mix_ratio", type=float, default=0.5,
+                        help="Probability that a step draws its batch from the demo dataset. "
+                        "Only used with --demo_dataset_repo_id.")
+    parser.add_argument("--distill_cfg_weight", type=float, default=None,
+                        help="Guidance distillation: distill the teacher's CFG-blended field "
+                        "v_u + w (v_c - v_u) at this weight. The student is always "
+                        "positive-conditioned and reproduces guided behavior in a single "
+                        "unguided pass at inference.")
+    parser.add_argument("--frozen_teacher", action="store_true",
+                        help="Keep a frozen copy of the teacher checkpoint and take all "
+                        "distillation targets from it instead of the training model. With "
+                        "--distill_cfg_weight this also replaces the dataset-action FM "
+                        "target with the teacher's guided field, so both loss terms agree "
+                        "(self-teacher guidance collapses toward the unconditional field "
+                        "and its uncond branch drifts untrained).")
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2.5e-5)
@@ -205,6 +231,23 @@ def main():
 
     dataloader = build_dataloader(dataset, args, shuffle=True, device=None)
 
+    # Optional expert-demo co-training loader (frames always labeled positive),
+    # mirroring train_recap so distillation covers the demo-state distribution
+    # the co-trained teacher was fine-tuned on.
+    demo_dataloader = None
+    if args.demo_dataset_repo_id:
+        from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        print(f"Loading demo co-training dataset (labeled positive): {args.demo_dataset_repo_id}")
+        demo_meta = LeRobotDatasetMetadata(args.demo_dataset_repo_id)
+        demo_delta = resolve_delta_timestamps(dummy_config, demo_meta)
+        with accelerator.local_main_process_first():
+            demo_dataset = LeRobotDataset(
+                args.demo_dataset_repo_id,
+                tolerance_s=args.tolerance_s,
+                delta_timestamps=demo_delta,
+            )
+        demo_dataloader = build_dataloader(demo_dataset, args, shuffle=True, device=None)
+
     # Initialize SmolVLARECAP Model
     action_dim = features["action"].shape[0]
     recap_config = SmolVLARECAPConfig(
@@ -250,7 +293,46 @@ def main():
     missing_keys, unexpected_keys = model.load_state_dict(clean_state_dict, strict=False)
     print(f"Loaded weights. Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
 
+    # Optional frozen teacher: a second copy of the checkpoint that supplies
+    # all distillation targets while the student trains away from it.
+    frozen_teacher = None
+    if args.frozen_teacher:
+        print("Building frozen teacher copy for distillation targets")
+        with accelerator.local_main_process_first():
+            frozen_teacher = SmolVLARECAP(recap_config).to(device)
+        frozen_teacher.load_state_dict(clean_state_dict, strict=False)
+        frozen_teacher.eval()
+        for p in frozen_teacher.parameters():
+            p.requires_grad = False
+
     pre_recap = model.get_pre_processor(dataset)
+
+    # Optional per-frame advantage labels (mirrors train_recap): with these,
+    # each frame is distilled under its true +/- token instead of the legacy
+    # all-positive assumption, which mislabels advantage-negative rollout
+    # frames in the FM loss component.
+    precomputed_advantages = None
+    task_thresholds = None
+    if args.precomputed_advantages or args.thresholds_path:
+        from lerobot_policy_smolvla_rl.advantage_utils import load_thresholds
+
+        missing = [
+            p for p in (args.precomputed_advantages, args.thresholds_path)
+            if not p or not os.path.exists(p)
+        ]
+        if missing:
+            print(f"Error: --precomputed_advantages and --thresholds_path must both exist, missing: {missing}")
+            sys.exit(1)
+        print(f"Loading pre-computed advantages from {args.precomputed_advantages}")
+        precomputed_advantages = np.load(args.precomputed_advantages)
+        print(f"Loading advantage thresholds from {args.thresholds_path}")
+        task_thresholds = load_thresholds(args.thresholds_path)
+    elif model.config.use_advantage_conditioning:
+        print(
+            "Warning: distilling an advantage-conditioned policy without "
+            "--precomputed_advantages/--thresholds_path — every frame is "
+            "treated as positive. Only correct for expert-demonstration data."
+        )
 
     # Freeze VLM backbone entirely, only action expert and target_time_mlp are trainable
     for p in model.parameters():
@@ -294,6 +376,15 @@ def main():
     model, optimizer, dataloader, scheduler = accelerator.prepare(
         model, optimizer, dataloader, scheduler
     )
+    if demo_dataloader is not None:
+        demo_dataloader = accelerator.prepare(demo_dataloader)
+
+    def _cycle_loader(dl):
+        while True:
+            for b in dl:
+                yield b
+
+    demo_iter = _cycle_loader(demo_dataloader) if demo_dataloader is not None else None
 
     step = 0
     if checkpoint_to_try:
@@ -304,6 +395,12 @@ def main():
 
     while step < args.steps:
         for batch in dataloader:
+            # Co-training: with prob demo_mix_ratio, swap in an expert-demo batch
+            # (labeled positive). The main-loader batch is skipped this step.
+            is_demo = False
+            if demo_iter is not None and torch.rand(1).item() < args.demo_mix_ratio:
+                batch = next(demo_iter)
+                is_demo = True
             if max_duration_seconds is not None:
                 elapsed = time.time() - start_time
                 if elapsed >= max_duration_seconds - args.duration_buffer:
@@ -321,6 +418,30 @@ def main():
                 break
 
             with accelerator.accumulate(model):
+                # Label advantage per frame (same lookup as train_recap); None
+                # keeps the legacy all-positive behavior for expert demos.
+                advantage_bool = None
+                if is_demo:
+                    advantage_bool = [True] * batch["task_index"].shape[0]
+                elif precomputed_advantages is not None:
+                    with torch.no_grad():
+                        def to_numpy(val):
+                            if hasattr(val, "cpu"):
+                                val = val.cpu()
+                            if hasattr(val, "numpy"):
+                                return val.numpy()
+                            return np.array(val)
+
+                        batch_indices = to_numpy(batch["index"])
+                        raw_adv = np.nan_to_num(
+                            precomputed_advantages[batch_indices], nan=0.0
+                        )
+                        task_indices = to_numpy(batch["task_index"])
+                        batch_thresholds = np.array(
+                            [task_thresholds[int(t)] for t in task_indices]
+                        )
+                        advantage_bool = (raw_adv > batch_thresholds).tolist()
+
                 recap_batch = pre_recap(batch)
 
                 # Forward pass in SnapFlow mode
@@ -330,6 +451,9 @@ def main():
                     alpha=args.alpha,
                     lambda_c=args.lambda_consistency,
                     clamp=args.clamp,
+                    advantage=advantage_bool,
+                    distill_cfg_weight=args.distill_cfg_weight,
+                    teacher_model=frozen_teacher,
                 )
 
                 accelerator.backward(loss)
@@ -341,11 +465,17 @@ def main():
 
                 if step % args.log_freq == 0:
                     lr = optimizer.param_groups[0]["lr"]
+                    adv_frac = (
+                        sum(advantage_bool) / max(len(advantage_bool), 1)
+                        if advantage_bool is not None
+                        else 1.0
+                    )
                     accelerator.log(
                         {
                             "snapflow/combined_loss": loss.item(),
                             "snapflow/fm_loss": fm_loss.item(),
                             "snapflow/consistency_loss": consistency_loss.item(),
+                            "snapflow/adv_frac": adv_frac,
                             "lr": lr,
                             "step": step,
                         }

@@ -51,6 +51,74 @@ def test_snapflow_loss_computation(base_config):
     assert not torch.isnan(fm_loss)
     assert not torch.isnan(consistency_loss)
 
+def test_snapflow_guided_distillation_loss(base_config):
+    model = SmolVLARECAP(base_config)
+
+    batch = {
+        "observation.images.image": torch.randn(2, 1, 3, 224, 224),
+        "observation.language.tokens": torch.zeros(2, 10, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 10, dtype=torch.bool),
+        "observation.state": torch.randn(2, 2),
+        "action": torch.randn(2, 4, 2),
+    }
+
+    # Guidance distillation: teacher blends cond/uncond at w; one frame
+    # advantage-negative so the FM mask path is exercised.
+    loss, fm_loss, consistency_loss = model(
+        batch,
+        mode="snapflow",
+        alpha=0.5,
+        lambda_c=0.1,
+        clamp=20.0,
+        advantage=[True, False],
+        distill_cfg_weight=1.5,
+    )
+
+    assert not torch.isnan(loss)
+    assert not torch.isnan(fm_loss)
+    assert not torch.isnan(consistency_loss)
+    assert loss.requires_grad
+
+def test_snapflow_frozen_teacher_guided_loss(base_config):
+    model = SmolVLARECAP(base_config)
+    teacher = SmolVLARECAP(base_config)
+    teacher.load_state_dict(model.state_dict())
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+
+    batch = {
+        "observation.images.image": torch.randn(2, 1, 3, 224, 224),
+        "observation.language.tokens": torch.zeros(2, 10, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 10, dtype=torch.bool),
+        "observation.state": torch.randn(2, 2),
+        "action": torch.randn(2, 4, 2),
+    }
+
+    loss, fm_loss, consistency_loss = model(
+        batch,
+        mode="snapflow",
+        alpha=0.5,
+        lambda_c=0.1,
+        clamp=20.0,
+        advantage=[True, False],
+        distill_cfg_weight=1.5,
+        teacher_model=teacher,
+    )
+
+    assert not torch.isnan(loss)
+    assert not torch.isnan(fm_loss)
+    assert not torch.isnan(consistency_loss)
+    assert loss.requires_grad
+
+    # A backward pass must leave the frozen teacher without gradients.
+    teacher_before = {k: v.clone() for k, v in teacher.state_dict().items()}
+    loss.backward()
+    assert all(p.grad is None for p in teacher.parameters())
+    for k, v in teacher.state_dict().items():
+        assert torch.equal(v, teacher_before[k])
+
+
 def test_snapflow_single_step_inference(base_config):
     base_config.snapflow_enabled = True
     model = SmolVLARECAP(base_config)
