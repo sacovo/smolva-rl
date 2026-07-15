@@ -13,8 +13,6 @@
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 
-% ---- first-draft helper: mark values still being measured ----
-\newcommand{\todo}[1]{\textcolor{red}{[#1]}}
 \newcommand{\pf}{\ensuremath{f^{+}}}   % positive fraction
 
 \begin{document}
@@ -22,14 +20,9 @@
 \title{Critic-Guided Rollout Post-Training of a Compact Vision-Language-Action Policy for Edge Robotics}
 
 \author{\IEEEauthorblockN{Sandro Covo}
-\IEEEauthorblockA{\textit{FHNW} \\
+\IEEEauthorblockA{\textit{FHNW School of Computer Science} \\
 Switzerland \\
 sandro.covo@fhnw.ch}
-\and
-\IEEEauthorblockN{\todo{Given Name Surname}}
-\IEEEauthorblockA{\textit{FHNW} \\
-Switzerland \\
-\todo{email}}
 }
 
 \maketitle
@@ -38,23 +31,17 @@ Switzerland \\
 Critic-guided rollout post-training, introduced by RECAP and demonstrated with the large
 $\pi^{*}_{0.6}$ vision-language-action (VLA) model, improves a policy by training on its own
 critic-scored rollouts. We study whether this recipe transfers to SmolVLA, a compact
-flow-matching VLA whose size makes it a candidate for edge and mobile robots, using the LIBERO
-benchmark. In contrast to RECAP, our reinforcement phase uses no human intervention: rollouts
-are collected autonomously and labeled by a learned critic alone. The recipe transfers, with one qualification: training on rollout data alone improves the
-two short-horizon suites but degrades the long-horizon one. Pre-training with knowledge
-insulation and advantage conditioning gains $\approx$$10$ points per suite over a plain
-SmolVLA baseline trained without either; co-training the rollout data with expert
-demonstration batches (mixing ratio $0.5$) removes the long-horizon regression and is the
-best configuration, reaching $67.8\%$ average success across three suites, compared to
-$62.9\%$ for the base policy and $52.4\%$ for the plain baseline. One practical caveat is the advantage-labeling threshold: if it is set
-aggressively, actions that are necessary for success are labeled negative and the policy
-degrades; a relaxed threshold avoids this. Classifier-free guidance at inference contributes
-little in our setting ($\sim$1 point); the gains come from the advantage-conditioned training
-itself. Finally, one-step SnapFlow distillation removes the
-iterative flow-matching solve at inference, cutting action-chunk latency $3.6\times$ on an
-NVIDIA Jetson Orin Nano.
-These results indicate that rollout-based post-training, so far demonstrated on
-large VLAs, is also applicable to compact models suited to resource-constrained robots.
+flow-matching VLA suited to edge and mobile robots, on the LIBERO benchmark. Rollouts are 
+collected autonomously and labeled by a learned critic alone. The RECAP recipe transfers, with one qualification: training on
+rollout data alone improves the two short-horizon suites but degrades the long-horizon one,
+and co-training with expert demonstration batches counteracts the regression. Together with
+knowledge-insulation pre-training, the best configuration reaches $68.1\%$ average success
+across three suites, compared to $62.9\%$ for the base policy and $55.3\%$ for a
+SmolVLA-style baseline without knowledge insulation. Finally, one-step SnapFlow distillation
+removes the iterative flow-matching solve at inference, cutting action-chunk latency
+$3.6\times$ on an NVIDIA Jetson Orin Nano while staying within two points of the original
+policy's average success. Rollout-based post-training, so far demonstrated on large VLAs, is thus
+also applicable to the compact models that resource-constrained robots can run.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -65,19 +52,21 @@ edge robotics
 \section{Introduction}
 Vision-language-action (VLA) policies map camera images, proprioceptive robot state, and a
 language instruction to robot actions. The strongest current VLAs are large models: the
-$\pi^{*}_{0.6}$ policy underlying RECAP~\cite{b_recap} couples a $4$B-parameter Gemma~3
+$\pi^{*}_{0.6}$ policy trained with RECAP~\cite{b_recap} couples a $4$B-parameter Gemma~3
 backbone with an $860$M-parameter action expert, and the reference inference stack for this
-model family calls for a GPU with more than $8$\,GB of memory~\cite{b_openpi}. The documented
-example, an RTX~4090, has a $450$\,W board power rating, and the stack often runs the policy
-off-robot entirely, streaming actions to the robot over a network. A battery-powered mobile robot offers a
-small fraction of that budget: a representative onboard computer such as the NVIDIA Jetson
-Orin Nano provides, within a $7$--$25$\,W envelope, $8$\,GB of unified memory shared with the
-operating system~\cite{b_jetson}---too little to hold even the bfloat16 weights of
-$\pi^{*}_{0.6}$ ($\approx$$10$\,GB). SmolVLA~\cite{b_smolvla} was proposed as a compact alternative
-($450$M parameters) that fits this class of hardware, but it is trained by imitation only.
+model family lists more than $8$\,GB of GPU memory as the inference requirement already
+for its released, smaller models ($\pi_0$, $\pi_{0.5}$)~\cite{b_openpi}. The documented
+example, an RTX~4090, has a $450$\,W board power rating. A battery-powered mobile robot offers a
+small fraction of that budget: our target onboard computer, an NVIDIA Jetson Orin NX
+$16$\,GB, operates within a $10$--$25$\,W envelope, and its unified memory is shared with
+the operating system and the rest of the robot's software stack~\cite{b_jetson}. The
+bfloat16 weights of $\pi^{*}_{0.6}$ alone ($\approx 10$\,GB) would leave roughly $6$\,GB
+for everything else, such as cameras, inverse kinematics, and navigation, before
+accounting for inference activations. SmolVLA~\cite{b_smolvla} was proposed as a compact alternative
+($450$M parameters) that fits this class of hardware, but it only supports imitation learning at the moment.
 
-RECAP~\cite{b_recap} showed that a VLA can be improved past its imitation baseline by
-\emph{rollout post-training}: the policy collects rollouts, a learned critic scores them with
+With RECAP~\cite{b_recap} Physical-Intelligence showed that a VLA can be improved past its imitation learning baseline by
+\emph{rollout post-training}: the policy collects rollouts (optionally with human interventions), a learned critic scores them with
 per-frame advantages, the advantages are thresholded into positive/negative labels, and the
 policy is retrained with the label as a conditioning token so that classifier-free guidance
 (CFG)~\cite{b_cfg} can steer it at inference. Those results were obtained on a large model
@@ -88,34 +77,37 @@ same reason we add SnapFlow~\cite{b_snapflow} one-step distillation, which remov
 iterative flow-matching solve so that the resulting policy can act in real time on limited
 hardware.
 
-Concretely, we run the pipeline on the LIBERO benchmark~\cite{b_libero} and report the
+We run the pipeline on the LIBERO benchmark~\cite{b_libero} and report the
 following:
 \begin{itemize}
 \item RECAP-style rollout post-training transfers to SmolVLA: the knowledge-insulation
-recipe~\cite{b_ki} gains $\approx$$10$ points per suite over plain SmolVLA; rollout-only
-training helps the short-horizon suites but degrades the long-horizon one; adding expert
-demonstrations to the fine-tuning mix lifts all three suites and gives the strongest policy
-(Sec.~\ref{sec:main}).
+recipe~\cite{b_ki} gains $5$--$11$ points per suite over a SmolVLA-style no-KI
+baseline. Rollout-only training helps the short-horizon suites but degrades the
+long-horizon one; adding expert demonstrations to the fine-tuning mix counteracts the
+regression and gives the strongest policies (Sec.~\ref{sec:main}).
 \item An ablation of the advantage-labeling threshold (Sec.~\ref{sec:dose}): setting it too
 aggressively labels necessary actions as negative, which degrades the policy and makes CFG
-counterproductive; a relaxed threshold ($\pf{=}0.8$) avoids this. Even then, guidance at
-inference adds only about one point---the benefit comes from the advantage-conditioned
-training itself.
+counterproductive; a relaxed threshold ($\pf{=}0.8$) avoids this. Guidance itself pays off
+only when the fine-tuning mix preserves distinct conditionals: about one point for
+rollout-only training, up to $6.6$ points after co-training.
 \item Remaining failures concentrate on long-horizon tasks that chain two pick-and-place
 subgoals; co-training helps most on skills that are absent from the policy's own rollouts
 (Sec.~\ref{sec:failure}).
-\item One-step SnapFlow distillation of the best policy, trading the iterative flow-matching
-solve for a single step: measured on a Jetson Orin Nano, chunk generation drops from $922$ to
-$255$\,ms (Sec.~\ref{sec:snapflow}).
+\item One-step SnapFlow distillation of the best policy: trading the iterative flow-matching
+solve for a single step. Measured on a Jetson Orin Nano, chunk generation drops from $922$ to
+$255$\,ms while the success rate stays within two average points of the iterative policy; baking CFG into the
+single step helps only where guidance helps the original policy (Sec.~\ref{sec:snapflow}).
 \end{itemize}
 
 \section{Background and Related Work}
 \textbf{Flow-matching VLA policies.} SmolVLA~\cite{b_smolvla} couples a compact
 vision-language backbone with a flow-matching~\cite{b_flow} action expert that integrates a
 learned velocity field to generate a chunk of actions from images, robot state, and language.
-\emph{Knowledge insulation} (KI)~\cite{b_ki} trains the action expert while limiting gradient
-flow into the language backbone and instead supervises the backbone with autoregressive action
-targets from the FAST tokenizer~\cite{b_fast}, preserving pretrained semantics.
+
+\textbf{Knowledge insulation} (KI)~\cite{b_ki} trains the randomly initialized action
+expert while blocking its gradients from entering the backbone; the backbone is instead
+trained with an autoregressive loss on FAST-tokenized action targets~\cite{b_fast},
+preserving its pretrained semantics.
 
 \textbf{Critic-guided rollout post-training.} RECAP~\cite{b_recap} trains a distributional
 critic on policy rollouts, computes $N$-step temporal-difference advantages, and retrains the
@@ -159,7 +151,7 @@ solve at inference. We use it to measure the accuracy--latency trade-off of the 
 \draw[<->, dashed] (fast)--(vlm);
 % SnapFlow distillation of the FM expert
 \node[aux, fill=purple!8, below=7mm of fm] (snap) {\textbf{SnapFlow}\\$10$-step $\to$ $1$-step};
-\draw[->, dashed] (fm)--(snap) node[midway, right]{distil};
+\draw[->, dashed] (fm)--(snap) node[midway, right]{distill};
 % critic / rollout-iteration loop (stacked to the right, routed around the aux row)
 \node[aux, fill=red!7, below=7mm of act] (critic) {critic (C51)};
 \node[aux, fill=red!7, below=5mm of critic] (thr) {advantages\\threshold $\pf$};
@@ -178,15 +170,17 @@ with a distributional critic, converts values to $N$-step advantages, and thresh
 target positive fraction \pf{} into the $\pm$ labels. The same architecture is used during
 pre-training, where the critic is trained on the expert demonstrations and its labels
 condition the policy from the start.
-SnapFlow optionally distils the ten-step expert into a single step for real-time inference.}
+SnapFlow optionally distills the ten-step expert into a single step for real-time inference.}
 \label{fig:arch}
 \end{figure*}
 
 \subsection{Critic and advantage-conditioned pre-training}\label{sec:pretrain}
-The pipeline starts with the critic, not the policy. A distributional (C51)~\cite{b_c51}
-critic is trained
+Before training the policy, a distributional (C51)~\cite{b_c51} critic is trained
 on the LIBERO expert dataset to predict the remaining time to episode completion as a
-categorical distribution; its expectation is the value $V(s_t)$. Fig.~\ref{fig:critic} shows
+categorical distribution ($201$ bins over the normalized range $[-1,0]$); its expectation
+is the value $V(s_t)$. For convenience the critic reuses the policy's architecture and
+consumes the same observations: the VLM backbone is truncated to eight layers, and the
+action head is replaced by the categorical value head. Fig.~\ref{fig:critic} shows
 the critic's output over episodes: the value rises steadily as the robot makes progress and
 temporarily drops back when progress stalls (e.g., a missed grasp), which is what makes
 per-frame advantages informative within a single trajectory.
@@ -194,36 +188,36 @@ per-frame advantages informative within a single trajectory.
 The base policy is then pre-trained ($250$k steps) on the same expert dataset with KI
 \emph{and advantage conditioning already in place}: per-frame advantages from the
 demonstration-trained critic are thresholded per task into positive/negative tokens that are
-prepended to the language prefix, with the token dropped at probability $0.3$ so an
-unconditional predictor is learned alongside. The resulting base policy $\pi_{\text{base}}$
-therefore enters fine-tuning already interpreting the advantage tokens, unconditional
-predictor included.
+prepended to the language prefix, with the token dropped with probability $0.3$ so an
+unconditional predictor is learned alongside.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figs/fig_critic.pdf}
 \caption{Output of the demonstration-trained critic over one expert episode: the expected
-normalized time-to-completion ($-1$ start, $0$ done). The value rises steadily as the robot
-makes progress and temporarily drops back where progress stalls, giving per-frame advantages
-their within-trajectory signal.}
+normalized time-to-completion ($-1$ start, $0$ done).}
 \label{fig:critic}
 \end{figure}
 
 \subsection{Rollout collection and critic fine-tuning}
 $\pi_{\text{base}}$ collects rollouts on the target suites, yielding $107{,}410$ frames over $600$
-episodes ($64.3\%$ success). All rollouts are collected autonomously; unlike RECAP, no human
-teleoperation corrections or interventions are used at any point. The critic is then
-fine-tuned on this rollout data. This step is necessary: having seen only successful
-demonstrations, the pre-training critic is over-optimistic on failed rollouts and assigns
-them values close to those of successes. After fine-tuning, per-frame advantages are computed
-as $N$-step TD residuals ($N{=}50$) with a terminal penalty for failed episodes, so failed
-frames receive strongly negative advantages. These advantages provide the thresholds and
-labels for the subsequent policy fine-tuning.
+episodes ($64.3\%$ success). All rollouts are collected autonomously, no human
+teleoperation corrections or interventions are used. The critic is then
+fine-tuned on this rollout data, with a pessimistic target for failed episodes: a large
+constant is added to their remaining time to completion, which after normalization clamps
+their return target to the bottom of the value support ($-1$). This step is necessary:
+having seen only successful demonstrations, the demonstration-trained critic was
+over-optimistic on failed rollouts and assigned them values close to those of successes.
+After fine-tuning, per-frame advantages are computed as $N$-step TD residuals ($N{=}50$);
+through the pessimistic returns, frames of failed episodes receive strongly negative
+advantages. These advantages provide the thresholds and labels for the subsequent policy
+fine-tuning.
 
 \subsection{Advantage labeling}
-For each task, a threshold $\varepsilon_\ell$ is set to the $100(1-\pf)$ percentile of the
-advantage distribution over that task's \emph{successful} frames; a frame is labeled positive
-iff its advantage exceeds $\varepsilon_\ell$. The target positive fraction \pf{} thus controls
+For each task, a threshold $\varepsilon_\ell$ is set to the $100(1-\pf)$th percentile of the
+advantage distribution over that task's \emph{successful} frames; a frame is labeled
+positive if its advantage exceeds $\varepsilon_\ell$ and negative otherwise. The target
+positive fraction \pf{} thus controls
 how aggressively frames are labeled negative. We use $\pf{=}0.8$ as the default and ablate
 lower values in Sec.~\ref{sec:dose}. We also evaluate an \emph{outcome-only} scheme that
 bypasses the critic: every frame of a successful episode is positive, every frame of a failed
@@ -231,7 +225,7 @@ episode negative.
 
 \subsection{Advantage-conditioned fine-tuning and CFG}
 The policy is fine-tuned from $\pi_{\text{base}}$ on the rollout data, with the rollout labels supplying
-the positive/negative token it already knows from pre-training; the same $0.3$ token dropout
+the positive/negative token established in pre-training; the same $0.3$ token dropout
 keeps the unconditional predictor required for CFG intact. At inference we sweep the guidance weight
 $w\in\{0,0.5,1,1.5,2\}$. The guided velocity field is
 $v^{\mathrm{cfg}}(x_t)=v_\theta(x_t)+w[v_\theta^{+}(x_t)-v_\theta(x_t)]$, recovering the
@@ -241,14 +235,17 @@ inference.
 
 
 \subsection{Expert co-training}
-We optionally mix a fraction (ratio $0.5$) of expert demonstration batches into fine-tuning,
-labeling all demonstration frames positive. This supplies known-good behavior for the positive
-conditional, including skills that may be absent from the policy's own rollouts.
+We also co-train on the expert demonstrations: at each training step the batch is
+drawn from the demonstrations with probability $0.5$, with all demonstration frames labeled
+positive. This supplies known-good behavior for the positive conditional, including skills
+that may be absent from the policy's own rollouts, and acts as replay against forgetting
+behavior that was learned in pre-training but is not exercised in the rollout data.
+
 
 \subsection{SnapFlow distillation}
-Given the best fine-tuned policy, SnapFlow~\cite{b_snapflow} distills the ten-step expert
-into a single-step generator conditioned on a target time, initialized so training begins
-exactly at the flow-matching teacher.
+Given the best fine-tuned policy, SnapFlow~\cite{b_snapflow} distills its ten-step expert
+into a single-step generator conditioned on a target time. The distilled policy is
+initialized from the original, so distillation starts from the original policy's behavior.
 
 \section{Experimental Setup}\label{sec:setup}
 \textbf{Benchmark.} LIBERO~\cite{b_libero} suites \textsc{spatial}, \textsc{goal}, and
@@ -256,71 +253,100 @@ exactly at the flow-matching teacher.
 setting, including the base, runs its episodes to timeout without completing the task. Because
 this affects all configurations identically, we suspect missing or corrupted \textsc{object}
 demonstrations in the pre-training data rather than a property of the methods; either way the
-suite cannot separate them. \textbf{Protocol.} Unless noted, every reported number is $50$
+suite cannot separate them. \textbf{Protocol.} Every reported number is $50$
 episodes per task ($n{=}500$ per suite); we report percent success at the best guidance
 weight. All advantage-conditioned methods are swept identically over
-$w\in\{0,0.5,1,1.5,2\}$; the no-KI baseline has no conditioning token, so its number is a
-single unconditioned evaluation. \textbf{Models.} SmolVLA with a $16$-layer VLM backbone; the base is pre-trained for $250$k
+$w\in\{0,0.5,1,1.5,2\}$; the no-KI baseline, whose constant conditioning admits no
+meaningful guidance, is evaluated at its single operating point $w{=}1$.
+\textbf{Models.} All policies use the SmolVLA architecture ($450$M parameters, $16$-layer
+VLM backbone with a flow-matching action expert); the critic shares this architecture with
+the backbone truncated to $8$ layers. The base is pre-trained for $250$k
 steps on the expert demonstrations with KI, FAST co-training, and advantage conditioning
-(Sec.~\ref{sec:pretrain}); fine-tunes run $20$k steps. The no-KI baseline follows the original SmolVLA
-recipe: flow-matching gradients from the action expert train the VLM directly (no
-insulation), which replaces the FAST AR co-training as the VLM's training signal, and no
-advantage conditioning is used---so the comparison to the base measures the KI training
-recipe as a whole, not gradient insulation in isolation. Training and evaluation hardware
+(Sec.~\ref{sec:pretrain}); fine-tuning runs take $20$k steps. The no-KI baseline mirrors the original SmolVLA
+objective: flow-matching gradients from the action expert train the VLM directly (no
+insulation), replacing the FAST AR co-training as the VLM's training signal, and the
+advantage token is held constant (every training frame positive, no token dropout), reducing
+the conditioning to an inert extra token. All remaining
+settings (optimizer, schedule, action chunking, data, $250$k steps) are shared with the
+base, so the
+comparison measures the KI training recipe as a whole rather than gradient insulation in
+isolation; both models are trained under our harness settings rather than the lerobot
+SmolVLA presets.
+\textbf{Comparability with published SmolVLA results.} The released SmolVLA is pre-trained
+on a large corpus of community robot datasets~\cite{b_smolvla}; reproducing this was not
+feasible within our compute budget, so every model here is trained on the LIBERO expert
+demonstrations (\texttt{HuggingFaceVLA/libero}) alone, and our absolute numbers are not
+directly comparable to published ones. Evaluated under our protocol, the released LIBERO
+fine-tune (\texttt{HuggingFaceVLA/smolvla\_libero}) scores close to our no-KI baseline,
+which is therefore a faithful stand-in for the original recipe in our setting.
+Training and evaluation hardware
 and run times are listed in Appendix~\ref{app:compute}.
 
 \section{Results}
 \subsection{Rollout post-training transfers to SmolVLA}\label{sec:main}
 Table~\ref{tab:main} reports success at the best guidance weight. The KI training recipe is
 the largest single effect: the KI base beats the no-KI baseline (Sec.~\ref{sec:setup}) by
-roughly $10$ points on every suite ($+10.2$, $+9.8$, and $+11.4$). Training on critic-labeled rollout data alone ($\pf{=}0.8$) improves the KI base on
+$5$ to $11$ points per suite ($+6.2$, $+5.2$, and $+11.4$). Training on critic-labeled rollout data alone ($\pf{=}0.8$) improves the KI base on
 \textsc{spatial} ($+6.6$) and \textsc{goal} ($+4.2$) but \emph{degrades} \textsc{long}
-($35.8$ vs.\ $41.6$). With expert demonstrations mixed in, the regression disappears and all
-three suites improve over the base ($67.8\%$ vs.\ $62.9\%$ average success). Whether co-training also repairs the \textsc{long} regression
-at $\pf{=}0.8$ is pending (Table~\ref{tab:main}, \todo{TBD} row).
+($35.8$ vs.\ $41.6$). Mixing expert demonstrations in lifts every suite over rollout-only
+training and yields the two best configurations ($68.1\%$ and $67.8\%$ average success vs.\
+$62.9\%$ for the base). The \textsc{long} regression, however, is only mitigated at
+$\pf{=}0.8$ ($38.2$, still below the base's $41.6$) and fully repaired at $\pf{=}0.4$
+($43.8$); at a suite-level standard error of about $\pm2$ points these threshold effects sit
+at the edge of resolution; we return to them in Sec.~\ref{sec:discussion}.
 
 \begin{table}[t]
-\caption{Main comparison, percent success ($n{=}500$/suite); conditioned methods at their
-best guidance weight, no-KI unconditioned.}
+\caption{Main comparison on the three LIBERO suites}
 \label{tab:main}
 \begin{center}
-\begin{tabular}{lcccc}
+\begin{tabular}{lccccc}
 \toprule
-method & spatial & goal & long & avg \\
+method & spatial & goal & long & avg & ms/chunk \\
 \midrule
-SmolVLA, no KI            & 61.0 & 66.0 & 30.2 & 52.4 \\
-SmolVLA $+$KI (base)      & 71.2 & 75.8 & 41.6 & 62.9 \\
-$+$rollout data (\pf{}=0.8) & \textbf{77.8} & 80.0 & 35.8 & 64.5 \\
-$+$co-training (\pf{}=0.4)   & 75.4 & \textbf{84.2} & \textbf{43.8} & \textbf{67.8} \\
-$+$co-training (\pf{}=0.8)   & \todo{TBD} & \todo{TBD} & \todo{TBD} & \todo{TBD} \\
-outcome-only              & \todo{TBD} & \todo{TBD} & \todo{TBD} & \todo{TBD} \\
+SmolVLA, no KI            & 65.0 & 70.6 & 30.2 & 55.3 & -- \\
+SmolVLA $+$KI (base)      & 71.2 & 75.8 & 41.6 & 62.9 & -- \\
+$+$rollout data (\pf{}=0.8) & 77.8 & 80.0 & 35.8 & 64.5 & -- \\
+$+$co-training (\pf{}=0.4)   & 75.4 & 84.2 & \textbf{43.8} & 67.8 & -- \\
+$+$co-training (\pf{}=0.8)   & \textbf{80.0} & \textbf{86.2} & 38.2 & \textbf{68.1} & 922 \\
+  $+$SnapFlow distillation     & 74.2 & 84.2 & 40.0 & 66.1 & \textbf{255} \\
+\midrule
+outcome-only              & 72.8 & 81.8 & 40.0 & 64.9 & -- \\
 \bottomrule
 \end{tabular}
 \end{center}
+{\footnotesize $+$ marks additions to the pipeline: rollout fine-tuning on the KI base,
+co-training at two labeling thresholds, and one-step distillation of the $\pf{=}0.8$
+policy (Sec.~\ref{sec:snapflow}). ``outcome-only'' labels frames by episode outcome only.
+Latency: one $20$-action chunk, Jetson Orin Nano, bfloat16; measured configurations only.}
 \end{table}
 
 \subsection{Ablation: the advantage-labeling threshold}\label{sec:dose}
-Table~\ref{tab:dose} and
-Fig.~\ref{fig:dose} sweep the guidance weight for three values of \pf{} on \textsc{spatial}.
+Table~\ref{tab:dose} sweeps the guidance weight for three values of \pf{} on \textsc{spatial}.
 At low \pf{} ($0.3$, $0.4$) a large share of the frames \emph{inside successful
-trajectories}---the approach and transport motions a task requires---fall below the threshold
+trajectories}, the approach and transport motions a task requires, fall below the threshold
 and are labeled negative ($26$--$31\%$ of all frames, Table~\ref{tab:labels}). The policy is
-then trained to treat necessary actions as behavior to avoid: success drops below the base
-even at $w{=}0$ ($67.0$ vs.\ $71.2$ for $\pf{=}0.3$), and guidance amplifies the damage,
-since the $v_\theta^{+}\!-\!v_\theta$ direction it extrapolates along then points away from
-useful behavior. At
+then trained to treat necessary actions as behavior to avoid. At $\pf{=}0.3$ the entire
+sweep sits below the base ($67.0$ at $w{=}0$ vs.\ $71.2$); at $\pf{=}0.4$ the unguided
+policy still edges out the base ($72.8$) but guidance erodes it steadily ($65.4$ at
+$w{=}2$), since the $v_\theta^{+}\!-\!v_\theta$ direction it extrapolates along points away
+from useful behavior. At
 $\pf{=}0.8$ the negative label is reserved for genuinely low-advantage behavior (mostly from
 failed episodes), the policy improves over the base, and moderate guidance helps. We therefore
 use $\pf{=}0.8$ throughout.
 
-Even in this best case, guidance itself is a minor contributor: it adds $+1.0$ on
+Even in this best case, guidance itself is a minor contributor for the rollout-only policy:
+it adds $+1.0$ on
 \textsc{spatial} ($76.8$ at $w{=}0$ vs.\ $77.8$ at $w{=}0.5$), while nearly all of the gain
-over the base is already present at $w{=}0$ ($76.8$ vs.\ $71.2$)---that is, it comes from the
-advantage-conditioned fine-tuning on labeled rollouts, not from steering at inference.
+over the base is already present at $w{=}0$ ($76.8$ vs.\ $71.2$). That is, the gain comes
+from the advantage-conditioned fine-tuning on labeled rollouts, not from steering at inference. The
+picture changes once demonstrations are co-trained: the co-trained $\pf{=}0.8$ policy gains
+$+6.6$ on \textsc{spatial} from guidance ($73.4$ at $w{=}0$ to $80.0$ at $w{=}1.5$) and
+$+2.4$ on \textsc{goal}. A possible reading, developed in Sec.~\ref{sec:discussion}, is
+that the demonstration batches keep the conditional and unconditional modes separated, so
+inference-time steering has a direction to amplify.
 
 \begin{table}[t]
-\caption{Label composition over all $107{,}410$ frames (incl.\ failures). ``neg{:}succ'' is
-the fraction of frames that lie in successful episodes yet are labeled negative.}
+\caption{Label composition of the rollout data}
 \label{tab:labels}
 \begin{center}
 \begin{tabular}{lcccc}
@@ -334,19 +360,13 @@ outcome-only & 44.2 & 55.8 & 0.0 & 0.0 \\
 \bottomrule
 \end{tabular}
 \end{center}
+{\footnotesize All $107{,}410$ rollout frames, failures included. ``pos{:}fail'': frames in
+failed episodes labeled positive; ``neg{:}succ'': frames in successful episodes labeled
+negative (percent of all frames).}
 \end{table}
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.82\columnwidth]{figs/fig_dose.pdf}
-\caption{Guidance-weight sweep on \textsc{spatial} for three labeling thresholds. With
-aggressive negatives (low \pf{}) the whole curve sits lower and degrades with $w$; at
-$\pf{=}0.8$ the curve is higher and peaks at $w{=}0.5$. Numbers in Table~\ref{tab:dose}.}
-\label{fig:dose}
-\end{figure}
-
 \begin{table}[t]
-\caption{Guidance-weight sweep on \textsc{spatial} (percent success, $n{=}500$).}
+\caption{Guidance-weight sweep on \textsc{spatial}}
 \label{tab:dose}
 \begin{center}
 \begin{tabular}{lcccccc}
@@ -363,11 +383,16 @@ scheme & pos\% & $w{=}0$ & $0.5$ & $1$ & $1.5$ & $2$ \\
 
 The negative-token probe points the same way: forcing the \emph{negative} token at inference
 costs only $1$--$2$ points relative to the positive token on \textsc{spatial} and
-\textsc{goal} ($w{=}1$). The positive, negative, and unconditional predictions are compressed
+\textsc{goal} ($w{=}1$). For the $\pf{=}0.3$ policy the probe finds no usable separation
+(negative $66.4$ vs.\ positive $66.0$ on \textsc{spatial}; on \textsc{goal} the negative
+token even scores higher, $76.4$ vs.\ $73.6$). With a third of successful frames labeled
+negative, the token never carried a good/bad distinction. The positive, negative, and unconditional predictions are compressed
 into a narrow band, so the $v_\theta^{+}\!-\!v_\theta$ difference that guidance amplifies is
-small. Part of this is the base policy being close to its ceiling on these suites; part may
+small. On \textsc{long} the separation is similarly modest: forcing the negative token
+costs $1.0$ point for the $\pf{=}0.8$ policy ($34.8$ vs.\ $35.8$) and $3.8$ for
+$\pf{=}0.4$ ($29.4$ vs.\ $33.2$). Part of this may be limited headroom over the base
+policy; part may
 be a capacity effect, which we return to in Sec.~\ref{sec:discussion}.
-\todo{negative-token probe on \textsc{long}.}
 
 \begin{figure*}[t]
 \centering
@@ -389,103 +414,183 @@ The dominant remaining failure mode is long-horizon tasks that chain \emph{two} 
 subgoals. All methods stay below $\sim40\%$ on the same subset of \textsc{long} tasks of this
 type, with the hardest (``put both the alphabet soup and the cream cheese box in the basket'')
 below $16\%$ for every method: the policy typically places the first object and fails to
-sequence the second before timeout (Fig.~\ref{fig:dualobj}). Single-subgoal \textsc{long}
+sequence the second before timeout. Single-subgoal \textsc{long}
 tasks reach $70$--$80\%$, comparable to the other suites, so the low \textsc{long} averages
 reflect error compounding across subgoals rather than a deficiency of any particular
 post-training method.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figs/lib10_dualobj_fail.png}
-\caption{Filmstrip ($10$ evenly spaced frames, left$\rightarrow$right) of a dual-subgoal
-\textsc{long} task (``put both the alphabet soup and the cream cheese box in the basket'').
-The policy places the first item but does not complete the second before timeout; all methods
-fail on this class of task.}
-\label{fig:dualobj}
-\end{figure}
-
 Second, co-training helps most where the rollout data cannot: on skills the base policy never
 executes successfully, its rollouts contain no positive examples, so rollout post-training
-has nothing to reinforce. Drawer manipulation is the clearest case: the base policy rarely
-opens a drawer, and only the co-trained policy acquires the skill reliably
-(Fig.~\ref{fig:drawer}). Rollout data can only sharpen behavior the policy already shows;
+has nothing to reinforce. Drawer manipulation is the clearest case: the base policy's
+rollouts contain no successful drawer opening, and only the co-trained policy acquires the
+skill (Fig.~\ref{fig:drawer}). Rollout data can only sharpen behavior the policy already shows;
 skills it lacks entirely have to come from the demonstrations.
 
 \subsection{Critic granularity: outcome-only labels}
 The outcome-only scheme (Table~\ref{tab:labels}) tests whether the critic's within-trajectory
-granularity matters, or whether a plain success/failure label suffices. \todo{report
-outcome-only vs.\ \pf{}=0.8 and co-training.}
+granularity matters, or whether a plain success/failure label suffices. The answer is mixed:
+outcome-only reaches $72.8$ on \textsc{spatial}, five points below the critic-labeled
+$\pf{=}0.8$ policy ($77.8$), but $81.8$ on \textsc{goal}, ahead of it ($80.0$), and $40.0$
+on \textsc{long}, also ahead ($35.8$). On average the two schemes are indistinguishable
+($64.9$ vs.\ $64.5$): the critic's within-trajectory granularity is not required to
+benefit from rollout data on these suites, although the best overall configuration
+(co-training, Table~\ref{tab:main}) does use it. We have not combined outcome-only labels
+with co-training; that run would isolate the critic's contribution to the best
+configuration and is left for future work.
 
 \subsection{SnapFlow: one-step inference}\label{sec:snapflow}
-We distill the best fine-tuned policy with SnapFlow into a single-step generator and measure
-inference on the class of hardware this work targets: an NVIDIA Jetson Orin Nano ($8$\,GB
+We distill the co-trained $\pf{=}0.8$ policy, the strongest configuration on the
+short-horizon suites and on average. On edge robots, long-horizon tasks are often
+decomposed by a higher-level planner, so short-horizon competence is the relevant
+operating regime.
+
+\textbf{Distillation quality.} The distilled policy is trained on the same data mixture the
+original was fine-tuned on: critic-labeled rollout data with demonstration batches at ratio
+$0.5$. The rollout frames keep their critic labels. Forcing them all positive would make
+the flow-matching term imitate advantage-negative rollout actions under the positive
+token. The distilled policy reaches $74.2$/$84.2$/$40.0$ (Table~\ref{tab:distill}), within
+$2.0$ average points of the ten-step original and matching it on \textsc{long}. Distilling
+longer hurts: in a preliminary variant without the demonstration mix, extending
+distillation from $15$k to $120$k steps kept lowering the distillation loss ($0.106$ to
+$0.047$) while average closed-loop success dropped by about ten points, a form of
+over-distillation, so all distilled policies are trained for $15$k steps. Finally,
+following guided-diffusion distillation~\cite{b_cfgdistill}, we try baking the guidance
+into the distilled policy by distilling the CFG-blended field of the original at
+$w{=}1.5$, so a single unguided pass reproduces guided behavior. With the training model
+supplying its own distillation targets (progressive self-distillation) this fails ($57.3$
+average): the data-anchored flow-matching term pulls the distilled policy toward the
+unguided field, and the blend's unconditional branch, trained by no loss term, drifts. A
+\emph{frozen} copy of the original supplying both loss terms recovers the mechanism where
+guidance helps the original most: on \textsc{spatial} the guidance-baked policy reaches
+$76.8$ in a single pass, within $3.2$ of the guided original, but it loses on \textsc{goal}
+and especially \textsc{long}, where one-step integration of the extrapolated field appears
+to overshoot. Guidance baking is therefore worthwhile only where the original demonstrably
+profits from $w{>}1$; the plain distilled policy remains our deployed configuration,
+averaging $64.5$--$64.7$ at its single-pass operating points ($w\in\{0,1\}$; other weights
+double the action expert's batch at inference).
+
+\begin{table}[t]
+\caption{SnapFlow distillation ablation}
+\label{tab:distill}
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+policy & spatial & goal & long & avg \\
+\midrule
+distilled policy                  & 74.2 & \textbf{84.2} & \textbf{40.0} & \textbf{66.1} \\
+$+$guidance baked, self-distilled & 67.0 & 72.4 & 32.6 & 57.3 \\
+$+$guidance baked, frozen original & \textbf{76.8} & 75.2 & 25.2 & 59.1 \\
+\midrule
+original ($10$-step FM)           & 80.0 & 86.2 & 38.2 & 68.1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+{\footnotesize All distilled policies are trained for $15$k steps from the co-trained
+$\pf{=}0.8$ policy on its fine-tuning mixture: critic-labeled rollouts with demonstration batches at
+ratio $0.5$.}
+\end{table}
+
+\textbf{Latency.} We measure inference on an NVIDIA Jetson Orin Nano ($8$\,GB
 unified memory), running the policy in bfloat16 (setup in Appendix~\ref{app:compute}).
 Generating one $20$-action chunk takes $922\pm1$\,ms with the ten-step flow-matching solve and
-$255\pm1$\,ms with SnapFlow's single step---a $3.6\times$ speed-up that raises the
+$255\pm1$\,ms with SnapFlow's single step, a $3.6\times$ speed-up that raises the
 re-planning rate from $1.1$ to $3.9$ chunks per second ($12.7$\,ms per action amortized over
-the chunk). The remaining $255$\,ms is dominated by the vision-language prefix, which both
-variants share. \todo{success-rate delta of the distilled policy vs.\ its teacher (evaluation
-pending).}
+the chunk). Our target device, the Jetson Orin NX ($16$\,GB), reproduces these numbers
+within $8\%$ (Appendix~\ref{app:compute}). The remaining $255$\,ms is dominated by the vision-language prefix, which both
+variants share.
 
 \section{Discussion and Limitations}\label{sec:discussion}
-Our results support the transfer we set out to test: the RECAP recipe also improves a compact
-VLA. The advantage-labeling threshold should be set permissively---an aggressive threshold
+Our results show: the RECAP recipe can also improve a compact
+VLA. The advantage-labeling threshold should be set permissively. An aggressive threshold
 labels necessary actions negative and the policy partially unlearns them. Rollout-only
 fine-tuning is likewise not uniformly safe: it degraded the long-horizon suite, and rollouts
-can only reinforce behavior the policy already exhibits. Mixing demonstration batches into the
-fine-tune addressed both issues in our experiments. One possible
+can only reinforce behavior the policy already exhibits. Mixing demonstration batches into
+fine-tuning addressed both issues in our experiments. One possible
 explanation for why co-training matters more here than in RECAP is model capacity: a compact
-policy may not have the capacity to retain its pre-training behavior through a rollout-only
-fine-tune, so the demonstration batches act as explicit replay against forgetting. The same
-limit may explain why guidance contributes so little (Sec.~\ref{sec:dose}): a small model may
-not represent clearly separated positive and negative conditionals, leaving CFG little to
-amplify. Our experiments do not isolate either effect, and the pending co-training run at
-$\pf{=}0.8$ will show whether the long-horizon regression is specific to rollout-only
-training.
+policy may not have the capacity to retain its pre-training behavior through rollout-only
+fine-tuning, so the demonstration batches act as explicit replay against forgetting. The same
+limit may explain the guidance results (Sec.~\ref{sec:dose}): after rollout-only
+fine-tuning the positive, negative, and unconditional predictions are compressed into a
+narrow band and CFG has little to amplify, whereas the co-trained policy, whose
+demonstration replay would preserve the separated modes, is the one policy that gains
+substantially from guidance. Our experiments are consistent with this capacity view but do
+not isolate it. The co-training run at $\pf{=}0.8$ also shows the long-horizon regression
+is not specific to rollout-only training: co-training reduces it without removing it,
+while the $\pf{=}0.4$ co-trained run clears it, so on \textsc{long} the labeling threshold
+may matter as much as the data mix, though these differences sit at the edge of the
+$\pm2$-point resolution. One hypothesis: most \textsc{long} rollout episodes fail, so at
+$\pf{=}0.4$ almost no failure frames carry the positive token ($3.0\%$ of all frames vs.\
+$16.2\%$ at $\pf{=}0.8$, Table~\ref{tab:labels}) and the positive conditional is learned
+almost entirely from the co-trained demonstrations, whereas at $\pf{=}0.8$ it also absorbs
+behavior from failed rollouts, on exactly the suite where the rollouts are weakest. The
+aggressive threshold's usual cost (Sec.~\ref{sec:dose}) is covered by the demonstrations,
+which supply the necessary actions it strips from the rollout positives.
 
 Limitations: all results are in simulation on LIBERO with a single training seed per
 configuration; per-task numbers at $50$ trials are noisy, so we draw conclusions only from
-suite-level aggregates and consistent cross-method patterns. Reporting the maximum over a
-five-point guidance sweep carries an optimistic bias of one to two points for the
-conditioned methods; the unconditioned no-KI baseline gets no such benefit, so its gap is,
-if anything, slightly overstated. We tested positive fractions $0.3$, $0.4$, and $0.8$
+suite-level aggregates. Reporting the maximum over a
+five-point guidance sweep carries an optimistic bias of one to two points, on the order of
+the suite-level standard error; every
+advantage-conditioned method receives the identical sweep, so comparisons among them are
+unaffected; absolute numbers are slightly flattered, and the no-KI baseline (single
+operating point, Sec.~\ref{sec:setup}) lacks this benefit. We tested positive fractions $0.3$, $0.4$, and $0.8$
 only. Latency was measured on-device but not in
-closed-loop control, and real-robot validation of the post-training gains remains future
-work.
+closed-loop control.
 
 \section{Conclusion}
 Critic-guided rollout post-training transfers from large VLAs to SmolVLA: pre-training with
-knowledge insulation and advantage conditioning improves over plain SmolVLA, and fine-tuning
-on critic-labeled rollouts mixed with expert demonstrations yields our best policy on every
-suite. Combined with one-step SnapFlow distillation
-for real-time inference, this makes rollout-based improvement of VLA policies a practical
-option for the compact models that edge and mobile robots can actually run.
+knowledge insulation improves over a SmolVLA-style no-KI baseline, and fine-tuning
+on critic-labeled rollouts mixed with expert demonstrations yields the best policy on each
+suite, although no single labeling threshold wins all three. One-step SnapFlow distillation
+preserves this within two average points while cutting on-device latency $3.6\times$,
+making rollout-based improvement of VLA policies a practical option for the compact models
+that edge and mobile robots can run.
 
 \appendices
 \section{Training and evaluation infrastructure}
 \label{app:compute}
-Fine-tunes run $20$k steps ($\approx90$~min on one NVIDIA H200). Evaluation is
+Pre-training ($250$k steps) takes $\approx18$~h on two NVIDIA H200 GPUs; fine-tuning
+runs take $20$k steps ($\approx90$~min on one H200). Evaluation is
 simulation-bound rather than GPU-bound: a full $n{=}500$ suite evaluation takes
-$\approx2.5$~h (\textsc{spatial}/\textsc{goal}) to $\approx6$~h (\textsc{long}) on an H200,
-$\approx1.5$--$1.8\times$ longer on an RTX~A4500, and $\approx3.2\times$ longer on an
-RTX~2080. Evaluations were therefore run on the smaller GPUs, reserving the H200 nodes for
-training.
+$2.5$--$6$~h on an H200 and only $1.5$--$3.2\times$ longer on much smaller GPUs
+(RTX~A4500, RTX~2080), so evaluations ran on the smaller GPUs, reserving the H200 nodes
+for training.
 
 \textbf{Edge latency measurement.} The latencies in Sec.~\ref{sec:snapflow} were measured on
 an NVIDIA Jetson Orin Nano ($8$\,GB unified memory, JetPack~6) with PyTorch~2.11, policy in
 bfloat16 under autocast, batch size~$1$, two $256{\times}256$ cameras, and $48$ language
 tokens: $30$ timed chunk generations after $8$ warm-up iterations (std $\approx1$\,ms). The
-policy is the deployed architecture with random weights, which leaves latency unchanged; in
-float32 the $453$M-parameter model exceeds the Orin Nano's memory, so bfloat16 is also the
-practical deployment dtype.
+policy is the deployed architecture.
+Table~\ref{tab:edge} repeats the measurement on a Jetson Orin NX ($16$\,GB): the bfloat16
+numbers reproduce within $8\%$. In float32, which would exceed the Orin Nano's memory,
+SnapFlow latency more than doubles and its speed-up shrinks to $2\times$, since
+the shared vision-language prefix dominates; bfloat16 is therefore the practical
+deployment dtype.
+
+\begin{table}[t]
+\caption{Action-chunk latency (ms) on edge devices}
+\label{tab:edge}
+\begin{center}
+\begin{tabular}{llccc}
+\toprule
+device & dtype & FM ($10$ steps) & SnapFlow & speed-up \\
+\midrule
+Orin Nano $8$\,GB & bf16 & $922$ & $255$ & $3.6\times$ \\
+Orin NX $16$\,GB  & bf16 & $850$ & $240$ & $3.5\times$ \\
+Orin NX $16$\,GB  & fp32 & $1143$ & $575$ & $2.0\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{table}
 
 \section*{Acknowledgment}
-\todo{acknowledgments / funding}
+Training and evaluation were carried out on the FHNW high-performance computing
+infrastructure, which made these experiments possible.
 
 \begin{thebibliography}{00}
 \bibitem{b_smolvla} M. Shukor et al., ``SmolVLA: A vision-language-action model for
 affordable and efficient robotics,'' arXiv:2506.01844, 2025.
-\bibitem{b_recap} Physical Intelligence, A. Amin et al., ``$\pi^{*}_{0.6}$: a VLA that
+\bibitem{b_recap} A. Amin et al., ``$\pi^{*}_{0.6}$: a VLA that
 learns from experience,'' arXiv:2511.14759, 2025.
 \bibitem{b_ki} D. Driess et al., ``Knowledge insulating vision-language-action models: Train
 fast, run fast, generalize better,'' arXiv:2505.23705, 2025.
@@ -493,13 +598,15 @@ fast, run fast, generalize better,'' arXiv:2505.23705, 2025.
 vision-language-action models,'' arXiv:2501.09747, 2025.
 \bibitem{b_libero} B. Liu et al., ``LIBERO: Benchmarking knowledge transfer for lifelong
 robot learning,'' arXiv:2306.03310, 2023.
-\bibitem{b_flow} Y. Lipman, R. T. Q. Chen, H. Ben-Hamu, M. Nickel, and M. Le, ``Flow matching
+\bibitem{b_flow} Y. Lipman et al., ``Flow matching
 for generative modeling,'' in \emph{Proc.\ ICLR}, 2023.
 \bibitem{b_cfg} J. Ho and T. Salimans, ``Classifier-free diffusion guidance,'' in
-\emph{NeurIPS Workshop on Deep Generative Models}, 2021.
+\emph{NeurIPS Workshop on Deep Generative Models and Downstream Applications}, 2021.
+\bibitem{b_cfgdistill} C. Meng et al., ``On distillation of guided diffusion models,'' in
+\emph{Proc.\ CVPR}, 2023.
 \bibitem{b_c51} M. G. Bellemare, W. Dabney, and R. Munos, ``A distributional perspective on
 reinforcement learning,'' in \emph{Proc.\ ICML}, 2017.
-\bibitem{b_snapflow} W. Luan, J. Li, W. Zhao, W. Zhang, T. Wu, and R. Ma, ``SnapFlow:
+\bibitem{b_snapflow} W. Luan et al., ``SnapFlow:
 One-step action generation for flow-matching VLAs via progressive self-distillation,''
 arXiv:2604.05656, 2026.
 \bibitem{b_openpi} Physical Intelligence, ``openpi: Open-source robot foundation models,''
@@ -513,9 +620,5 @@ learning,'' arXiv:2509.09674, 2025.
 \bibitem{b_grape} Z. Zhang et al., ``GRAPE: Generalizing robot policy via preference
 alignment,'' arXiv:2411.19309, 2024.
 \end{thebibliography}
-
-\vspace{6pt}
-\noindent\todo{Draft. Remaining red markers: co-training$+$\pf{}=0.8 and outcome-only rows,
-negative-token probe on \textsc{long}, SnapFlow latency/accuracy numbers, second author.}
 
 \end{document}
