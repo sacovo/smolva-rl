@@ -127,52 +127,38 @@ flow-matching expert into a single target-time-conditioned jump, removing the it
 solve at inference. We use it to measure the accuracy--latency trade-off of the best policy.
 
 \section{Method}
+Fig.~\ref{fig:arch} gives an overview of the pipeline; the following subsections describe
+each stage.
 
-\begin{figure*}[t]
+\begin{figure}[t]
 \centering
-\begin{tikzpicture}[
-  font=\footnotesize, >=Latex,
-  box/.style={draw, rounded corners, align=center, minimum height=9mm, inner sep=3pt},
-  main/.style={box, fill=blue!6},
-  aux/.style={box, fill=gray!8},
-  op/.style={draw, circle, minimum size=5.5mm, inner sep=0pt}]
-% main forward chain
-\node[box] (in) {camera images\\robot state\\language};
-\node[main, right=10mm of in] (vlm) {VLM backbone\\\emph{knowledge insulation}};
-\node[op, right=9mm of vlm] (cat) {$\oplus$};
-\node[main, fill=green!7, right=9mm of cat] (fm) {flow-matching\\action expert\\($10$-step ODE)};
-\node[box, right=9mm of fm] (act) {action\\chunk};
-\draw[->] (in)--(vlm); \draw[->] (vlm)--(cat); \draw[->] (cat)--(fm); \draw[->] (fm)--(act);
-% advantage token
-\node[aux, fill=orange!14, above=6mm of cat] (adv) {advantage\\token $\pm$};
-\draw[->] (adv)--(cat);
-% FAST tokenizer -> AR loss into VLM
-\node[aux, below=7mm of vlm] (fast) {FAST tokenizer\\(AR co-training)};
-\draw[<->, dashed] (fast)--(vlm);
-% SnapFlow distillation of the FM expert
-\node[aux, fill=purple!8, below=7mm of fm] (snap) {\textbf{SnapFlow}\\$10$-step $\to$ $1$-step};
-\draw[->, dashed] (fm)--(snap) node[midway, right]{distill};
-% critic / rollout-iteration loop (stacked to the right, routed around the aux row)
-\node[aux, fill=red!7, below=7mm of act] (critic) {critic (C51)};
-\node[aux, fill=red!7, below=5mm of critic] (thr) {advantages\\threshold $\pf$};
-\draw[->] (act)--(critic); \draw[->] (critic)--(thr);
-\draw[->, dashed] (thr.west) -| (in.south)
-  node[pos=0.25, below]{policy rollouts (loop)};
-\draw[->, dashed] (thr.east) -- ++(10mm,0) |- (adv.east)
-  node[pos=0.75, above]{labels};
+\begin{tikzpicture}[font=\scriptsize, >=Latex,
+  box/.style={draw, rounded corners, align=center, inner sep=3pt, minimum height=7.5mm},
+  data/.style={box, fill=gray!12},
+  pol/.style={box, fill=blue!8},
+  crit/.style={box, fill=orange!15}]
+\node[pol]  (policy) at (0,0)       {SmolVLA policy\\KI, $\pm$ token};
+\node[data] (demos)  at (-3.2,0)    {expert\\demos};
+\node[data] (roll)   at (3.2,0)     {autonomous\\rollouts};
+\node[crit] (critic) at (3.2,-1.8)  {critic (C51)};
+\node[crit] (labels) at (0,-1.8)    {advantages $\to$\\$\pm$ labels (\pf)};
+\node[pol]  (snap)   at (-3.2,-1.8) {one-step policy\\(SnapFlow)};
+\draw[->] (demos) -- node[above]{pre-train} node[below]{co-train ($+$)} (policy);
+\draw[->] (policy) -- node[above]{collect} (roll);
+\draw[->] (roll) -- node[right]{fine-tune} (critic);
+\draw[->] (critic) -- node[above]{$N$-step TD} (labels);
+\draw[->] (labels) -- node[right]{fine-tune} (policy);
+\draw[->, dashed] (policy.south) to[bend right=20] node[above left]{distill} (snap.east);
 \end{tikzpicture}
-\caption{RECAP-style rollout post-training for SmolVLA. Camera images, robot state, and
-language pass through a knowledge-insulated vision-language backbone; an advantage token
-($\pm$) is prepended ($\oplus$) and a flow-matching expert integrates a velocity field into an
-action chunk. During training the FAST tokenizer~\cite{b_fast} supplies an autoregressive
-co-training signal to the backbone. The rollout loop (dashed) runs the policy, scores rollouts
-with a distributional critic, converts values to $N$-step advantages, and thresholds them at
-target positive fraction \pf{} into the $\pm$ labels. The same architecture is used during
-pre-training, where the critic is trained on the expert demonstrations and its labels
-condition the policy from the start.
-SnapFlow optionally distills the ten-step expert into a single step for real-time inference.}
+\caption{Pipeline overview. Gray: data; blue: policies; orange: critic and labeling.
+Expert demonstrations pre-train the advantage-conditioned policy and re-enter fine-tuning
+as always-positive co-training batches. The policy collects autonomous rollouts, on which
+the critic (itself first trained on the demonstrations) is fine-tuned; $N$-step advantages
+are thresholded at positive fraction \pf{} into the $\pm$ tokens that condition
+fine-tuning and enable CFG at inference. SnapFlow distills the fine-tuned ten-step policy
+into a single step for edge deployment.}
 \label{fig:arch}
-\end{figure*}
+\end{figure}
 
 \subsection{Critic and advantage-conditioned pre-training}\label{sec:pretrain}
 Before training the policy, a distributional (C51)~\cite{b_c51} critic is trained
@@ -248,30 +234,34 @@ into a single-step generator conditioned on a target time. The distilled policy 
 initialized from the original, so distillation starts from the original policy's behavior.
 
 \section{Experimental Setup}\label{sec:setup}
-\textbf{Benchmark.} LIBERO~\cite{b_libero} suites \textsc{spatial}, \textsc{goal}, and
-\textsc{long} (LIBERO-10), $10$ tasks each. We do not use \textsc{object}: every policy trained in our
+\textbf{Benchmark.} We evaluate on three suites of the LIBERO benchmark~\cite{b_libero}:
+\textsc{spatial}, \textsc{goal}, and \textsc{long} (LIBERO-10), with $10$ manipulation
+tasks each. We do not use the fourth suite, \textsc{object}: every policy trained in our
 setting, including the base, runs its episodes to timeout without completing the task. Because
 this affects all configurations identically, we suspect missing or corrupted \textsc{object}
 demonstrations in the pre-training data rather than a property of the methods; either way the
-suite cannot separate them. \textbf{Protocol.} Every reported number is $50$
-episodes per task ($n{=}500$ per suite); we report percent success at the best guidance
-weight. All advantage-conditioned methods are swept identically over
+suite cannot separate them.
+
+\textbf{Protocol.} Every reported number is the percent success over $50$ episodes per
+task ($n{=}500$ per suite), taken at the method's best guidance weight. All
+advantage-conditioned methods are swept identically over
 $w\in\{0,0.5,1,1.5,2\}$; the no-KI baseline, whose constant conditioning admits no
 meaningful guidance, is evaluated at its single operating point $w{=}1$.
-\textbf{Models.} All policies use the SmolVLA architecture ($450$M parameters, $16$-layer
-VLM backbone with a flow-matching action expert); the critic shares this architecture with
-the backbone truncated to $8$ layers. The base is pre-trained for $250$k
-steps on the expert demonstrations with KI, FAST co-training, and advantage conditioning
-(Sec.~\ref{sec:pretrain}); fine-tuning runs take $20$k steps. The no-KI baseline mirrors the original SmolVLA
-objective: flow-matching gradients from the action expert train the VLM directly (no
-insulation), replacing the FAST AR co-training as the VLM's training signal, and the
-advantage token is held constant (every training frame positive, no token dropout), reducing
-the conditioning to an inert extra token. All remaining
-settings (optimizer, schedule, action chunking, data, $250$k steps) are shared with the
-base, so the
-comparison measures the KI training recipe as a whole rather than gradient insulation in
-isolation; both models are trained under our harness settings rather than the lerobot
-SmolVLA presets.
+
+\textbf{Models.} All policies use the SmolVLA architecture ($450$M parameters, a
+$16$-layer VLM backbone with a flow-matching action expert), and the critic shares this
+architecture with the backbone truncated to $8$ layers. The base policy is pre-trained for
+$250$k steps on the expert demonstrations with KI, FAST co-training, and advantage
+conditioning (Sec.~\ref{sec:pretrain}); all fine-tuning runs take $20$k steps. The no-KI
+baseline mirrors the original SmolVLA objective: flow-matching gradients from the action
+expert train the VLM directly (no insulation), replacing the FAST AR co-training as the
+VLM's training signal, and the advantage token is held constant (every training frame
+positive, no token dropout), which reduces the conditioning to an inert extra token. All
+remaining settings (optimizer, schedule, action chunking, data, $250$k steps) are shared
+with the base, so the comparison measures the KI training recipe as a whole rather than
+gradient insulation in isolation; both models are trained under our harness settings
+rather than the lerobot SmolVLA presets.
+
 \textbf{Comparability with published SmolVLA results.} The released SmolVLA is pre-trained
 on a large corpus of community robot datasets~\cite{b_smolvla}; reproducing this was not
 feasible within our compute budget, so every model here is trained on the LIBERO expert
@@ -321,7 +311,7 @@ Latency: one $20$-action chunk, Jetson Orin Nano, bfloat16; measured configurati
 \end{table}
 
 \subsection{Ablation: the advantage-labeling threshold}\label{sec:dose}
-Table~\ref{tab:dose} sweeps the guidance weight for three values of \pf{} on \textsc{spatial}.
+Table~\ref{tab:dose} shows the reuslt of a sweep of the guidance weights for three values of \pf{} on the \textsc{spatial} suite.
 At low \pf{} ($0.3$, $0.4$) a large share of the frames \emph{inside successful
 trajectories}, the approach and transport motions a task requires, fall below the threshold
 and are labeled negative ($26$--$31\%$ of all frames, Table~\ref{tab:labels}). The policy is
@@ -430,7 +420,7 @@ skills it lacks entirely have to come from the demonstrations.
 The outcome-only scheme (Table~\ref{tab:labels}) tests whether the critic's within-trajectory
 granularity matters, or whether a plain success/failure label suffices. The answer is mixed:
 outcome-only reaches $72.8$ on \textsc{spatial}, five points below the critic-labeled
-$\pf{=}0.8$ policy ($77.8$), but $81.8$ on \textsc{goal}, ahead of it ($80.0$), and $40.0$
+$\pf{=}0.8$ policy ($77.8$), but $81.8$ on \textsc{goal}, slightly ahead of it ($80.0$), and $40.0$
 on \textsc{long}, also ahead ($35.8$). On average the two schemes are indistinguishable
 ($64.9$ vs.\ $64.5$): the critic's within-trajectory granularity is not required to
 benefit from rollout data on these suites, although the best overall configuration
@@ -505,7 +495,17 @@ VLA. The advantage-labeling threshold should be set permissively. An aggressive 
 labels necessary actions negative and the policy partially unlearns them. Rollout-only
 fine-tuning is likewise not uniformly safe: it degraded the long-horizon suite, and rollouts
 can only reinforce behavior the policy already exhibits. Mixing demonstration batches into
-fine-tuning addressed both issues in our experiments. One possible
+fine-tuning addressed both issues in our experiments.
+
+The suite-level pattern suggests that rollout post-training amplifies the quality of the
+rollouts it is fed. On \textsc{spatial} and \textsc{goal}, where roughly three quarters of
+the base policy's episodes succeed, the labeled rollouts contain plenty of good behavior
+to reinforce, and rollout-only training helps. On \textsc{long}, where most rollouts fail,
+even the positively labeled frames come from largely mediocre behavior; fine-tuning on
+them amounts to learning from a weak teacher, and the policy falls below its starting
+point. Notably, RECAP's corrective teleoperation inserts good behavior exactly where the
+policy lacks it; in our autonomous setting, the co-trained demonstrations take over that
+role. One possible
 explanation for why co-training matters more here than in RECAP is model capacity: a compact
 policy may not have the capacity to retain its pre-training behavior through rollout-only
 fine-tuning, so the demonstration batches act as explicit replay against forgetting. The same
