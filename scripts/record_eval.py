@@ -149,8 +149,10 @@ class GamepadController:
         dy = -self.js.get_axis(0) # Left on stick is negative X
         
         # Deadzone filter
-        if abs(dx) < 0.1: dx = 0.0
-        if abs(dy) < 0.1: dy = 0.0
+        if abs(dx) < 0.1:
+            dx = 0.0
+        if abs(dy) < 0.1:
+            dy = 0.0
         
         # Scale speed
         dx *= 0.3
@@ -173,8 +175,10 @@ class GamepadController:
         dyaw = self.js.get_axis(3)
         dpitch = -self.js.get_axis(4)
         
-        if abs(dyaw) < 0.1: dyaw = 0.0
-        if abs(dpitch) < 0.1: dpitch = 0.0
+        if abs(dyaw) < 0.1:
+            dyaw = 0.0
+        if abs(dpitch) < 0.1:
+            dpitch = 0.0
         
         dyaw *= 0.3
         dpitch *= 0.3
@@ -304,19 +308,31 @@ def run_sandbox(args):
                     action_numpy = np.zeros(7, dtype=np.float32)
                     action_numpy[6] = gripper_state
                     
-                    if key == ord('w'): action_numpy[0] = 0.3
-                    elif key == ord('s'): action_numpy[0] = -0.3
-                    if key == ord('a'): action_numpy[1] = 0.3
-                    elif key == ord('d'): action_numpy[1] = -0.3
-                    if key == ord('q'): action_numpy[2] = 0.3
-                    elif key == ord('e'): action_numpy[2] = -0.3
+                    if key == ord('w'):
+                        action_numpy[0] = 0.3
+                    elif key == ord('s'):
+                        action_numpy[0] = -0.3
+                    if key == ord('a'):
+                        action_numpy[1] = 0.3
+                    elif key == ord('d'):
+                        action_numpy[1] = -0.3
+                    if key == ord('q'):
+                        action_numpy[2] = 0.3
+                    elif key == ord('e'):
+                        action_numpy[2] = -0.3
                     
-                    if key == ord('u'): action_numpy[3] = 0.3
-                    elif key == ord('o'): action_numpy[3] = -0.3
-                    if key == ord('i'): action_numpy[4] = 0.3
-                    elif key == ord('k'): action_numpy[4] = -0.3
-                    if key == ord('j'): action_numpy[5] = 0.3
-                    elif key == ord('l'): action_numpy[5] = -0.3
+                    if key == ord('u'):
+                        action_numpy[3] = 0.3
+                    elif key == ord('o'):
+                        action_numpy[3] = -0.3
+                    if key == ord('i'):
+                        action_numpy[4] = 0.3
+                    elif key == ord('k'):
+                        action_numpy[4] = -0.3
+                    if key == ord('j'):
+                        action_numpy[5] = 0.3
+                    elif key == ord('l'):
+                        action_numpy[5] = -0.3
                     
                     if key == ord(' '):
                         gripper_state = -gripper_state
@@ -578,20 +594,32 @@ def main():
                         action_numpy[6] = gripper_state
                         
                         # Handle translation key mappings
-                        if key == ord('w'): action_numpy[0] = 0.3
-                        elif key == ord('s'): action_numpy[0] = -0.3
-                        if key == ord('a'): action_numpy[1] = 0.3
-                        elif key == ord('d'): action_numpy[1] = -0.3
-                        if key == ord('q'): action_numpy[2] = 0.3
-                        elif key == ord('e'): action_numpy[2] = -0.3
+                        if key == ord('w'):
+                            action_numpy[0] = 0.3
+                        elif key == ord('s'):
+                            action_numpy[0] = -0.3
+                        if key == ord('a'):
+                            action_numpy[1] = 0.3
+                        elif key == ord('d'):
+                            action_numpy[1] = -0.3
+                        if key == ord('q'):
+                            action_numpy[2] = 0.3
+                        elif key == ord('e'):
+                            action_numpy[2] = -0.3
                         
                         # Handle rotation key mappings
-                        if key == ord('u'): action_numpy[3] = 0.3
-                        elif key == ord('o'): action_numpy[3] = -0.3
-                        if key == ord('i'): action_numpy[4] = 0.3
-                        elif key == ord('k'): action_numpy[4] = -0.3
-                        if key == ord('j'): action_numpy[5] = 0.3
-                        elif key == ord('l'): action_numpy[5] = -0.3
+                        if key == ord('u'):
+                            action_numpy[3] = 0.3
+                        elif key == ord('o'):
+                            action_numpy[3] = -0.3
+                        if key == ord('i'):
+                            action_numpy[4] = 0.3
+                        elif key == ord('k'):
+                            action_numpy[4] = -0.3
+                        if key == ord('j'):
+                            action_numpy[5] = 0.3
+                        elif key == ord('l'):
+                            action_numpy[5] = -0.3
                         
                         # Handle gripper toggle (Space)
                         if key == ord(' '):

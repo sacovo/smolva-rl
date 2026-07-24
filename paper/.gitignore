@@ -304,10 +304,6 @@ TSWLatexianTemp*
 *.pdf
 
 ## Project-specific (must stay after the *.pdf rule above):
-# IEEE template reference material (kept locally, not tracked)
-conference_101719.*
-IEEEtran_HOWTO.pdf
-
 # generated figures are tracked so the paper builds without running Python
 !figs/*.pdf
 

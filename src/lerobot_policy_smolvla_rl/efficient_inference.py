@@ -197,7 +197,7 @@ def select_visual_tokens(policy_model, images, img_masks, lang_tokens, lang_mask
 def check_pruning_constraints(pruned_layers, num_layers, self_attn_every_n_layers=2):
     if not pruned_layers:
         return
-    if any(l < 0 or l >= num_layers for l in pruned_layers):
+    if any(layer_idx < 0 or layer_idx >= num_layers for layer_idx in pruned_layers):
         raise ValueError(f"Pruned layer indices must be in range [0, {num_layers - 1}].")
     if 0 in pruned_layers or (num_layers - 1) in pruned_layers:
         raise ValueError("Cannot prune the first (0) or final layer.")

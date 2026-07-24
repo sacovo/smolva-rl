@@ -278,10 +278,13 @@ initialized from the original, so distillation starts from the original policy's
 \textbf{Benchmark.} We evaluate on three suites of the LIBERO benchmark~\cite{b_libero}:
 \textsc{spatial}, \textsc{goal}, and \textsc{long} (LIBERO-10), with $10$ manipulation
 tasks each. We do not use the fourth suite, \textsc{object}: every policy trained in our
-setting, including the base, runs its episodes to timeout without completing the task. Because
-this affects all configurations identically, we suspect missing or corrupted \textsc{object}
-demonstrations in the pre-training data rather than a property of the methods; either way the
-suite cannot separate them.
+setting, including the base, runs its episodes to timeout without completing the task. A
+control experiment locates the cause: re-running the base pre-training unchanged except for
+photometric image augmentation lifts \textsc{object} from $0\%$ to $53.6\%$ while staying
+within evaluation noise on the three reported suites (average $63.5$ vs.\ $62.9$). The
+failure is thus a visual domain gap that augmentation closes, not corrupted demonstrations
+or a property of the methods. Since all configurations compared here are trained without
+augmentation, the suite affects them identically and cannot separate them.
 
 \textbf{Protocol.} Every reported number is the percent success over $50$ episodes per
 task ($n{=}500$ per suite), taken at the method's best guidance weight. All

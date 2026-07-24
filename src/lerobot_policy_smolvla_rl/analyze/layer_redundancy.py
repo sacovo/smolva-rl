@@ -135,10 +135,10 @@ def run_layer_redundancy_analysis(policy, dataset_repo_id, episodes=None, calibr
     vlm_cos_sims = {}
     exp_cos_sims = {}
     
-    for l in range(num_layers):
+    for layer_idx in range(num_layers):
         # VLM Similarity
-        vlm_in = record_dict["vlm_inputs"][l]
-        vlm_out = record_dict["vlm_outputs"][l]
+        vlm_in = record_dict["vlm_inputs"][layer_idx]
+        vlm_out = record_dict["vlm_outputs"][layer_idx]
         
         if len(vlm_in) > 0 and len(vlm_out) > 0:
             vlm_in_t = torch.cat(vlm_in, dim=0) # (Total_frames, Seq_len, D)
@@ -147,22 +147,22 @@ def run_layer_redundancy_analysis(policy, dataset_repo_id, episodes=None, calibr
             # Compute cosine similarity along feature dimension D
             # shape: (Total_frames, Seq_len)
             sim = F.cosine_similarity(vlm_in_t, vlm_out_t, dim=-1)
-            vlm_cos_sims[l] = sim.mean().item()
+            vlm_cos_sims[layer_idx] = sim.mean().item()
         else:
-            vlm_cos_sims[l] = 1.0 # default to 1.0 (no change, i.e., completely redundant)
+            vlm_cos_sims[layer_idx] = 1.0 # default to 1.0 (no change, i.e., completely redundant)
             
         # Expert Similarity
-        exp_in = record_dict["exp_inputs"][l]
-        exp_out = record_dict["exp_outputs"][l]
+        exp_in = record_dict["exp_inputs"][layer_idx]
+        exp_out = record_dict["exp_outputs"][layer_idx]
         
         if len(exp_in) > 0 and len(exp_out) > 0:
             exp_in_t = torch.cat(exp_in, dim=0) # (Total_frames, Seq_len, D)
             exp_out_t = torch.cat(exp_out, dim=0) # (Total_frames, Seq_len, D)
             
             sim = F.cosine_similarity(exp_in_t, exp_out_t, dim=-1)
-            exp_cos_sims[l] = sim.mean().item()
+            exp_cos_sims[layer_idx] = sim.mean().item()
         else:
-            exp_cos_sims[l] = 1.0
+            exp_cos_sims[layer_idx] = 1.0
             
     # Normalize redundancies to [0, 1] range
     vlm_sims_val = list(vlm_cos_sims.values())
@@ -178,26 +178,26 @@ def run_layer_redundancy_analysis(policy, dataset_repo_id, episodes=None, calibr
             return 1.0
         return (val - min_val) / (max_val - min_val)
         
-    normalized_vlm = {l: normalize_score(vlm_cos_sims[l], vlm_min, vlm_max) for l in range(num_layers)}
-    normalized_exp = {l: normalize_score(exp_cos_sims[l], exp_min, exp_max) for l in range(num_layers)}
+    normalized_vlm = {idx: normalize_score(vlm_cos_sims[idx], vlm_min, vlm_max) for idx in range(num_layers)}
+    normalized_exp = {idx: normalize_score(exp_cos_sims[idx], exp_min, exp_max) for idx in range(num_layers)}
     
     # Combined score = min of normalized redundancy scores
     # A layer is only redundant if it is redundant in both streams
     combined_redundancy = {
-        l: min(normalized_vlm[l], normalized_exp[l]) for l in range(num_layers)
+        idx: min(normalized_vlm[idx], normalized_exp[idx]) for idx in range(num_layers)
     }
     
     # Build ranked table
     rows = []
-    for l in range(num_layers):
-        status = "Kept (Constraint)" if (l == 0 or l == num_layers - 1) else "Candidate"
+    for layer_idx in range(num_layers):
+        status = "Kept (Constraint)" if (layer_idx == 0 or layer_idx == num_layers - 1) else "Candidate"
         rows.append({
-            "Layer Index": l,
-            "VLM Similarity (Redundancy)": f"{vlm_cos_sims[l]:.4f}",
-            "Expert Similarity (Redundancy)": f"{exp_cos_sims[l]:.4f}",
-            "Normalized VLM Redundancy": f"{normalized_vlm[l]:.4f}",
-            "Normalized Expert Redundancy": f"{normalized_exp[l]:.4f}",
-            "Combined Redundancy Score": combined_redundancy[l],
+            "Layer Index": layer_idx,
+            "VLM Similarity (Redundancy)": f"{vlm_cos_sims[layer_idx]:.4f}",
+            "Expert Similarity (Redundancy)": f"{exp_cos_sims[layer_idx]:.4f}",
+            "Normalized VLM Redundancy": f"{normalized_vlm[layer_idx]:.4f}",
+            "Normalized Expert Redundancy": f"{normalized_exp[layer_idx]:.4f}",
+            "Combined Redundancy Score": combined_redundancy[layer_idx],
             "Pruning Status": status
         })
         

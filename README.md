@@ -2,7 +2,7 @@
 
 RECAP-style reinforcement post-training for [SmolVLA](https://arxiv.org/abs/2506.01844) (450M), evaluated on the LIBERO benchmark: a distributional critic scores the policy's own rollouts, per-frame advantages are thresholded into positive/negative tokens, and the policy is retrained with advantage conditioning so classifier-free guidance can steer it at inference. Pre-training uses knowledge insulation (KI) with FAST-token co-training of the VLM backbone; SnapFlow one-step distillation removes the iterative flow-matching solve for real-time inference on edge hardware (Jetson Orin Nano).
 
-Best configuration (critic-labeled rollouts co-trained with expert demonstrations): **67.8%** average success across three LIBERO suites, vs. 62.9% for the base policy and 52.4% for plain SmolVLA — with rollouts collected fully autonomously, no human interventions.
+Best configuration (critic-labeled rollouts co-trained with expert demonstrations, positive fraction 0.8): **68.1%** average success across three LIBERO suites, vs. 62.9% for the base policy and 52.4% for plain SmolVLA — with rollouts collected fully autonomously, no human interventions.
 
 **Project page:** https://sacovo.github.io/smolva-rl/ · **Paper:** [`paper/`](paper/) (PDF built by CI, [download](https://sacovo.github.io/smolva-rl/paper.pdf)) · **Findings:** [`docs/recap_findings_overview.md`](docs/recap_findings_overview.md)
 
@@ -90,6 +90,19 @@ The pipeline is one critic → advantages → policy cycle, run twice: first on 
 ## Evaluation
 
 `scripts/eval_cfg.sh` sweeps the classifier-free guidance weight on LIBERO suites; `scripts/compile_results.py` and `scripts/compare_eval_runs.py` aggregate results. `scripts/bench_jetson.py` measures action-chunk latency on a Jetson Orin Nano (the paper's 922 ms → 255 ms SnapFlow numbers).
+
+## Reproducing the paper's results
+
+Every number in the paper comes out of the pipeline above; the differences between table rows are only in which config you run. In short:
+
+1. **Base policy and no-KI baseline (Table I, first block)** — round-1 pre-training on `HuggingFaceVLA/libero` with pre-computed advantages, 250k steps on 2×H200 (~19 h). The base config is [`scripts/cluster/configs/recap_libero_aug.json`](scripts/cluster/configs/recap_libero_aug.json) (add `--no_augmentation` to match the paper's original base exactly); the no-KI baseline is [`scripts/cluster/configs/smolvla_noki_nodrop.json`](scripts/cluster/configs/smolvla_noki_nodrop.json).
+2. **Rollout fine-tunes (Table I, remaining rows)** — round 2 as above: collect rollouts with `scripts/record_eval.py`, fine-tune the critic, recompute advantages at the row's positive fraction (pf = 0.4 or 0.8), then fine-tune with or without demo co-training (`--demo_mix_ratio 0.5`). The outcome-only row skips the critic and labels whole episodes by success.
+3. **Evaluation sweeps** — each cell is 500 episodes per suite per guidance weight w ∈ {0, 0.5, 1, 1.5, 2}, run as a SLURM array ([`scripts/cluster/rat_aug.py`](scripts/cluster/rat_aug.py) + [`scripts/cluster/sub_aug_eval.sh`](scripts/cluster/sub_aug_eval.sh) are a working pair; edit the three constants at the top for a new sweep) and harvested with [`scripts/cluster/harvest_eval.py`](scripts/cluster/harvest_eval.py). Suite-level noise at n = 500 is about ±2 points — treat smaller differences as ties.
+4. **SnapFlow distillation ablation (Table "one-step distillation")** — `train_snapflow.py` from the co-trained pf 0.8 checkpoint, 15k steps on 1×H200; the deployed student (v5) uses `--demo_mix_ratio 0.5`, the frozen-teacher guidance-baking variant (v7) is [`scripts/cluster/configs/snapflow_ctpf08_v7.json`](scripts/cluster/configs/snapflow_ctpf08_v7.json).
+5. **Edge latency** — `scripts/bench_jetson.py` on a Jetson Orin (bf16), teacher vs. SnapFlow student, giving the 922 ms → 255 ms (3.6×) chunk-latency numbers.
+6. **`libero_object` exclusion control (Sec. IV)** — the base pre-training config run as-is (augmentation is on by default) reproduces the augmented control: `object` goes from 0% to 53.6% while the three paper suites stay within noise (63.5 vs. 62.9 avg), showing the exclusion was a visual-domain gap, not bad data. Evaluate with the same sweep as step 3 — `rat_aug.py` already includes all four suites.
+
+[`docs/cluster_runbook.md`](docs/cluster_runbook.md) has the full cluster workflow (access, submission, chaining, monitoring) plus the current state of all experiments — every result table, the run-by-run SnapFlow lessons, and a checkpoint map.
 
 ## Paper
 
