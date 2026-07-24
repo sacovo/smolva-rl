@@ -46,7 +46,7 @@ layers, 2×H200. Configs read from each `recap_model/migrated/config.json`.
 | `libero_recap_250000` / `libero/recap_model` | **on** (critic-based, real ±) | on | on | the full RECAP+KI model (250k / 350k) |
 | `libero_expert` | on (all-positive, `expert_mode`) | on | on | phase-2 imitation baseline |
 | `libero_expert_no_ki` | **off** | on | on | ⚠️ name is misleading — KI is **on** per its config (predates the `--disable_ki` flag) |
-| `libero_smolvla_noki` (wandb `kloi9fle`) | off | **off** | **0** | the genuine SmolVLA-paper-style run: FM trains the VLM, 250k steps |
+| `libero_smolvla_noki` (wandb `kloi9fle`) | on (degenerate: `expert_mode` all-positive, dropout 0.3) | **off** | **0** | the genuine SmolVLA-paper-style run: FM trains the VLM, 250k steps |
 
 > Caution: `libero_expert_no_ki` is *not* a KI-off model. The only genuine
 > KI-off run is `libero_smolvla_noki`. The two "expert" models differ only in
@@ -57,7 +57,9 @@ layers, 2×H200. Configs read from each `recap_model/migrated/config.json`.
 ## 3. LIBERO evaluation (cfg=1.0, n=50/suite)
 
 We first ran a full CFG sweep, then realized **CFG is meaningless for these
-models**: `expert_no_ki`/`smolvla_noki` have `use_advantage_conditioning=False`
+models**: `expert_no_ki`/`smolvla_noki` — CORRECTION 2026-07-12: the migrated
+`smolvla_noki` config shows `use_advantage_conditioning=True` (trained via
+`expert_mode`, i.e. a degenerate always-positive token with 0.3 dropout), not `False`
 so `cfg_weight` is ignored entirely, and `expert` was trained all-positive
 (`expert_mode`) so the guidance direction is ≈ null. Reduced to `cfg=1.0`.
 

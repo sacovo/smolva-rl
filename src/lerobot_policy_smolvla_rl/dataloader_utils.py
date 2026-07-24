@@ -24,8 +24,95 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from lerobot.datasets.transforms import (
+    ImageTransformConfig,
+    ImageTransforms,
+    ImageTransformsConfig,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Image augmentation
+# ---------------------------------------------------------------------------
+
+# Photometric augmentations only perturb appearance, so they never break the
+# image<->action spatial grounding and are safe to apply freely. Values mirror
+# the LeRobot multitask-DiT LIBERO recipe so runs stay comparable.
+_PHOTOMETRIC_TFS = {
+    "brightness": ImageTransformConfig(type="ColorJitter", kwargs={"brightness": [0.75, 1.25]}),
+    "contrast": ImageTransformConfig(type="ColorJitter", kwargs={"contrast": [0.6, 1.4]}),
+    "saturation": ImageTransformConfig(type="ColorJitter", kwargs={"saturation": [0.8, 1.2]}),
+    "hue": ImageTransformConfig(type="ColorJitter", kwargs={"hue": [-0.05, 0.05]}),
+    "sharpness": ImageTransformConfig(type="SharpnessJitter", kwargs={"sharpness": [0.6, 1.4]}),
+}
+
+# Geometric augmentations perturb the image without perturbing the target
+# actions, so they act as regularisation only while the magnitude stays small
+# enough not to break spatial correspondence. Opt-in via --augmentation_geom.
+_GEOMETRIC_TFS = {
+    "rotation": ImageTransformConfig(type="RandomRotation", kwargs={"degrees": [-5, 5]}),
+    "translation": ImageTransformConfig(
+        type="RandomAffine", kwargs={"degrees": 0, "translate": [0.1, 0.1]}
+    ),
+}
+
+
+def add_augmentation_args(parser) -> None:
+    """Register the shared image-augmentation flags onto *parser* (mutates in-place)."""
+    parser.add_argument(
+        "--augmentation",
+        action="store_true",
+        default=True,
+        help="Enable photometric image augmentation "
+             "(brightness/contrast/saturation/hue/sharpness) on training frames "
+             "(default: True)",
+    )
+    parser.add_argument(
+        "--no_augmentation",
+        dest="augmentation",
+        action="store_false",
+        help="Disable image augmentation entirely (raw frames)",
+    )
+    parser.add_argument(
+        "--augmentation_geom",
+        action="store_true",
+        help="Additionally enable geometric image augmentation (small "
+             "rotation/translation). Requires --augmentation.",
+    )
+
+
+def build_image_transforms(augmentation: bool, augmentation_geom: bool):
+    """Build the LeRobot ImageTransforms applied to training frames.
+
+    Returns ``None`` (no augmentation) unless ``augmentation`` is set. Geometric
+    transforms are only added when ``augmentation_geom`` is also set; requesting
+    geometric-only augmentation is an error since it implies photometric too.
+    """
+    if not augmentation:
+        if augmentation_geom:
+            raise ValueError("--augmentation_geom requires --augmentation to be set.")
+        return None
+
+    tfs = dict(_PHOTOMETRIC_TFS)
+    if augmentation_geom:
+        tfs.update(_GEOMETRIC_TFS)
+
+    cfg = ImageTransformsConfig(
+        enable=True,
+        # Sample at most 4 of the available transforms per frame (matches the
+        # DiT recipe); with photometric-only this caps at the 3 lib default.
+        max_num_transforms=4 if augmentation_geom else 3,
+        random_order=False,
+        tfs=tfs,
+    )
+    logger.info(
+        "Image augmentation enabled (%s): %s",
+        "photometric+geometric" if augmentation_geom else "photometric",
+        ", ".join(tfs),
+    )
+    return ImageTransforms(cfg)
 
 
 # ---------------------------------------------------------------------------

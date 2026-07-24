@@ -1,6 +1,5 @@
 import pytest
 import torch
-import torch.nn as nn
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot_policy_smolvla_rl import SmolVLARECAPConfig, SmolVLARECAP, SmolVLARECAPPolicy
 from lerobot_policy_smolvla_rl.efficient_inference import select_diverse_tokens, check_pruning_constraints
@@ -48,9 +47,10 @@ def test_layer_redundancy_forward_patching(base_config):
     # Enable visual token pruning configuration
     base_config.visual_tokens_keep = 24
     
-    # 2 layer configuration check
-    policy = SmolVLARECAPPolicy(base_config)
-    
+    # 2 layer configuration check -- constructing the policy exercises
+    # config validation for the pruning setup
+    SmolVLARECAPPolicy(base_config)
+
     # Check that check_pruning_constraints runs and accepts None
     check_pruning_constraints(None, 2)
     

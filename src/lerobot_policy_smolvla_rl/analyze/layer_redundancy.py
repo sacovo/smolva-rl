@@ -1,10 +1,9 @@
 import torch
 import torch.nn.functional as F
 import types
-from pathlib import Path
 import click
 import pandas as pd
-from lerobot_policy_smolvla_rl.analyze.attribution.policy_io import load_recap_policy, iter_eval_batches
+from lerobot_policy_smolvla_rl.analyze.attribution.policy_io import iter_eval_batches
 
 def make_recording_forward(original_forward, record_dict):
     def recording_forward(

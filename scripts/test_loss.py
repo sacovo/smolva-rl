@@ -1,9 +1,9 @@
 import torch
-import json
 import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_policy_smolvla_rl.modeling_smolvla_recap import SmolVLARECAPPolicy
+from lerobot_policy_smolvla_rl.advantage_utils import load_thresholds
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -27,8 +27,7 @@ def main():
     # 3. Load precomputed advantages and thresholds
     print("Loading precomputed advantages...")
     precomputed_adv = np.load("outputs/recap_phase1/task_advantages_HuggingFaceVLA_libero.npy")
-    with open("outputs/recap_phase1/task_thresholds_HuggingFaceVLA_libero.json", "r") as f:
-        threshold_data = json.load(f)
+    threshold_data = load_thresholds("outputs/recap_phase1/task_thresholds_HuggingFaceVLA_libero.json")
     
     # 4. Get the preprocessor
     pre_recap = policy.model.get_pre_processor(dataset)
@@ -53,7 +52,7 @@ def main():
             # Get advantage for this frame
             task_idx = int(batch["task_index"].item())
             adv_val = precomputed_adv[idx]
-            thresh_val = float(threshold_data[str(task_idx)])
+            thresh_val = float(threshold_data[task_idx])
             advantage_bool = [adv_val > thresh_val]
 
             # Preprocess to add language tokens with advantage code

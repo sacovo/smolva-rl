@@ -2,6 +2,7 @@ import os
 import json
 import datetime
 import subprocess
+import argparse
 
 def parse_unknown_args(args_list):
     """
@@ -230,6 +231,85 @@ uv run accelerate launch \\
 echo "Job finished at $(date)"
 """
     return sbatch_content
+
+def build_submit_arg_parser(description):
+    """
+    Builds the argparse.ArgumentParser shared by all submit_*.py entrypoints
+    (Slurm resource flags + --config/--dry-run). Training-specific options are
+    parsed separately via parse_unknown_args on the leftover argv.
+    """
+    parser = argparse.ArgumentParser(description=description)
+
+    slurm_group = parser.add_argument_group("Slurm Configuration")
+    slurm_group.add_argument("--nodes", type=int, default=None)
+    slurm_group.add_argument("--ntasks-per-node", type=int, default=None)
+    slurm_group.add_argument("--cpus-per-task", type=int, default=None)
+    slurm_group.add_argument("--gres", type=str, default=None)
+    slurm_group.add_argument("--time", type=str, default=None)
+    slurm_group.add_argument("--mem", type=str, default=None)
+    slurm_group.add_argument("--job-name", type=str, default=None)
+    slurm_group.add_argument("--output", type=str, default=None)
+    slurm_group.add_argument("--error", type=str, default=None)
+    slurm_group.add_argument("--partition", type=str, default=None)
+    slurm_group.add_argument("--num-jobs", type=int, default=None, help="Number of times to submit the job sequentially with dependencies")
+    slurm_group.add_argument("--dependency-type", type=str, default=None, choices=["afterany", "afterok", "after", "afternotok"], help="Slurm dependency type (default: afterany)")
+
+    parser.add_argument("--config", type=str, default=None, help="Path to config JSON/YAML file")
+    parser.add_argument("--dry-run", action="store_true", help="Print SBATCH script without submitting")
+    return parser
+
+
+def run_submission(description, slurm_defaults, train_script, job_name_fn):
+    """
+    Shared submit_*.py driver: parse CLI args, merge with --config, apply
+    per-script Slurm defaults, resolve a job name, save the resolved config,
+    and generate + submit the sbatch script.
+
+    slurm_defaults: dict of Slurm config defaults (nodes, gres, mem, etc.)
+        specific to this training script's resource needs.
+    train_script: path to the training entrypoint (e.g.
+        "src/lerobot_policy_smolvla_rl/train_recap.py").
+    job_name_fn: callable(training_config, dataset_name) -> str, returning
+        the job name (e.g. mode-dependent naming for critic/recap, a fixed
+        scheme for snapflow).
+    """
+    parser = build_submit_arg_parser(description)
+    parsed_args, unknown_args = parser.parse_known_args()
+
+    cli_slurm = {
+        k: v for k, v in vars(parsed_args).items()
+        if k not in ["config", "dry_run"] and v is not None
+    }
+    cli_training = parse_unknown_args(unknown_args)
+
+    slurm_config, training_config = load_and_merge_config(
+        parsed_args.config, cli_slurm, cli_training
+    )
+
+    for key, value in slurm_defaults.items():
+        slurm_config.setdefault(key, value)
+
+    # Automatically propagate Slurm time limit to training script duration limit
+    slurm_time = slurm_config.get("time")
+    if slurm_time and "duration" not in training_config:
+        training_config["duration"] = slurm_time
+
+    dataset = training_config.get("dataset_repo_id")
+    dataset_name = os.path.basename(dataset) if dataset else "unknown_dataset"
+    slurm_config.setdefault("job_name", job_name_fn(training_config, dataset_name))
+
+    save_resolved_config(slurm_config["job_name"], slurm_config, training_config)
+
+    training_args_list = serialize_args(training_config)
+    sbatch_script = generate_sbatch_script(train_script, slurm_config, training_args_list)
+
+    submit_sbatch(
+        sbatch_script,
+        num_jobs=slurm_config["num_jobs"],
+        dependency_type=slurm_config["dependency_type"],
+        dry_run=parsed_args.dry_run,
+    )
+
 
 def extract_job_id(sbatch_output):
     """

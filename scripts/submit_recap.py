@@ -1,108 +1,39 @@
 #!/usr/bin/env python3
 import sys
 import os
-import argparse
 from datetime import datetime
 
 # Add directory to python path if run directly
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.submit_utils import (
-    parse_unknown_args,
-    serialize_args,
-    load_and_merge_config,
-    save_resolved_config,
-    generate_sbatch_script,
-    submit_sbatch,
-)
+from scripts.submit_utils import run_submission
+
+
+def job_name(training_config, dataset_name):
+    mode = "finetune" if "pretrained_policy_path" in training_config else "pretrain"
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    return f"recap_{dataset_name}_{mode}_{timestamp}"
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Submit RECAP Training to Slurm")
-    
-    # Slurm Arguments
-    slurm_group = parser.add_argument_group("Slurm Configuration")
-    slurm_group.add_argument("--nodes", type=int, default=None)
-    slurm_group.add_argument("--ntasks-per-node", type=int, default=None)
-    slurm_group.add_argument("--cpus-per-task", type=int, default=None)
-    slurm_group.add_argument("--gres", type=str, default=None)
-    slurm_group.add_argument("--time", type=str, default=None)
-    slurm_group.add_argument("--mem", type=str, default=None)
-    slurm_group.add_argument("--job-name", type=str, default=None)
-    slurm_group.add_argument("--output", type=str, default=None)
-    slurm_group.add_argument("--error", type=str, default=None)
-    slurm_group.add_argument("--partition", type=str, default=None)
-    slurm_group.add_argument("--num-jobs", type=int, default=None, help="Number of times to submit the job sequentially with dependencies")
-    slurm_group.add_argument("--dependency-type", type=str, default=None, choices=["afterany", "afterok", "after", "afternotok"], help="Slurm dependency type (default: afterany)")
-    
-    # Submission arguments
-    parser.add_argument("--config", type=str, default=None, help="Path to config JSON/YAML file")
-    parser.add_argument("--dry-run", action="store_true", help="Print SBATCH script without submitting")
-    
-    # Parse Slurm and submission args, leaving the rest
-    parsed_args, unknown_args = parser.parse_known_args()
-    
-    # Extract clean Slurm dict
-    cli_slurm = {
-        k: v for k, v in vars(parsed_args).items() 
-        if k not in ["config", "dry_run"] and v is not None
-    }
-    
-    # Parse unknown args (training options)
-    cli_training = parse_unknown_args(unknown_args)
-    
-    # Load and merge with config file
-    slurm_config, training_config = load_and_merge_config(
-        parsed_args.config,
-        cli_slurm,
-        cli_training
+    run_submission(
+        description="Submit RECAP Training to Slurm",
+        slurm_defaults={
+            "nodes": 1,
+            "ntasks_per_node": 1,
+            "cpus_per_task": 16,
+            "gres": "gpu:4",
+            "time": "24:00:00",
+            "mem": "64G",
+            "output": "logs/%x_%j.out",
+            "error": "logs/%x_%j.err",
+            "num_jobs": 1,
+            "dependency_type": "afterany",
+        },
+        train_script="src/lerobot_policy_smolvla_rl/train_recap.py",
+        job_name_fn=job_name,
     )
-    
-    # Apply defaults if still not set
-    slurm_config.setdefault("nodes", 1)
-    slurm_config.setdefault("ntasks_per_node", 1)
-    slurm_config.setdefault("cpus_per_task", 16)
-    slurm_config.setdefault("gres", "gpu:4")
-    slurm_config.setdefault("time", "24:00:00")
-    slurm_config.setdefault("mem", "64G")
-    slurm_config.setdefault("output", "logs/%x_%j.out")
-    slurm_config.setdefault("error", "logs/%x_%j.err")
-    slurm_config.setdefault("num_jobs", 1)
-    slurm_config.setdefault("dependency_type", "afterany")
-    
-    # Automatically propagate Slurm time limit to training script duration limit
-    slurm_time = slurm_config.get("time")
-    if slurm_time and "duration" not in training_config:
-        training_config["duration"] = slurm_time
-    
-    # Resolve job name
-    dataset = training_config.get("dataset_repo_id")
-    dataset_name = os.path.basename(dataset) if dataset else "unknown_dataset"
-    
-    mode = "pretrain"
-    if "pretrained_policy_path" in training_config:
-        mode = "finetune"
-        
-    timestamp = datetime.now().strftime("%m%d_%H%M%S")
-    default_job_name = f"recap_{dataset_name}_{mode}_{timestamp}"
-    slurm_config.setdefault("job_name", default_job_name)
-    
-    # Save the resolved configuration
-    save_resolved_config(slurm_config["job_name"], slurm_config, training_config)
-    
-    # Generate and submit sbatch
-    training_args_list = serialize_args(training_config)
-    sbatch_script = generate_sbatch_script(
-        "src/lerobot_policy_smolvla_rl/train_recap.py",
-        slurm_config,
-        training_args_list
-    )
-    
-    submit_sbatch(
-        sbatch_script,
-        num_jobs=slurm_config["num_jobs"],
-        dependency_type=slurm_config["dependency_type"],
-        dry_run=parsed_args.dry_run
-    )
+
 
 if __name__ == "__main__":
     main()

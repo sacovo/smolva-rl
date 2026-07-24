@@ -17,8 +17,10 @@ from lerobot_policy_smolvla_rl.checkpoint_utils import (
     parse_duration_to_seconds,
 )
 from lerobot_policy_smolvla_rl.dataloader_utils import (
+    add_augmentation_args,
     add_dataloader_args,
     build_dataloader,
+    build_image_transforms,
 )
 from lerobot_policy_smolvla_rl.ds_utils import (
     calculate_returns,
@@ -86,6 +88,7 @@ def parse_args():
     parser.add_argument("--job_name", type=str, default="train_critic")
     parser.add_argument("--wandb_entity", type=str, default=None)
     add_dataloader_args(parser)
+    add_augmentation_args(parser)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
     parser.add_argument("--save_dir", type=str, default="outputs/checkpoints_critic")
@@ -230,6 +233,9 @@ def main():
         "episodes": episodes_to_load,
         "tolerance_s": args.tolerance_s,
         "video_backend": args.video_backend,
+        "image_transforms": build_image_transforms(
+            args.augmentation, args.augmentation_geom
+        ),
     }
 
     with accelerator.local_main_process_first():

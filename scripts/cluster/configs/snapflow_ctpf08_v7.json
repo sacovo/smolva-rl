@@ -1,0 +1,31 @@
+{
+  "slurm": {
+    "cpus_per_task": 16,
+    "partition": "h200",
+    "mem": "96G",
+    "gres": "gpu:h200:1",
+    "time": "24:00:00",
+    "job_name": "snapflow_ctpf08_v7"
+  },
+  "training": {
+    "recap_checkpoint": "outputs/recap_cotrain_pf08_policy/recap_model/migrated",
+    "dataset_repo_id": "sancov/rollout_merged",
+    "precomputed_advantages": "outputs/rollout_advantages/task_advantages_sancov_rollout_merged.npy",
+    "thresholds_path": "outputs/rollout_advantages_pf08/task_thresholds_sancov_rollout_merged.json",
+    "steps": 15000,
+    "batch_size": 64,
+    "accumulation_steps": 1,
+    "lr": 0.0001,
+    "warmup_steps": 250,
+    "alpha": 0.5,
+    "lambda_consistency": 0.1,
+    "clamp": 20.0,
+    "job_name": "snapflow_ctpf08_v7",
+    "model_save_name": "snapflow_model",
+    "save_dir": "outputs/snapflow_ctpf08_v7_policy",
+    "demo_dataset_repo_id": "HuggingFaceVLA/libero",
+    "demo_mix_ratio": 0.5,
+    "distill_cfg_weight": 1.5,
+    "frozen_teacher": true
+  }
+}

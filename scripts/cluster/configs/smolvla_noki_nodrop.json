@@ -1,0 +1,34 @@
+{
+  "slurm": {
+    "partition": "h200",
+    "gres": "gpu:h200:2",
+    "num_jobs": 3,
+    "job_name": "smolvla_noki_nodrop",
+    "cpus_per_task": 32,
+    "time": "24:00:00",
+    "mem": "128G",
+    "nodes": 1,
+    "ntasks_per_node": 1,
+    "output": "logs/%x_%j.out",
+    "error": "logs/%x_%j.err",
+    "dependency_type": "afterany"
+  },
+  "training": {
+    "save_dir": "outputs/libero_smolvla_noki_nodrop/",
+    "fm_loss_weight": 4.0,
+    "warmup_steps": 200,
+    "accumulation_steps": 8,
+    "steps": 250000,
+    "expert_mode": true,
+    "batch_size": 32,
+    "job_name": "smolvla_noki_nodrop",
+    "num_vlm_layers": 16,
+    "disable_ki": true,
+    "loss_n_action_steps": 20,
+    "adv_dropout_rate": 0,
+    "ar_loss_weight": 0,
+    "dataset_repo_id": "HuggingFaceVLA/libero",
+    "action_chunk_size": 20,
+    "duration": "24:00:00"
+  }
+}

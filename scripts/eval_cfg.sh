@@ -1,8 +1,7 @@
 #!/bin/bash
 set -e
 
-# Target PID of the running lerobot-eval process
-# Weights to evaluate
+# CFG weights to evaluate
 CFG_WEIGHTS=(0.0 0.25 0.5 0.75 1.0 1.5 2.0 3.0)
 
 for cfg in "${CFG_WEIGHTS[@]}"; do
