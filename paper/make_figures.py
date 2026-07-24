@@ -21,7 +21,7 @@ ax.axhline(0, ls=':', c='gray', lw=.8)
 ax.annotate("drops back", xy=(58, -0.60), xytext=(105, -0.72), fontsize=7,
             arrowprops=dict(arrowstyle="->", lw=.7, color="gray"))
 ax.set_xlabel("step")
-ax.set_ylabel("value $V$")
+ax.set_ylabel("critic value $V(s_t)$\n(time-to-go)")
 ax.set_ylim(-1.02, 0.08)
 ax.tick_params(labelsize=8)
 fig.tight_layout()
